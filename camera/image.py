@@ -1,7 +1,8 @@
+
 import cv2
 
 
-cam = cv2.VideoCapture(1) 
+cam = cv2.VideoCapture(1)  # Logitech USB) 
 image = cv2.imread("Bane.jpg")
 while True:  
     s, img = cam.read()
@@ -9,5 +10,4 @@ while True:
     cv2.imshow("hsv", hsv)
     cv2.waitKey(1)    # wait for 1 millisecond before moving on to next frame
     cv2.imwrite("filename.jpg", hsv)
-
 

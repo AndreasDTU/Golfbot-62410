@@ -17,7 +17,7 @@ def pictocord(img, x_max, y_max):
     #Fill 2d array with color values
     for y in range(y_max):
         for x in range (x_max):
-            coordinate_array[y][x] = colors.get(img.getpixel((x, y)), 0)
+            coordinate_array[y][x] = colors.get(img.getpixel((x, y)), 0) #This is bullshit and dont work pls fix guys
     return coordinate_array
 
 

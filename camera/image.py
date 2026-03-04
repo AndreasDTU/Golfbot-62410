@@ -19,8 +19,8 @@ while True:
 
 
 #Some shit like this idk???
-coordinate_array = [[0 for _ in range(x_max)] for _ in range(y_max)]  # Initialize a 2D array for 640x480 image coordinates
 
+coordinate_array = [[0 for _ in range(x_max)] for _ in range(y_max)]  # Initialize a 2D array for 640x480 image coordinates
 #Make picture fit altså fix lens distortion
 
 #Pitcture from hls to 5 colors(Wall, Ball, Orange Ball, Robot, Floor)

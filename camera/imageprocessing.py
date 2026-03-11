@@ -9,6 +9,13 @@ def imageprocessing(img, colorspace):
     return cv2.cvtColor(img,colorspace)
 
 
+def undistort_with_calibration(img, calibration_file):
+    data = np.load(calibration_file)
+    camera_matrix = data["camera_matrix"]
+    distortion_coeffs = data["distortion_coeffs"]
+    return cv2.undistort(img, camera_matrix, distortion_coeffs)
+
+
 
 #Make picture fit altså fix lens distortion https://docs.opencv.org/4.x/dc/dbb/tutorial_py_calibration.html
 

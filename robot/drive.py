@@ -9,6 +9,9 @@ wheel_track = 200
 
 tank_drive = MoveTank(OUTPUT_B, OUTPUT_C)
 
+forward_speed = -100
+backward_speed = 100
+
 # Drive the robot a certain distance (in mm) forward and right (will be combined movement)
 def drive(forward_distance: int, right_distance: int):
     if forward_distance == 0 and right_distance == 0:
@@ -16,7 +19,7 @@ def drive(forward_distance: int, right_distance: int):
     # Only drive forward/backward?
     if right_distance == 0:
         rotation_count = abs(forward_distance / wheel_diameter)
-        speed = SpeedPercent(100 if forward_distance > 0 else -100)
+        speed = SpeedPercent(forward_speed if forward_distance > 0 else backward_speed)
         tank_drive.on_for_rotations(speed, speed, rotation_count)
     # Combine with rotation
     else:
@@ -24,7 +27,7 @@ def drive(forward_distance: int, right_distance: int):
 
         if np.isclose(theta, 0.0):
             rotation_count = abs(forward_distance / wheel_diameter)
-            speed = SpeedPercent(100 if forward_distance > 0 else -100)
+            speed = SpeedPercent(forward_speed if forward_distance > 0 else backward_speed)
             tank_drive.on_for_rotations(speed, speed, rotation_count)
             return
 
@@ -44,10 +47,10 @@ def drive(forward_distance: int, right_distance: int):
             return
 
         left_speed = SpeedPercent(
-            (left_rotations / max_rotations) * (100 if left_distance >= 0 else -100)
+            (left_rotations / max_rotations) * (forward_speed if left_distance >= 0 else backward_speed)
         )
         right_speed = SpeedPercent(
-            (right_rotations / max_rotations) * (100 if right_wheel_distance >= 0 else -100)
+            (right_rotations / max_rotations) * (forward_speed if right_wheel_distance >= 0 else backward_speed)
         )
 
         tank_drive.left_motor.on_for_rotations(left_speed, left_rotations, block=False)
@@ -62,8 +65,8 @@ def turn(degrees: float):
     wheel_distance = (wheel_track / 2) * abs(theta)
     rotation_count = wheel_distance / wheel_diameter
 
-    left_speed = SpeedPercent(100 if degrees > 0 else -100)
-    right_speed = SpeedPercent(-100 if degrees > 0 else 100)
+    left_speed = SpeedPercent(forward_speed if degrees > 0 else backward_speed)
+    right_speed = SpeedPercent(backward_speed if degrees > 0 else forward_speed)
 
     tank_drive.left_motor.on_for_rotations(left_speed, rotation_count, block=False)
     tank_drive.right_motor.on_for_rotations(right_speed, rotation_count, block=True)

@@ -9,11 +9,29 @@ def imageprocessing(img, colorspace):
     return cv2.cvtColor(img,colorspace)
 
 
-def undistort_with_calibration(img, calibration_file):
+def undistort_with_calibration(img, calibration_file, balance=0.5):
     data = np.load(calibration_file)
-    camera_matrix = data["camera_matrix"]
-    distortion_coeffs = data["distortion_coeffs"]
-    return cv2.undistort(img, camera_matrix, distortion_coeffs)
+    K = data["K"]
+    D = data["D"]
+
+    height, width = img.shape[:2]
+    image_size = (width, height)
+    new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+        K,
+        D,
+        image_size,
+        np.eye(3, dtype=np.float64),
+        balance=balance,
+    )
+    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+        K,
+        D,
+        np.eye(3, dtype=np.float64),
+        new_K,
+        image_size,
+        cv2.CV_16SC2,
+    )
+    return cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
 
 

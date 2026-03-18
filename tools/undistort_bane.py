@@ -19,7 +19,7 @@ from camera.imageprocessing import undistort_with_calibration
 INPUT_IMAGE = REPO_ROOT / "Bane.png"
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
 OUTPUT_IMAGE = REPO_ROOT / "Bane_undistorted.png"
-BALANCE = 0.5
+BALANCE = 0.0
 
 
 def main() -> int:
@@ -36,7 +36,11 @@ def main() -> int:
         print(f"Kunne ikke laese billede: {INPUT_IMAGE}", file=sys.stderr)
         return 1
 
-    undistorted = undistort_with_calibration(image, str(CALIBRATION_FILE), balance=BALANCE)
+    try:
+        undistorted = undistort_with_calibration(image, str(CALIBRATION_FILE), balance=BALANCE)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     if not cv2.imwrite(str(OUTPUT_IMAGE), undistorted):
         print(f"Kunne ikke gemme output: {OUTPUT_IMAGE}", file=sys.stderr)

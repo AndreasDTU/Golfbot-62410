@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 
-CHECKERBOARD_INNER_CORNERS = (6, 8)
+CHECKERBOARD_INNER_CORNERS = (18, 8)
 SQUARE_SIZE_MM = 25.0
 CAMERA_INDEX = 0
 OUTPUT_FILE = "calibration_data.npz"

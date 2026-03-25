@@ -209,3 +209,5 @@ __marimo__/
 
 # Ignore pictures
 *.jpg
+# Generated test artifacts
+test/artifacts/

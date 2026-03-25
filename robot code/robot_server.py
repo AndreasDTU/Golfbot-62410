@@ -15,12 +15,15 @@ Commands:
   pipe up <units> [speed] - Raise the pipe N units
   pipe down <units> [speed] - Lower the pipe N units
   pipe stop               - Stop pipe motor immediately
+  pickup                  - Pickup a ball
+  dropoff                 - Dropoff all balls
   stop                    - Stop all drive motors
   ping                    - Health check, returns 'pong'
 """
 
 import socket
 import threading
+import time
 from ev3dev2.motor import (
     LargeMotor, MoveTank,
     OUTPUT_B, OUTPUT_C, OUTPUT_D,
@@ -136,6 +139,50 @@ def cmd_pipe(parts):
     )
     return "ok: pipe {} {} units".format(subaction, units)
 
+def cmd_pickup():
+    units = 10
+    speed = 30
+    motor_deg = units * PIPE_DEGREES_PER_UNIT
+
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(speed),
+        degrees=motor_deg,
+        brake=True,
+        block=True
+    )
+
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(-speed),
+        degrees=motor_deg,
+        brake=True,
+        block=True
+    )
+
+    return "ok: pipe pickup completed"
+
+def cmd_dropoff():
+    units = 20
+    speed = 30
+    motor_deg = units * PIPE_DEGREES_PER_UNIT
+
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(-speed),
+        degrees=motor_deg,
+        brake=True,
+        block=True
+    )
+
+    time.sleep(3)
+
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(speed),
+        degrees=motor_deg,
+        brake=True,
+        block=True
+    )
+    
+    return "ok: pipe pickup completed"
+
 
 def cmd_stop():
     tank.off()
@@ -166,6 +213,10 @@ def handle_command(cmd):
             return cmd_pipe(parts)
         elif action == "stop":
             return cmd_stop()
+        elif action == "pickup":
+            return cmd_pickup()
+        elif action == "dropoff":
+            return cmd_dropoff()
         else:
             return "error: unknown command '{}'".format(action)
     except Exception as e:

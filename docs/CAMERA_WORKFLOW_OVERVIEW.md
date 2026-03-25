@@ -12,6 +12,7 @@ Det nuvaerende workflow er:
 4. Segmenter den orange baneramme i HSV.
 5. Find banens geometri.
 6. Warp billedet til et top-down view.
+7. Brug manuel 4-punkts selection som fallback hvis den automatiske hjoernefinding er ustabil.
 
 ## Centrale filer
 
@@ -137,6 +138,33 @@ python3 tools/live_topdown_view.py
 
 Tryk `q` for at afslutte.
 
+### [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py)
+
+Dette script er den manuelle fallback til top-down view, naar den automatiske HSV-baserede hjoernefinding ikke er stabil nok.
+
+Det:
+
+1. aabner livefeed fra kameraet
+2. undistorter hvert frame med `undistort_with_calibration(...)`
+3. viser en loupe / forstorrelsesvisning af omraadet under musen
+4. lader brugeren vaelge 4 punkter med venstreklik
+5. nulstiller valgte punkter med hoejreklik eller `r`
+6. bygger en perspektivtransformation, saa snart der er valgt praecist 4 punkter
+7. viser et live `Top-Down View`, som opdateres med den gemte transformationsmatrix
+
+Vinduer:
+
+- `Manual Top-Down Selector`: undistortet livefeed med punkter, linjer og loupe
+- `Top-Down View`: live warp baseret paa de 4 manuelt valgte punkter
+
+Bruges saadan:
+
+```bash
+python3 tools/manual_topdown_view.py
+```
+
+Tryk `q` for at afslutte.
+
 ## Main flow og ældre filer
 
 ### [Main.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/Main.py)
@@ -193,7 +221,8 @@ Hvis man vil arbejde fra start til slut, er den normale rækkefølge:
 2. Kontroller at `calibration_data.npz` bliver oprettet
 3. Test undistortion med [tools/live_undistort.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_undistort.py) eller [tools/undistort_bane.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/undistort_bane.py)
 4. Koer [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py) for at tune HSV og teste top-down warp
-5. Integrer de dele, der virker, ind i den endelige vision-pipeline
+5. Hvis den automatiske hjoernefinding er ustabil, koer [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py) som manuel fallback
+6. Integrer de dele, der virker, ind i den endelige vision-pipeline
 
 ## Kort opsummering
 
@@ -202,3 +231,7 @@ Hvis man kun skal huske tre filer, er det:
 - [tools/calibrate_camera.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/calibrate_camera.py): laver kalibreringen
 - [camera/imageprocessing.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/imageprocessing.py): anvender kalibreringen
 - [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py): viser den samlede live-debugkæde
+
+Hvis den automatiske top-down detection fejler, er den vigtigste fallback:
+
+- [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py): manuel 4-punkts selection med loupe og live top-down warp

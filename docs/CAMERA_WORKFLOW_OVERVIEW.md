@@ -1,0 +1,204 @@
+# Camera Workflow Overview
+
+Denne fil forklarer de vigtigste kamera- og visionfiler i repoet fra start til slut, så det er nemt at se, hvad der bruges til hvad.
+
+## Overblik
+
+Det nuvaerende workflow er:
+
+1. Kalibrer kameraet med et checkerboard.
+2. Gem kalibreringskonstanter i `calibration_data.npz`.
+3. Brug konstanterne til at undistorte billeder eller livefeed.
+4. Segmenter den orange baneramme i HSV.
+5. Find banens geometri.
+6. Warp billedet til et top-down view.
+
+## Centrale filer
+
+### [tools/calibrate_camera.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/calibrate_camera.py)
+
+Dette er scriptet til selve kamerakalibreringen.
+
+Det gør følgende:
+
+- aabner livefeed fra kameraet
+- finder checkerboard-hjoerner
+- vurderer live om et billede er godt nok til kalibrering
+- gemmer gode checkerboard-billeder internt som punktpar
+- koerer `cv2.fisheye.calibrate(...)`
+- gemmer resultatet i `calibration_data.npz`
+
+Det er her vi finder:
+
+- `K`: kameramatrix
+- `D`: distortion-koefficienter
+- `image_size`: den oploesning kalibreringen er lavet til
+
+Bruges saadan:
+
+```bash
+python3 tools/calibrate_camera.py
+```
+
+### [calibration_data.npz](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/calibration_data.npz)
+
+Dette er outputfilen fra kalibreringen.
+
+Den indeholder:
+
+- `K`
+- `D`
+- `image_size`
+
+Den bruges af de andre scripts, saa de kan undistorte billeder uden at kalibrere igen.
+
+## Undistortion
+
+### [camera/imageprocessing.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/imageprocessing.py)
+
+Denne fil indeholder hjaelpefunktioner til billedbehandling.
+
+Lige nu er de vigtigste funktioner:
+
+- `imageprocessing(img, colorspace)`
+- `undistort_with_calibration(img, calibration_file, balance=0.0)`
+
+`undistort_with_calibration(...)`:
+
+- loader `K` og `D` fra `calibration_data.npz`
+- checker at billedets oploesning matcher kalibreringsopluesningen
+- bruger OpenCV fisheye-funktionerne til at undistorte billedet
+
+Det er denne funktion, de andre scripts genbruger.
+
+### [tools/undistort_bane.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/undistort_bane.py)
+
+Dette er et lille tests script til stillbilleder.
+
+Det:
+
+- loader `Bane.png`
+- anvender `undistort_with_calibration(...)`
+- gemmer resultatet som `Bane_undistorted.png`
+
+Bruges saadan:
+
+```bash
+python3 tools/undistort_bane.py
+```
+
+### [tools/live_undistort.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_undistort.py)
+
+Dette script bruges til hurtigt at teste kalibreringen paa livefeedet.
+
+Det:
+
+- loader `calibration_data.npz`
+- aabner kameraet
+- bygger fisheye-remap
+- viser originalt og undistortet billede side om side
+
+Bruges saadan:
+
+```bash
+python3 tools/live_undistort.py
+```
+
+Hvis det undistortede billede ser helt sort ud, er kalibreringen typisk ustabil eller lavet paa for faa / for daarlige checkerboard-billeder.
+
+## Top-down workflow
+
+### [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py)
+
+Dette er det mest komplette live-debug-script i den nuvaerende gren.
+
+Det koerer hele den relevante testkæde:
+
+1. loader `calibration_data.npz`
+2. undistorter livefeedet
+3. konverterer billedet til HSV
+4. segmenterer den orange baneramme med trackbars
+5. finder stoerste kontur
+6. approksimerer konturen med `cv2.approxPolyDP`
+7. checker om polygonen har 4 hjoerner
+8. warper billedet til et top-down view hvis geometrien er gyldig
+
+Vinduer:
+
+- `LiveFeed`: undistortet billede med konturer, status og HSV-sliders
+- `HSV Mask`: viser hvad HSV-filteret faktisk udvaelger
+- `TopDownView`: viser warp eller placeholder hvis der ikke er 4 hjoerner
+
+Bruges saadan:
+
+```bash
+python3 tools/live_topdown_view.py
+```
+
+Tryk `q` for at afslutte.
+
+## Main flow og ældre filer
+
+### [Main.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/Main.py)
+
+Dette er et tidligt hovedscript for projektet.
+
+Det:
+
+- tager et billede fra kameraet
+- konverterer det til et andet colorspace
+- gemmer et debug-billede
+
+Det bruger endnu ikke den nye kalibrering eller top-down pipeline direkte.
+
+### [camera/image.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/image.py)
+
+Indeholder `imagecapture(CameraID)`, som tager et enkelt billede fra et kamera.
+
+### [camera/pictocord.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/pictocord.py)
+
+En tidlig skitse til at oversaette et billede til et koordinatsystem.
+
+Filen virker mere som en placeholder end som en faerdig del af pipeline'en lige nu.
+
+### [camera/calibration.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/calibration.py)
+
+Denne fil indeholder generelle checkerboard- og warp-hjaelpere til tests.
+
+Den bruges ikke som det primære live-kalibreringsscript. Den er mere en samling utility-funktioner til smoke tests og eksperimenter.
+
+## Test- og hjælpefiler
+
+### [tools/checkerboard_smoke_test.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/checkerboard_smoke_test.py)
+
+Testscript til checkerboard-detektion paa et fast testbillede.
+
+### [tools/perspective_warp_test.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/perspective_warp_test.py)
+
+Testscript til perspektivtransformation paa et fast billede.
+
+### [test/test_checkerboard_smoke.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/test/test_checkerboard_smoke.py)
+
+Automatisk test for checkerboard-relateret funktionalitet.
+
+### [test/test_perspective_warp.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/test/test_perspective_warp.py)
+
+Automatisk test for perspektiv-warp.
+
+## Typisk brug i praksis
+
+Hvis man vil arbejde fra start til slut, er den normale rækkefølge:
+
+1. Koer [tools/calibrate_camera.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/calibrate_camera.py)
+2. Kontroller at `calibration_data.npz` bliver oprettet
+3. Test undistortion med [tools/live_undistort.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_undistort.py) eller [tools/undistort_bane.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/undistort_bane.py)
+4. Koer [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py) for at tune HSV og teste top-down warp
+5. Integrer de dele, der virker, ind i den endelige vision-pipeline
+
+## Kort opsummering
+
+Hvis man kun skal huske tre filer, er det:
+
+- [tools/calibrate_camera.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/calibrate_camera.py): laver kalibreringen
+- [camera/imageprocessing.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/imageprocessing.py): anvender kalibreringen
+- [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py): viser den samlede live-debugkæde

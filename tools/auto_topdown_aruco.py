@@ -18,7 +18,7 @@ from camera.imageprocessing import undistort_with_calibration
 
 
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 LIVE_WINDOW = "Live Feed (Debug)"
 TOPDOWN_WINDOW = "Top-Down View"
 REQUIRED_MARKER_IDS = (0, 1, 2, 3)

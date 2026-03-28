@@ -37,6 +37,8 @@ from camera.imageprocessing import undistort_with_calibration
 
 FIELD_WIDTH_CM = 180
 FIELD_HEIGHT_CM = 120
+Z_BALL_CM = 2.0
+Z_FLOOR_CM = 0.0
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
 DEFAULT_IMAGE = REPO_ROOT / "test_topdown.png"
 WINDOW_NAME = "Top-Down Detector"
@@ -68,6 +70,10 @@ TRACKBAR_NAMES = {
     "ball_min_area": "B min area",
     "ball_max_area": "B max area",
     "ball_min_circ": "B min circ",
+    "cam_height_cm": "Cam h cm",
+    "calib_z_cm": "Border h cm",
+    "cam_center_x": "Cam C X",
+    "cam_center_y": "Cam C Y",
 }
 
 # Still-image mode is the safest default for deterministic tuning.
@@ -85,6 +91,7 @@ class BallDetection:
 
     label: str
     center: tuple[int, int]
+    corrected_center: tuple[int, int]
     radius_px: int
     contour: np.ndarray
     area: float
@@ -96,8 +103,10 @@ class RedZoneDetection:
     """Detected red avoidance geometry."""
 
     contour: np.ndarray
+    corrected_contour: np.ndarray
     bounding_box: tuple[int, int, int, int]
     center: tuple[int, int]
+    corrected_center: tuple[int, int]
     area: float
 
 
@@ -168,11 +177,12 @@ def load_calibration_image_size(calibration_file: Path) -> tuple[int, int]:
     return image_size
 
 
-def create_hsv_trackbars() -> None:
+def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
     """Create trackbars for the three color classes.
 
     Red uses two hue intervals because red wraps across the HSV hue boundary.
     """
+    frame_width, frame_height = frame_size
     cv2.namedWindow(CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CONTROL_WINDOW_NAME, *CONTROL_WINDOW_SIZE)
 
@@ -181,7 +191,7 @@ def create_hsv_trackbars() -> None:
         "red1_h_max": 12,
         "red2_h_min": 165,
         "red2_h_max": 179,
-        "red_s_min": 110,
+        "red_s_min": 196,
         "red_s_max": 255,
         "red_v_min": 60,
         "red_v_max": 255,
@@ -201,6 +211,10 @@ def create_hsv_trackbars() -> None:
         "ball_min_area": 20,
         "ball_max_area": 2500,
         "ball_min_circ": 70,
+        "cam_height_cm": 180,
+        "calib_z_cm": 8,
+        "cam_center_x": frame_width // 2,
+        "cam_center_y": frame_height // 2,
     }
 
     for key, value in defaults.items():
@@ -212,6 +226,14 @@ def create_hsv_trackbars() -> None:
             max_value = 20000
         if key == "ball_min_circ":
             max_value = 100
+        if key == "cam_height_cm":
+            max_value = 300
+        if key == "calib_z_cm":
+            max_value = 30
+        if key == "cam_center_x":
+            max_value = max(1, frame_width)
+        if key == "cam_center_y":
+            max_value = max(1, frame_height)
         cv2.createTrackbar(name, CONTROL_WINDOW_NAME, value, max_value, noop)
 
 
@@ -299,6 +321,10 @@ def read_hsv_ranges() -> dict[str, object]:
         "ball_min_area": float(cv2.getTrackbarPos(TRACKBAR_NAMES["ball_min_area"], CONTROL_WINDOW_NAME)),
         "ball_max_area": float(cv2.getTrackbarPos(TRACKBAR_NAMES["ball_max_area"], CONTROL_WINDOW_NAME)),
         "ball_min_circularity": cv2.getTrackbarPos(TRACKBAR_NAMES["ball_min_circ"], CONTROL_WINDOW_NAME) / 100.0,
+        "h_cam_cm": float(cv2.getTrackbarPos(TRACKBAR_NAMES["cam_height_cm"], CONTROL_WINDOW_NAME)),
+        "z_calib_cm": float(cv2.getTrackbarPos(TRACKBAR_NAMES["calib_z_cm"], CONTROL_WINDOW_NAME)),
+        "camera_center_x": float(cv2.getTrackbarPos(TRACKBAR_NAMES["cam_center_x"], CONTROL_WINDOW_NAME)),
+        "camera_center_y": float(cv2.getTrackbarPos(TRACKBAR_NAMES["cam_center_y"], CONTROL_WINDOW_NAME)),
     }
 
 
@@ -318,7 +344,51 @@ def cleanup_mask(mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
     return cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
-def detect_red_zones(frame_bgr: np.ndarray, params: dict[str, object]) -> tuple[list[RedZoneDetection], np.ndarray]:
+def correct_parallax(
+    pixel_coord: tuple[int, int],
+    z_object_cm: float,
+    h_cam_cm: float,
+    z_calib_cm: float,
+    camera_center_pixels: tuple[float, float],
+) -> tuple[int, int]:
+    """Correct radial displacement caused by object height relative to the warp plane."""
+    camera_center_x, camera_center_y = camera_center_pixels
+    denominator = h_cam_cm - z_calib_cm
+    if abs(denominator) < 1e-6:
+        return int(round(pixel_coord[0])), int(round(pixel_coord[1]))
+    t = (h_cam_cm - z_object_cm) / denominator
+
+    x_real = camera_center_x + (pixel_coord[0] - camera_center_x) * t
+    y_real = camera_center_y + (pixel_coord[1] - camera_center_y) * t
+    return int(round(x_real)), int(round(y_real))
+
+
+def correct_contour_parallax(
+    contour: np.ndarray,
+    z_object_cm: float,
+    h_cam_cm: float,
+    z_calib_cm: float,
+    camera_center_pixels: tuple[float, float],
+) -> np.ndarray:
+    """Apply parallax correction point-by-point for contour-based schematic overlays."""
+    corrected_points = [
+        correct_parallax(
+            pixel_coord=(int(point[0][0]), int(point[0][1])),
+            z_object_cm=z_object_cm,
+            h_cam_cm=h_cam_cm,
+            z_calib_cm=z_calib_cm,
+            camera_center_pixels=camera_center_pixels,
+        )
+        for point in contour
+    ]
+    return np.array(corrected_points, dtype=np.int32).reshape((-1, 1, 2))
+
+
+def detect_red_zones(
+    frame_bgr: np.ndarray,
+    params: dict[str, object],
+    camera_center_pixels: tuple[float, float],
+) -> tuple[list[RedZoneDetection], np.ndarray]:
     """Detect red avoidance zones from the top-down image.
 
     Red wraps around the hue axis, so two masks are built and combined.
@@ -340,11 +410,26 @@ def detect_red_zones(frame_bgr: np.ndarray, params: dict[str, object]) -> tuple[
             continue
 
         x, y, width, height = cv2.boundingRect(contour)
+        center = contour_center(contour)
         detections.append(
             RedZoneDetection(
                 contour=contour,
+                corrected_contour=correct_contour_parallax(
+                    contour=contour,
+                    z_object_cm=Z_FLOOR_CM,
+                    h_cam_cm=float(params["h_cam_cm"]),
+                    z_calib_cm=float(params["z_calib_cm"]),
+                    camera_center_pixels=camera_center_pixels,
+                ),
                 bounding_box=(x, y, width, height),
-                center=contour_center(contour),
+                center=center,
+                corrected_center=correct_parallax(
+                    pixel_coord=center,
+                    z_object_cm=Z_FLOOR_CM,
+                    h_cam_cm=float(params["h_cam_cm"]),
+                    z_calib_cm=float(params["z_calib_cm"]),
+                    camera_center_pixels=camera_center_pixels,
+                ),
                 area=area,
             )
         )
@@ -368,6 +453,10 @@ def detect_ball_candidates(
     min_area: float,
     max_area: float,
     min_circularity: float,
+    z_object_cm: float,
+    h_cam_cm: float,
+    z_calib_cm: float,
+    camera_center_pixels: tuple[float, float],
 ) -> tuple[list[BallDetection], np.ndarray]:
     """Detect circular objects for one HSV color class."""
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
@@ -399,6 +488,13 @@ def detect_ball_candidates(
             BallDetection(
                 label=label,
                 center=(int(center_x), int(center_y)),
+                corrected_center=correct_parallax(
+                    pixel_coord=(int(center_x), int(center_y)),
+                    z_object_cm=z_object_cm,
+                    h_cam_cm=h_cam_cm,
+                    z_calib_cm=z_calib_cm,
+                    camera_center_pixels=camera_center_pixels,
+                ),
                 radius_px=max(2, int(radius)),
                 contour=contour,
                 area=area,
@@ -409,8 +505,12 @@ def detect_ball_candidates(
     return detections, mask
 
 
-def detect_balls(frame_bgr: np.ndarray, params: dict[str, object]) -> tuple[list[BallDetection], list[BallDetection], dict[str, np.ndarray]]:
-    """Detect white balls and orange balls using the same contour filters."""
+def detect_balls(
+    frame_bgr: np.ndarray,
+    params: dict[str, object],
+    camera_center_pixels: tuple[float, float],
+) -> tuple[list[BallDetection], list[BallDetection], dict[str, np.ndarray]]:
+    """Detect white balls and orange balls using the same contour filters and parallax correction."""
     white_detections, white_mask = detect_ball_candidates(
         frame_bgr=frame_bgr,
         hsv_range=params["white"],
@@ -418,6 +518,10 @@ def detect_balls(frame_bgr: np.ndarray, params: dict[str, object]) -> tuple[list
         min_area=float(params["ball_min_area"]),
         max_area=float(params["ball_max_area"]),
         min_circularity=float(params["ball_min_circularity"]),
+        z_object_cm=Z_BALL_CM,
+        h_cam_cm=float(params["h_cam_cm"]),
+        z_calib_cm=float(params["z_calib_cm"]),
+        camera_center_pixels=camera_center_pixels,
     )
     orange_detections, orange_mask = detect_ball_candidates(
         frame_bgr=frame_bgr,
@@ -426,6 +530,10 @@ def detect_balls(frame_bgr: np.ndarray, params: dict[str, object]) -> tuple[list
         min_area=float(params["ball_min_area"]),
         max_area=float(params["ball_max_area"]),
         min_circularity=float(params["ball_min_circularity"]),
+        z_object_cm=Z_BALL_CM,
+        h_cam_cm=float(params["h_cam_cm"]),
+        z_calib_cm=float(params["z_calib_cm"]),
+        camera_center_pixels=camera_center_pixels,
     )
 
     masks = {
@@ -453,6 +561,7 @@ def draw_schematic(
     red_zones: list[RedZoneDetection],
     white_balls: list[BallDetection],
     orange_balls: list[BallDetection],
+    camera_center_pixels: tuple[float, float],
 ) -> np.ndarray:
     """Draw a clean synthetic field view containing only the detected objects."""
     source_height, source_width = frame_shape[:2]
@@ -468,7 +577,7 @@ def draw_schematic(
     )
 
     for zone in red_zones:
-        mapped_contour = zone.contour.astype(np.float32).copy()
+        mapped_contour = zone.corrected_contour.astype(np.float32).copy()
         mapped_contour[:, 0, 0] *= SCHEMATIC_WIDTH_PX / max(1, source_width)
         mapped_contour[:, 0, 1] *= SCHEMATIC_HEIGHT_PX / max(1, source_height)
         mapped_contour = mapped_contour.astype(np.int32)
@@ -476,7 +585,7 @@ def draw_schematic(
 
     for ball in white_balls:
         center = map_point_between_frames(
-            ball.center,
+            ball.corrected_center,
             (source_width, source_height),
             (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
         )
@@ -486,13 +595,35 @@ def draw_schematic(
 
     for orange_ball in orange_balls:
         center = map_point_between_frames(
-            orange_ball.center,
+            orange_ball.corrected_center,
             (source_width, source_height),
             (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
         )
         radius = max(4, int(orange_ball.radius_px * SCHEMATIC_WIDTH_PX / max(1, source_width)))
         cv2.circle(schematic, center, radius, (0, 140, 255), -1, cv2.LINE_AA)
         cv2.circle(schematic, center, radius, (0, 80, 180), 1, cv2.LINE_AA)
+
+    camera_center_schematic = map_point_between_frames(
+        (int(round(camera_center_pixels[0])), int(round(camera_center_pixels[1]))),
+        (source_width, source_height),
+        (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
+    )
+    cv2.line(
+        schematic,
+        (camera_center_schematic[0] - 4, camera_center_schematic[1]),
+        (camera_center_schematic[0] + 4, camera_center_schematic[1]),
+        (255, 80, 80),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.line(
+        schematic,
+        (camera_center_schematic[0], camera_center_schematic[1] - 4),
+        (camera_center_schematic[0], camera_center_schematic[1] + 4),
+        (255, 80, 80),
+        1,
+        cv2.LINE_AA,
+    )
 
     cv2.putText(
         schematic,
@@ -626,8 +757,12 @@ def load_image_frame(image_path: Path) -> np.ndarray:
 
 def process_frame(frame_bgr: np.ndarray, params: dict[str, object], fps: float) -> tuple[np.ndarray, np.ndarray]:
     """Run the full detection pass and build both output panels."""
-    red_zones, red_mask = detect_red_zones(frame_bgr, params)
-    white_balls, orange_balls, ball_masks = detect_balls(frame_bgr, params)
+    camera_center_pixels = (
+        float(params["camera_center_x"]),
+        float(params["camera_center_y"]),
+    )
+    red_zones, red_mask = detect_red_zones(frame_bgr, params, camera_center_pixels)
+    white_balls, orange_balls, ball_masks = detect_balls(frame_bgr, params, camera_center_pixels)
 
     annotated = annotate_camera_frame(
         frame_bgr=frame_bgr,
@@ -641,6 +776,7 @@ def process_frame(frame_bgr: np.ndarray, params: dict[str, object], fps: float) 
         red_zones=red_zones,
         white_balls=white_balls,
         orange_balls=orange_balls,
+        camera_center_pixels=camera_center_pixels,
     )
     masks = build_mask_preview(red_mask, ball_masks["white"], ball_masks["orange"])
     return np.hstack(resize_to_match_height(annotated, schematic)), masks
@@ -657,7 +793,7 @@ def configure_camera(cap: cv2.VideoCapture, width: int, height: int) -> None:
 def run_image_mode(image_path: Path) -> int:
     """Run repeated processing on one still image so HSV sliders remain interactive."""
     frame = load_image_frame(image_path)
-    create_hsv_trackbars()
+    create_hsv_trackbars((int(frame.shape[1]), int(frame.shape[0])))
 
     while True:
         start = time.perf_counter()
@@ -692,7 +828,6 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
         return 1
 
     calibration_width, calibration_height = load_calibration_image_size(CALIBRATION_FILE)
-    create_hsv_trackbars()
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         print(f"Could not open camera {camera_index}", file=sys.stderr)
@@ -703,14 +838,23 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
         width if width > 0 else calibration_width,
         height if height > 0 else calibration_height,
     )
+    ok, initial_frame = cap.read()
+    if not ok or initial_frame is None:
+        print("Camera read failed", file=sys.stderr)
+        cap.release()
+        return 1
+    create_hsv_trackbars((int(initial_frame.shape[1]), int(initial_frame.shape[0])))
     last_tick = time.perf_counter()
 
     try:
         while True:
-            ok, raw_frame = cap.read()
-            if not ok or raw_frame is None:
-                print("Camera read failed", file=sys.stderr)
-                return 1
+            raw_frame = initial_frame
+            initial_frame = None
+            if raw_frame is None:
+                ok, raw_frame = cap.read()
+                if not ok or raw_frame is None:
+                    print("Camera read failed", file=sys.stderr)
+                    return 1
 
             start = time.perf_counter()
             topdown_frame = prepare_live_topdown_frame(raw_frame, CALIBRATION_FILE, balance)

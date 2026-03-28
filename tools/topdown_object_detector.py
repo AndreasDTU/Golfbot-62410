@@ -19,6 +19,8 @@ The script intentionally keeps the detection pipeline simple and deterministic:
 from __future__ import annotations
 
 import argparse
+import heapq
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -83,6 +85,8 @@ CAMERA_INDEX = 1
 # Schematic sizing is chosen to keep the correct 180:120 = 3:2 field aspect ratio.
 SCHEMATIC_WIDTH_PX = 900
 SCHEMATIC_HEIGHT_PX = 600
+SCHEMATIC_WINDOW_NAME = "2D Schematic"
+ROBOT_RADIUS_CM = 15
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,18 @@ class HSVRange:
 
     lower: np.ndarray
     upper: np.ndarray
+
+
+@dataclass
+class AppState:
+    """Mutable UI state used by the schematic click-to-plan interaction."""
+
+    latest_frame_shape: tuple[int, int, int] | None = None
+    latest_red_zones: list[RedZoneDetection] | None = None
+    latest_white_balls: list[BallDetection] | None = None
+    latest_orange_balls: list[BallDetection] | None = None
+    selected_start_cm: tuple[int, int] | None = None
+    route_points_cm: list[tuple[int, int]] | None = None
 
 
 def noop(_value: int) -> None:
@@ -556,12 +572,209 @@ def map_point_between_frames(
     return x, y
 
 
+def source_point_to_field_cm(point: tuple[int, int], source_size: tuple[int, int]) -> tuple[int, int]:
+    """Map a source-frame pixel to a 1 cm occupancy-grid coordinate."""
+    src_width, src_height = source_size
+    x = int(round(point[0] * (FIELD_WIDTH_CM - 1) / max(1, src_width - 1)))
+    y = int(round(point[1] * (FIELD_HEIGHT_CM - 1) / max(1, src_height - 1)))
+    return (
+        int(np.clip(x, 0, FIELD_WIDTH_CM - 1)),
+        int(np.clip(y, 0, FIELD_HEIGHT_CM - 1)),
+    )
+
+
+def field_cm_to_schematic(point_cm: tuple[int, int]) -> tuple[int, int]:
+    """Map a 1 cm grid coordinate to the schematic window."""
+    return map_point_between_frames(
+        point_cm,
+        (FIELD_WIDTH_CM, FIELD_HEIGHT_CM),
+        (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
+    )
+
+
+def contour_to_field_grid(contour: np.ndarray, source_size: tuple[int, int]) -> np.ndarray:
+    """Convert a contour from source pixels to the 1 cm occupancy grid."""
+    mapped_points = [
+        source_point_to_field_cm((int(point[0][0]), int(point[0][1])), source_size)
+        for point in contour
+    ]
+    return np.array(mapped_points, dtype=np.int32).reshape((-1, 1, 2))
+
+
+def build_occupancy_grid(frame_shape: tuple[int, int, int], red_zones: list[RedZoneDetection]) -> np.ndarray:
+    """Build a 1 cm binary occupancy grid with a dilated red-zone safety margin."""
+    source_height, source_width = frame_shape[:2]
+    grid = np.zeros((FIELD_HEIGHT_CM, FIELD_WIDTH_CM), dtype=np.uint8)
+
+    for zone in red_zones:
+        grid_contour = contour_to_field_grid(zone.corrected_contour, (source_width, source_height))
+        cv2.fillPoly(grid, [grid_contour], 1)
+
+    kernel_size = max(1, int(2 * ROBOT_RADIUS_CM + 1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    dilated = cv2.dilate(grid, kernel, iterations=1)
+    return (dilated > 0).astype(np.uint8)
+
+
+def a_star_search(grid: np.ndarray, start_node: tuple[int, int], goal_node: tuple[int, int]) -> list[tuple[int, int]]:
+    """Run 8-connected A* search on a binary occupancy grid."""
+    width = int(grid.shape[1])
+    height = int(grid.shape[0])
+
+    def in_bounds(node: tuple[int, int]) -> bool:
+        return 0 <= node[0] < width and 0 <= node[1] < height
+
+    def is_free(node: tuple[int, int]) -> bool:
+        return grid[node[1], node[0]] == 0
+
+    if not in_bounds(start_node) or not in_bounds(goal_node):
+        return []
+    if not is_free(start_node) or not is_free(goal_node):
+        return []
+
+    neighbors = [
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)),
+        (-1, 1, math.sqrt(2.0)),
+        (1, 1, math.sqrt(2.0)),
+    ]
+
+    def heuristic(node: tuple[int, int], goal: tuple[int, int]) -> float:
+        return math.hypot(goal[0] - node[0], goal[1] - node[1])
+
+    open_heap: list[tuple[float, float, tuple[int, int]]] = []
+    heapq.heappush(open_heap, (heuristic(start_node, goal_node), 0.0, start_node))
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    g_score = {start_node: 0.0}
+
+    while open_heap:
+        _f_cost, current_cost, current = heapq.heappop(open_heap)
+        if current == goal_node:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            path.reverse()
+            return path
+
+        if current_cost > g_score.get(current, float("inf")):
+            continue
+
+        for dx, dy, step_cost in neighbors:
+            neighbor = (current[0] + dx, current[1] + dy)
+            if not in_bounds(neighbor) or not is_free(neighbor):
+                continue
+
+            tentative_g = g_score[current] + step_cost
+            if tentative_g >= g_score.get(neighbor, float("inf")):
+                continue
+
+            came_from[neighbor] = current
+            g_score[neighbor] = tentative_g
+            heapq.heappush(
+                open_heap,
+                (tentative_g + heuristic(neighbor, goal_node), tentative_g, neighbor),
+            )
+
+    return []
+
+
+def build_greedy_route(
+    grid: np.ndarray,
+    ball_nodes_cm: list[tuple[int, int]],
+    start_node_cm: tuple[int, int],
+) -> list[tuple[int, int]]:
+    """Greedily connect the start ball to the nearest reachable unvisited balls."""
+    if not ball_nodes_cm:
+        return []
+
+    unvisited = list(ball_nodes_cm)
+    current = min(unvisited, key=lambda node: math.hypot(node[0] - start_node_cm[0], node[1] - start_node_cm[1]))
+    route: list[tuple[int, int]] = [current]
+    unvisited.remove(current)
+
+    while unvisited:
+        candidate = min(unvisited, key=lambda node: math.hypot(node[0] - current[0], node[1] - current[1]))
+        segment = a_star_search(grid, current, candidate)
+        if not segment:
+            unvisited.remove(candidate)
+            continue
+
+        route.extend(segment[1:])
+        current = candidate
+        unvisited.remove(candidate)
+
+    return route
+
+
+def update_route_from_state(app_state: AppState) -> None:
+    """Recompute the path-planning route from the latest detections and selected start point."""
+    if (
+        app_state.latest_frame_shape is None
+        or app_state.latest_red_zones is None
+        or app_state.latest_white_balls is None
+        or app_state.latest_orange_balls is None
+        or app_state.selected_start_cm is None
+    ):
+        app_state.route_points_cm = None
+        return
+
+    all_balls = app_state.latest_white_balls + app_state.latest_orange_balls
+    if not all_balls:
+        app_state.route_points_cm = None
+        return
+
+    source_height, source_width = app_state.latest_frame_shape[:2]
+    ball_nodes_cm = [
+        source_point_to_field_cm(ball.corrected_center, (source_width, source_height))
+        for ball in all_balls
+    ]
+    occupancy_grid = build_occupancy_grid(app_state.latest_frame_shape, app_state.latest_red_zones)
+    app_state.route_points_cm = build_greedy_route(
+        occupancy_grid,
+        ball_nodes_cm,
+        app_state.selected_start_cm,
+    )
+
+
+def on_schematic_mouse(event: int, x: int, y: int, _flags: int, userdata: AppState) -> None:
+    """Handle left-click selection of the closest ball in the schematic window."""
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+
+    if userdata.latest_frame_shape is None or userdata.latest_white_balls is None or userdata.latest_orange_balls is None:
+        return
+
+    all_balls = userdata.latest_white_balls + userdata.latest_orange_balls
+    if not all_balls:
+        return
+
+    click_cm = map_point_between_frames(
+        (x, y),
+        (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
+        (FIELD_WIDTH_CM, FIELD_HEIGHT_CM),
+    )
+    source_height, source_width = userdata.latest_frame_shape[:2]
+    nearest_ball = min(
+        all_balls,
+        key=lambda ball: math.hypot(
+            source_point_to_field_cm(ball.corrected_center, (source_width, source_height))[0] - click_cm[0],
+            source_point_to_field_cm(ball.corrected_center, (source_width, source_height))[1] - click_cm[1],
+        ),
+    )
+    userdata.selected_start_cm = source_point_to_field_cm(nearest_ball.corrected_center, (source_width, source_height))
+    update_route_from_state(userdata)
 def draw_schematic(
     frame_shape: tuple[int, int, int],
     red_zones: list[RedZoneDetection],
     white_balls: list[BallDetection],
     orange_balls: list[BallDetection],
     camera_center_pixels: tuple[float, float],
+    app_state: AppState,
 ) -> np.ndarray:
     """Draw a clean synthetic field view containing only the detected objects."""
     source_height, source_width = frame_shape[:2]
@@ -602,6 +815,18 @@ def draw_schematic(
         radius = max(4, int(orange_ball.radius_px * SCHEMATIC_WIDTH_PX / max(1, source_width)))
         cv2.circle(schematic, center, radius, (0, 140, 255), -1, cv2.LINE_AA)
         cv2.circle(schematic, center, radius, (0, 80, 180), 1, cv2.LINE_AA)
+
+    if app_state.route_points_cm:
+        route_points = np.array(
+            [field_cm_to_schematic(point_cm) for point_cm in app_state.route_points_cm],
+            dtype=np.int32,
+        ).reshape((-1, 1, 2))
+        if len(route_points) >= 2:
+            cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
+
+    if app_state.selected_start_cm is not None:
+        selected_start = field_cm_to_schematic(app_state.selected_start_cm)
+        cv2.circle(schematic, selected_start, 8, (0, 255, 255), 2, cv2.LINE_AA)
 
     camera_center_schematic = map_point_between_frames(
         (int(round(camera_center_pixels[0])), int(round(camera_center_pixels[1]))),
@@ -755,7 +980,12 @@ def load_image_frame(image_path: Path) -> np.ndarray:
     return frame
 
 
-def process_frame(frame_bgr: np.ndarray, params: dict[str, object], fps: float) -> tuple[np.ndarray, np.ndarray]:
+def process_frame(
+    frame_bgr: np.ndarray,
+    params: dict[str, object],
+    fps: float,
+    app_state: AppState,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run the full detection pass and build both output panels."""
     camera_center_pixels = (
         float(params["camera_center_x"]),
@@ -763,6 +993,12 @@ def process_frame(frame_bgr: np.ndarray, params: dict[str, object], fps: float) 
     )
     red_zones, red_mask = detect_red_zones(frame_bgr, params, camera_center_pixels)
     white_balls, orange_balls, ball_masks = detect_balls(frame_bgr, params, camera_center_pixels)
+
+    app_state.latest_frame_shape = frame_bgr.shape
+    app_state.latest_red_zones = red_zones
+    app_state.latest_white_balls = white_balls
+    app_state.latest_orange_balls = orange_balls
+    update_route_from_state(app_state)
 
     annotated = annotate_camera_frame(
         frame_bgr=frame_bgr,
@@ -777,9 +1013,11 @@ def process_frame(frame_bgr: np.ndarray, params: dict[str, object], fps: float) 
         white_balls=white_balls,
         orange_balls=orange_balls,
         camera_center_pixels=camera_center_pixels,
+        app_state=app_state,
     )
     masks = build_mask_preview(red_mask, ball_masks["white"], ball_masks["orange"])
-    return np.hstack(resize_to_match_height(annotated, schematic)), masks
+    combined = np.hstack(resize_to_match_height(annotated, schematic))
+    return combined, masks, schematic
 
 
 def configure_camera(cap: cv2.VideoCapture, width: int, height: int) -> None:
@@ -793,12 +1031,15 @@ def configure_camera(cap: cv2.VideoCapture, width: int, height: int) -> None:
 def run_image_mode(image_path: Path) -> int:
     """Run repeated processing on one still image so HSV sliders remain interactive."""
     frame = load_image_frame(image_path)
+    app_state = AppState()
     create_hsv_trackbars((int(frame.shape[1]), int(frame.shape[0])))
+    cv2.namedWindow(SCHEMATIC_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(SCHEMATIC_WINDOW_NAME, on_schematic_mouse, app_state)
 
     while True:
         start = time.perf_counter()
         params = read_hsv_ranges()
-        combined, masks = process_frame(frame, params, fps=0.0)
+        combined, masks, schematic = process_frame(frame, params, fps=0.0, app_state=app_state)
         processing_ms = (time.perf_counter() - start) * 1000.0
 
         cv2.putText(
@@ -813,6 +1054,7 @@ def run_image_mode(image_path: Path) -> int:
         )
 
         cv2.imshow(WINDOW_NAME, combined)
+        cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
         cv2.imshow(MASK_WINDOW_NAME, masks)
         key = cv2.waitKey(20) & 0xFF
         if key in (27, ord("q")):
@@ -843,7 +1085,10 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
         print("Camera read failed", file=sys.stderr)
         cap.release()
         return 1
+    app_state = AppState()
     create_hsv_trackbars((int(initial_frame.shape[1]), int(initial_frame.shape[0])))
+    cv2.namedWindow(SCHEMATIC_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(SCHEMATIC_WINDOW_NAME, on_schematic_mouse, app_state)
     last_tick = time.perf_counter()
 
     try:
@@ -864,7 +1109,12 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
             fps = 1.0 / max(1e-6, now - last_tick)
             last_tick = now
 
-            combined, masks = process_frame(topdown_frame, params, fps=fps)
+            combined, masks, schematic = process_frame(
+                topdown_frame,
+                params,
+                fps=fps,
+                app_state=app_state,
+            )
             processing_ms = (time.perf_counter() - start) * 1000.0
 
             cv2.putText(
@@ -879,6 +1129,7 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
             )
 
             cv2.imshow(WINDOW_NAME, combined)
+            cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
             cv2.imshow(MASK_WINDOW_NAME, masks)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):

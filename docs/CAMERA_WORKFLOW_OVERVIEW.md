@@ -257,7 +257,8 @@ Hvis man vil arbejde fra start til slut, er den normale rækkefølge:
 4. Hvis arenaen er sat op med ArUco-jig, koer [tools/auto_topdown_aruco.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/auto_topdown_aruco.py) for marker-baseret top-down warp
 5. Ellers koer [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py) for at tune HSV og teste top-down warp
 6. Hvis den automatiske hjoernefinding er ustabil, koer [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py) som manuel fallback
-7. Integrer de dele, der virker, ind i den endelige vision-pipeline
+7. Brug [tools/topdown_object_detector.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/topdown_object_detector.py) hvis du vil detektere roede zoner, hvide bolde og orange bolde i et top-down billede og se baade annoteret kameravisning og 2D-skema. Koer f.eks. `python3 tools/topdown_object_detector.py --image test_topdown.png` eller `python3 tools/topdown_object_detector.py --live`.
+8. Integrer de dele, der virker, ind i den endelige vision-pipeline
 
 ## Kort opsummering
 
@@ -267,6 +268,7 @@ Hvis man kun skal huske tre filer, er det:
 - [camera/imageprocessing.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/imageprocessing.py): anvender kalibreringen
 - [tools/auto_topdown_aruco.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/auto_topdown_aruco.py): laver top-down warp ud fra 4 ArUco-markers med cached homography
 - [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py): viser den samlede live-debugkæde
+- [tools/topdown_object_detector.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/topdown_object_detector.py): detekterer bolde og roede zoner i top-down view med trackbars og 2D-skema
 
 Hvis den automatiske top-down detection fejler, er den vigtigste fallback:
 

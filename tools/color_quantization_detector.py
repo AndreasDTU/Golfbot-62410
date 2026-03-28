@@ -20,7 +20,7 @@ from camera.imageprocessing import undistort_with_calibration
 
 
 USE_LIVE_FEED = False
-INPUT_IMAGE = REPO_ROOT / "Bane_undistorted_transformed.png"
+INPUT_IMAGE = REPO_ROOT / "Bane_undistorted.png"
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
 CAMERA_INDEX = 0
 WINDOW_NAME = "Color Quantization Detector"
@@ -32,10 +32,17 @@ KMEANS_EPSILON = 1.0
 MEDIAN_BLUR_SIZE = 5
 BALL_MAX_AREA = 8000.0
 BALL_MAX_ASPECT_RATIO_DELTA = 0.2
+USE_GENERAL_RED_MASK_FOR_RAW_IMGS = True
 CROSS_MIN_AREA = 120.0
 CROSS_MAX_AREA = 50000.0
 CROSS_MIN_SOLIDITY = 0.2
 SCHEMATIC_BALL_RADIUS = 12
+LAB_A_NEUTRAL = 128.0
+DEFAULT_EDGE_TOL = 35
+RED_BORDER_AREA_THRESHOLD = 5000.0
+RED_CROSS_MAX_AREA = 5000.0
+RED_CROSS_MIN_ASPECT_RATIO = 0.5
+RED_CROSS_MAX_ASPECT_RATIO = 2.0
 
 DEFAULT_K = 8
 DEFAULT_TOLERANCE = 15
@@ -248,6 +255,59 @@ def detect_cross(mask: np.ndarray) -> Detection | None:
     return best_detection
 
 
+def contour_touches_frame(contour: np.ndarray, image_shape: tuple[int, int, int]) -> bool:
+    height, width = image_shape[:2]
+    x, y, contour_width, contour_height = cv2.boundingRect(contour)
+    return x <= 2 or y <= 2 or (x + contour_width) >= (width - 2) or (y + contour_height) >= (height - 2)
+
+
+def categorize_red_contours(
+    mask: np.ndarray,
+    image_shape: tuple[int, int, int],
+    min_area: float,
+) -> tuple[Detection | None, list[np.ndarray]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    best_cross: Detection | None = None
+    border_contours: list[np.ndarray] = []
+
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+
+        x, y, width, height = cv2.boundingRect(contour)
+        if height <= 0:
+            continue
+
+        aspect_ratio = float(width) / float(height)
+        center = contour_center(contour)
+
+        if area > RED_BORDER_AREA_THRESHOLD:
+            border_contours.append(contour)
+            continue
+
+        if area > RED_CROSS_MAX_AREA:
+            continue
+
+        if aspect_ratio < RED_CROSS_MIN_ASPECT_RATIO or aspect_ratio > RED_CROSS_MAX_ASPECT_RATIO:
+            continue
+
+        candidate = Detection(
+            label="red",
+            center=center,
+            contour=contour,
+            area=area,
+            circularity=0.0,
+        )
+        if best_cross is not None and candidate.area <= best_cross.area:
+            continue
+
+        best_cross = candidate
+
+    return best_cross, border_contours
+
+
 def draw_cross_marker(image: np.ndarray, center: tuple[int, int], color: tuple[int, int, int], scale: int) -> None:
     x, y = center
     thickness = max(2, scale // 4)
@@ -284,9 +344,11 @@ def build_detection_overlay(
     white_balls: list[Detection],
     orange_balls: list[Detection],
     red_cross: Detection | None,
+    red_borders: list[np.ndarray],
     fps: float | None,
     cluster_info: dict[str, list[int]],
     k_clusters: int,
+    settings: dict[str, float],
 ) -> np.ndarray:
     overlay = original.copy()
 
@@ -298,6 +360,9 @@ def build_detection_overlay(
         (x, y), radius = cv2.minEnclosingCircle(detection.contour)
         cv2.circle(overlay, (int(x), int(y)), int(radius), DISPLAY_COLORS["orange"], 2, cv2.LINE_AA)
 
+    if red_borders:
+        cv2.drawContours(overlay, red_borders, -1, DISPLAY_COLORS["red"], 3, cv2.LINE_AA)
+
     if red_cross is not None:
         x, y, width, height = cv2.boundingRect(red_cross.contour)
         cv2.rectangle(overlay, (x, y), (x + width, y + height), DISPLAY_COLORS["red"], 2, cv2.LINE_AA)
@@ -308,12 +373,32 @@ def build_detection_overlay(
     info_lines = [
         f"Active class: {state.active_class} (w/o/r/f)",
         f"K: {k_clusters}",
+        f"Tol W/O/R: {int(settings['tol_white'])}/{int(settings['tol_orange'])}/{int(settings['tol_red'])}",
+        f"Edge Tol / A min: {int(settings['edge_tol'])} / {int(LAB_A_NEUTRAL + settings['edge_tol'])}",
+        f"Min circ: {settings['min_circularity']:.2f}",
+        f"Min area: {int(settings['min_area'])}",
         f"White balls: {len(white_balls)} clusters={cluster_info['white']}",
         f"Orange balls: {len(orange_balls)} clusters={cluster_info['orange']}",
         f"Red cross: {0 if red_cross is None else 1} clusters={cluster_info['red']}",
+        f"Red borders: {len(red_borders)}",
     ]
     if fps is not None:
         info_lines.append(f"FPS: {fps:.1f}")
+
+    panel_top = 78
+    panel_bottom = panel_top + len(info_lines) * 26 + 18
+    cv2.rectangle(overlay, (8, panel_top - 28), (520, panel_bottom), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (8, panel_top - 28), (520, panel_bottom), (255, 255, 255), 1)
+    cv2.putText(
+        overlay,
+        "Trackbar Readout",
+        (16, panel_top - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
     for index, text in enumerate(info_lines):
         cv2.putText(
@@ -336,6 +421,7 @@ def build_schematic(
     white_balls: list[Detection],
     orange_balls: list[Detection],
     red_cross: Detection | None,
+    red_borders: list[np.ndarray],
 ) -> np.ndarray:
     height, width = image_shape[:2]
     floor_lab = state.target_labs["floor"].reshape((1, 1, 3)).astype(np.uint8)
@@ -350,8 +436,11 @@ def build_schematic(
         cv2.circle(schematic, detection.center, SCHEMATIC_BALL_RADIUS, DISPLAY_COLORS["orange"], -1, cv2.LINE_AA)
         cv2.circle(schematic, detection.center, SCHEMATIC_BALL_RADIUS, (30, 30, 30), 1, cv2.LINE_AA)
 
+    if red_borders:
+        cv2.drawContours(schematic, red_borders, -1, DISPLAY_COLORS["red"], 4, cv2.LINE_AA)
+
     if red_cross is not None:
-        draw_cross_marker(schematic, red_cross.center, DISPLAY_COLORS["red"], SCHEMATIC_BALL_RADIUS + 8)
+        cv2.drawContours(schematic, [red_cross.contour], -1, DISPLAY_COLORS["red"], thickness=cv2.FILLED, lineType=cv2.LINE_AA)
 
     cv2.putText(
         schematic,
@@ -398,9 +487,11 @@ def build_dashboard(
     white_balls: list[Detection],
     orange_balls: list[Detection],
     red_cross: Detection | None,
+    red_borders: list[np.ndarray],
     fps: float | None,
     cluster_info: dict[str, list[int]],
     k_clusters: int,
+    settings: dict[str, float],
 ) -> np.ndarray:
     overlay = build_detection_overlay(
         frame,
@@ -408,26 +499,29 @@ def build_dashboard(
         white_balls,
         orange_balls,
         red_cross,
+        red_borders,
         fps,
         cluster_info,
         k_clusters,
+        settings,
     )
-    schematic = build_schematic(frame.shape, state, white_balls, orange_balls, red_cross)
+    schematic = build_schematic(frame.shape, state, white_balls, orange_balls, red_cross, red_borders)
     return np.hstack((overlay, schematic))
 
 
 def get_trackbar_values() -> dict[str, float]:
-    k_value = clamp_k_value(cv2.getTrackbarPos("K-Value", CONTROLS_WINDOW_NAME))
-    if k_value != cv2.getTrackbarPos("K-Value", CONTROLS_WINDOW_NAME):
-        cv2.setTrackbarPos("K-Value", CONTROLS_WINDOW_NAME, k_value)
+    k_value = clamp_k_value(cv2.getTrackbarPos("K", CONTROLS_WINDOW_NAME))
+    if k_value != cv2.getTrackbarPos("K", CONTROLS_WINDOW_NAME):
+        cv2.setTrackbarPos("K", CONTROLS_WINDOW_NAME, k_value)
 
     return {
         "k": k_value,
-        "tol_white": float(cv2.getTrackbarPos("Tolerance White", CONTROLS_WINDOW_NAME)),
-        "tol_orange": float(cv2.getTrackbarPos("Tolerance Orange", CONTROLS_WINDOW_NAME)),
-        "tol_red": float(cv2.getTrackbarPos("Tolerance Red", CONTROLS_WINDOW_NAME)),
-        "min_circularity": cv2.getTrackbarPos("Min Circularity", CONTROLS_WINDOW_NAME) / 100.0,
-        "min_area": float(cv2.getTrackbarPos("Min Area", CONTROLS_WINDOW_NAME)),
+        "tol_white": float(cv2.getTrackbarPos("Tol W", CONTROLS_WINDOW_NAME)),
+        "tol_orange": float(cv2.getTrackbarPos("Tol O", CONTROLS_WINDOW_NAME)),
+        "tol_red": float(cv2.getTrackbarPos("Tol R", CONTROLS_WINDOW_NAME)),
+        "edge_tol": float(cv2.getTrackbarPos("Edge Tol", CONTROLS_WINDOW_NAME)),
+        "min_circularity": cv2.getTrackbarPos("Circ", CONTROLS_WINDOW_NAME) / 100.0,
+        "min_area": float(cv2.getTrackbarPos("Area", CONTROLS_WINDOW_NAME)),
     }
 
 
@@ -435,7 +529,7 @@ def analyze_frame(
     frame: np.ndarray,
     state: AppState,
     settings: dict[str, float],
-) -> tuple[np.ndarray, np.ndarray, list[Detection], list[Detection], Detection | None, dict[str, list[int]]]:
+) -> tuple[np.ndarray, np.ndarray, list[Detection], list[Detection], Detection | None, list[np.ndarray], dict[str, list[int]]]:
     ensure_quantized_cache(state, frame, int(settings["k"]))
     assert state.cached_quantized is not None
     assert state.cached_label_map is not None
@@ -451,11 +545,18 @@ def analyze_frame(
         state.target_labs["orange"],
         settings["tol_orange"],
     )
-    red_clusters = get_clusters_within_tolerance(
-        state.cached_centers_lab,
-        state.target_labs["red"],
-        settings["tol_red"],
-    )
+    if USE_GENERAL_RED_MASK_FOR_RAW_IMGS:
+        red_clusters = [
+            int(index)
+            for index, lab_color in enumerate(state.cached_centers_lab)
+            if float(lab_color[1]) >= (LAB_A_NEUTRAL + settings["edge_tol"])
+        ]
+    else:
+        red_clusters = get_clusters_within_tolerance(
+            state.cached_centers_lab,
+            state.target_labs["red"],
+            settings["tol_red"],
+        )
 
     white_mask = cluster_mask(state.cached_label_map, white_clusters)
     orange_mask = cluster_mask(state.cached_label_map, orange_clusters)
@@ -473,7 +574,11 @@ def analyze_frame(
         settings["min_area"],
         settings["min_circularity"],
     )
-    red_cross = detect_cross(red_mask)
+    if USE_GENERAL_RED_MASK_FOR_RAW_IMGS:
+        red_cross, red_borders = categorize_red_contours(red_mask, frame.shape, settings["min_area"])
+    else:
+        red_cross = detect_cross(red_mask)
+        red_borders = []
 
     masks = np.dstack((white_mask, orange_mask, red_mask))
     cluster_info = {
@@ -481,7 +586,7 @@ def analyze_frame(
         "orange": orange_clusters,
         "red": red_clusters,
     }
-    return state.cached_quantized, masks, white_balls, orange_balls, red_cross, cluster_info
+    return state.cached_quantized, masks, white_balls, orange_balls, red_cross, red_borders, cluster_info
 
 
 def load_static_image() -> np.ndarray:
@@ -496,12 +601,14 @@ def load_static_image() -> np.ndarray:
 
 def create_controls_window() -> None:
     cv2.namedWindow(CONTROLS_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.createTrackbar("K-Value", CONTROLS_WINDOW_NAME, DEFAULT_K, MAX_K, noop)
-    cv2.createTrackbar("Tolerance White", CONTROLS_WINDOW_NAME, DEFAULT_TOLERANCE, 100, noop)
-    cv2.createTrackbar("Tolerance Orange", CONTROLS_WINDOW_NAME, DEFAULT_TOLERANCE, 100, noop)
-    cv2.createTrackbar("Tolerance Red", CONTROLS_WINDOW_NAME, DEFAULT_TOLERANCE, 100, noop)
-    cv2.createTrackbar("Min Circularity", CONTROLS_WINDOW_NAME, DEFAULT_MIN_CIRCULARITY, 100, noop)
-    cv2.createTrackbar("Min Area", CONTROLS_WINDOW_NAME, DEFAULT_MIN_AREA, 500, noop)
+    cv2.resizeWindow(CONTROLS_WINDOW_NAME, 400, 300)
+    cv2.createTrackbar("K", CONTROLS_WINDOW_NAME, DEFAULT_K, MAX_K, noop)
+    cv2.createTrackbar("Tol W", CONTROLS_WINDOW_NAME, DEFAULT_TOLERANCE, 100, noop)
+    cv2.createTrackbar("Tol O", CONTROLS_WINDOW_NAME, DEFAULT_TOLERANCE, 100, noop)
+    cv2.createTrackbar("Tol R", CONTROLS_WINDOW_NAME, DEFAULT_TOLERANCE, 100, noop)
+    cv2.createTrackbar("Edge Tol", CONTROLS_WINDOW_NAME, DEFAULT_EDGE_TOL, 100, noop)
+    cv2.createTrackbar("Circ", CONTROLS_WINDOW_NAME, DEFAULT_MIN_CIRCULARITY, 100, noop)
+    cv2.createTrackbar("Area", CONTROLS_WINDOW_NAME, DEFAULT_MIN_AREA, 500, noop)
 
 
 def print_sampled_target(label: str, bgr: np.ndarray, lab: np.ndarray) -> None:
@@ -540,7 +647,7 @@ def process_static_image(state: AppState) -> int:
         delta = max(current_time - previous_time, 1e-6)
         previous_time = current_time
 
-        _quantized, masks, white_balls, orange_balls, red_cross, cluster_info = analyze_frame(
+        _quantized, masks, white_balls, orange_balls, red_cross, red_borders, cluster_info = analyze_frame(
             state.current_frame,
             state,
             settings,
@@ -551,9 +658,11 @@ def process_static_image(state: AppState) -> int:
             white_balls,
             orange_balls,
             red_cross,
+            red_borders,
             fps=1.0 / delta,
             cluster_info=cluster_info,
             k_clusters=int(settings["k"]),
+            settings=settings,
         )
         mask_dashboard = build_mask_dashboard(masks[:, :, 0], masks[:, :, 1], masks[:, :, 2])
 
@@ -598,7 +707,7 @@ def process_live_feed(state: AppState) -> int:
             delta = max(current_time - previous_time, 1e-6)
             previous_time = current_time
 
-            _quantized, masks, white_balls, orange_balls, red_cross, cluster_info = analyze_frame(
+            _quantized, masks, white_balls, orange_balls, red_cross, red_borders, cluster_info = analyze_frame(
                 state.current_frame,
                 state,
                 settings,
@@ -609,9 +718,11 @@ def process_live_feed(state: AppState) -> int:
                 white_balls,
                 orange_balls,
                 red_cross,
+                red_borders,
                 fps=1.0 / delta,
                 cluster_info=cluster_info,
                 k_clusters=int(settings["k"]),
+                settings=settings,
             )
             mask_dashboard = build_mask_dashboard(masks[:, :, 0], masks[:, :, 1], masks[:, :, 2])
 

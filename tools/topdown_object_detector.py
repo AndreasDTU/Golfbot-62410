@@ -23,7 +23,7 @@ import heapq
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -128,6 +128,147 @@ class HSVRange:
     upper: np.ndarray
 
 
+@dataclass(frozen=True)
+class SmoothedBallCoordinate:
+    """Smoothed field coordinate paired with the detection that produced it."""
+
+    label: str
+    center_px: tuple[int, int]
+    corrected_center_px: tuple[int, int]
+    cm_x: float
+    cm_y: float
+
+
+@dataclass
+class SmoothedCoordinateTrack:
+    """Persistent EMA state for one detected ball."""
+
+    label: str
+    x_cm: float
+    y_cm: float
+    missed_frames: int = 0
+
+
+class BallCoordinateSmoother:
+    """Smooth per-ball field coordinates over time with deterministic EMA matching."""
+
+    def __init__(
+        self,
+        alpha: float = 0.35,
+        max_match_distance_cm: float = 12.0,
+        max_missed_frames: int = 5,
+    ) -> None:
+        self.alpha = alpha
+        self.max_match_distance_cm = max_match_distance_cm
+        self.max_missed_frames = max_missed_frames
+        self.next_track_id = 0
+        self.tracks: dict[int, SmoothedCoordinateTrack] = {}
+
+    def reset(self) -> None:
+        """Clear all smoothing state."""
+        self.next_track_id = 0
+        self.tracks.clear()
+
+    def update(
+        self,
+        detections: list[BallDetection],
+        frame_shape: tuple[int, int, int],
+    ) -> list[SmoothedBallCoordinate]:
+        """Update smoothing tracks from the current frame's detections."""
+        source_height, source_width = frame_shape[:2]
+        observations = [
+            (
+                index,
+                detection,
+                pixel_to_field_cm(
+                    detection.corrected_center,
+                    (source_width, source_height),
+                ),
+            )
+            for index, detection in enumerate(detections)
+        ]
+
+        matched_tracks: set[int] = set()
+        matched_observations: set[int] = set()
+        smoothed_results: dict[int, SmoothedBallCoordinate] = {}
+
+        labels = sorted({detection.label for detection in detections})
+        for label in labels:
+            label_track_ids = [track_id for track_id, track in self.tracks.items() if track.label == label]
+            label_observations = [
+                (index, detection, cm_point)
+                for index, detection, cm_point in observations
+                if detection.label == label
+            ]
+            candidate_pairs: list[tuple[float, int, int]] = []
+
+            for track_id in label_track_ids:
+                track = self.tracks[track_id]
+                for observation_index, _detection, (raw_x_cm, raw_y_cm) in label_observations:
+                    distance_cm = math.hypot(raw_x_cm - track.x_cm, raw_y_cm - track.y_cm)
+                    candidate_pairs.append((distance_cm, track_id, observation_index))
+
+            candidate_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+            for distance_cm, track_id, observation_index in candidate_pairs:
+                if distance_cm > self.max_match_distance_cm:
+                    continue
+                if track_id in matched_tracks or observation_index in matched_observations:
+                    continue
+
+                track = self.tracks[track_id]
+                detection = detections[observation_index]
+                raw_x_cm, raw_y_cm = pixel_to_field_cm(
+                    detection.corrected_center,
+                    (source_width, source_height),
+                )
+                track.x_cm = self.alpha * raw_x_cm + (1.0 - self.alpha) * track.x_cm
+                track.y_cm = self.alpha * raw_y_cm + (1.0 - self.alpha) * track.y_cm
+                track.missed_frames = 0
+
+                matched_tracks.add(track_id)
+                matched_observations.add(observation_index)
+                smoothed_results[observation_index] = SmoothedBallCoordinate(
+                    label=detection.label,
+                    center_px=detection.center,
+                    corrected_center_px=detection.corrected_center,
+                    cm_x=track.x_cm,
+                    cm_y=track.y_cm,
+                )
+
+        for observation_index, detection, (raw_x_cm, raw_y_cm) in observations:
+            if observation_index in matched_observations:
+                continue
+
+            track_id = self.next_track_id
+            self.next_track_id += 1
+            self.tracks[track_id] = SmoothedCoordinateTrack(
+                label=detection.label,
+                x_cm=raw_x_cm,
+                y_cm=raw_y_cm,
+            )
+            matched_tracks.add(track_id)
+            smoothed_results[observation_index] = SmoothedBallCoordinate(
+                label=detection.label,
+                center_px=detection.center,
+                corrected_center_px=detection.corrected_center,
+                cm_x=raw_x_cm,
+                cm_y=raw_y_cm,
+            )
+
+        stale_track_ids = []
+        for track_id, track in self.tracks.items():
+            if track_id in matched_tracks:
+                continue
+            track.missed_frames += 1
+            if track.missed_frames > self.max_missed_frames:
+                stale_track_ids.append(track_id)
+
+        for track_id in stale_track_ids:
+            del self.tracks[track_id]
+
+        return [smoothed_results[index] for index in range(len(detections))]
+
+
 @dataclass
 class AppState:
     """Mutable UI state used by the schematic click-to-plan interaction."""
@@ -136,8 +277,10 @@ class AppState:
     latest_red_zones: list[RedZoneDetection] | None = None
     latest_white_balls: list[BallDetection] | None = None
     latest_orange_balls: list[BallDetection] | None = None
+    latest_smoothed_ball_coordinates: list[SmoothedBallCoordinate] = field(default_factory=list)
     selected_start_cm: tuple[int, int] | None = None
     route_points_cm: list[tuple[int, int]] | None = None
+    coordinate_smoother: BallCoordinateSmoother = field(default_factory=BallCoordinateSmoother)
 
 
 @dataclass
@@ -416,18 +559,18 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         "white_s_max": 70,
         "white_v_min": 170,
         "white_v_max": 255,
-        "orange_h_min": 8,
-        "orange_h_max": 30,
+        "orange_h_min": 15,
+        "orange_h_max": 28,
         "orange_s_min": 120,
         "orange_s_max": 255,
         "orange_v_min": 120,
         "orange_v_max": 255,
         "red_min_area": 400,
-        "ball_min_area": 20,
+        "ball_min_area": 157,
         "ball_max_area": 2500,
         "ball_min_circ": 70,
-        "cam_height_cm": 180,
-        "calib_z_cm": 8,
+        "cam_height_cm": 179,
+        "calib_z_cm": 7,
         "cam_center_x": frame_width // 2,
         "cam_center_y": frame_height // 2,
     }
@@ -771,6 +914,17 @@ def map_point_between_frames(
     return x, y
 
 
+def pixel_to_field_cm(point: tuple[int, int], source_size: tuple[int, int]) -> tuple[float, float]:
+    """Convert top-down pixel coordinates to field cm with origin at the bottom-left."""
+    src_width, src_height = source_size
+    x_cm = float(point[0]) * FIELD_WIDTH_CM / max(1, src_width - 1)
+    y_cm = FIELD_HEIGHT_CM - (float(point[1]) * FIELD_HEIGHT_CM / max(1, src_height - 1))
+    return (
+        float(np.clip(x_cm, 0.0, FIELD_WIDTH_CM)),
+        float(np.clip(y_cm, 0.0, FIELD_HEIGHT_CM)),
+    )
+
+
 def source_point_to_field_cm(point: tuple[int, int], source_size: tuple[int, int]) -> tuple[int, int]:
     """Map a source-frame pixel to a 1 cm occupancy-grid coordinate."""
     src_width, src_height = source_size
@@ -972,6 +1126,7 @@ def draw_schematic(
     red_zones: list[RedZoneDetection],
     white_balls: list[BallDetection],
     orange_balls: list[BallDetection],
+    smoothed_ball_coordinates: list[SmoothedBallCoordinate],
     camera_center_pixels: tuple[float, float],
     app_state: AppState,
 ) -> np.ndarray:
@@ -1014,6 +1169,23 @@ def draw_schematic(
         radius = max(4, int(orange_ball.radius_px * SCHEMATIC_WIDTH_PX / max(1, source_width)))
         cv2.circle(schematic, center, radius, (0, 140, 255), -1, cv2.LINE_AA)
         cv2.circle(schematic, center, radius, (0, 80, 180), 1, cv2.LINE_AA)
+
+    for smoothed_ball in smoothed_ball_coordinates:
+        text_anchor = map_point_between_frames(
+            smoothed_ball.corrected_center_px,
+            (source_width, source_height),
+            (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
+        )
+        cv2.putText(
+            schematic,
+            f"X: {smoothed_ball.cm_x:.1f}, Y: {smoothed_ball.cm_y:.1f}",
+            (text_anchor[0] + 10, max(20, text_anchor[1] - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
     if app_state.route_points_cm:
         route_points = np.array(
@@ -1221,11 +1393,16 @@ def process_frame(
     )
     red_zones, red_mask = detect_red_zones(frame_bgr, params, camera_center_pixels)
     white_balls, orange_balls, ball_masks = detect_balls(frame_bgr, params, camera_center_pixels)
+    smoothed_ball_coordinates = app_state.coordinate_smoother.update(
+        white_balls + orange_balls,
+        frame_bgr.shape,
+    )
 
     app_state.latest_frame_shape = frame_bgr.shape
     app_state.latest_red_zones = red_zones
     app_state.latest_white_balls = white_balls
     app_state.latest_orange_balls = orange_balls
+    app_state.latest_smoothed_ball_coordinates = smoothed_ball_coordinates
     update_route_from_state(app_state)
 
     annotated = annotate_camera_frame(
@@ -1240,6 +1417,7 @@ def process_frame(
         red_zones=red_zones,
         white_balls=white_balls,
         orange_balls=orange_balls,
+        smoothed_ball_coordinates=smoothed_ball_coordinates,
         camera_center_pixels=camera_center_pixels,
         app_state=app_state,
     )
@@ -1350,8 +1528,10 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 app_state.latest_red_zones = None
                 app_state.latest_white_balls = None
                 app_state.latest_orange_balls = None
+                app_state.latest_smoothed_ball_coordinates = []
                 app_state.selected_start_cm = None
                 app_state.route_points_cm = None
+                app_state.coordinate_smoother.reset()
                 masks = build_mask_preview(
                     np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
                     np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
@@ -1362,6 +1542,7 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                     red_zones=[],
                     white_balls=[],
                     orange_balls=[],
+                    smoothed_ball_coordinates=[],
                     camera_center_pixels=(
                         float(params["camera_center_x"]),
                         float(params["camera_center_y"]),
@@ -1408,6 +1589,8 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 break
             if key == ord("r"):
                 selection_state.clear_points()
+                app_state.coordinate_smoother.reset()
+                app_state.latest_smoothed_ball_coordinates = []
                 app_state.selected_start_cm = None
                 app_state.route_points_cm = None
     finally:

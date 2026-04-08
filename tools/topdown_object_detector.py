@@ -7,7 +7,7 @@ This tool supports two input modes:
 
 The output is shown as:
 - Left: annotated top-down camera frame
-- Right: synthetic 2D schematic of the 180x120 cm field
+- Right: synthetic 2D schematic of the measured field
 
 The script intentionally keeps the detection pipeline simple and deterministic:
 - HSV thresholding
@@ -38,8 +38,10 @@ if str(REPO_ROOT) not in sys.path:
 from camera.imageprocessing import undistort_with_calibration
 
 
-FIELD_WIDTH_CM = 180
-FIELD_HEIGHT_CM = 120
+FIELD_WIDTH_CM = 167.0
+FIELD_HEIGHT_CM = 121.5
+FIELD_GRID_WIDTH_CM = int(round(FIELD_WIDTH_CM))
+FIELD_GRID_HEIGHT_CM = int(round(FIELD_HEIGHT_CM))
 Z_BALL_CM = 2.0
 Z_FLOOR_CM = 0.0
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
@@ -121,7 +123,7 @@ LOUPE_SCALE = 5
 LOUPE_PADDING = 12
 POINT_RADIUS = 6
 
-# Schematic sizing is chosen to keep the correct 180:120 = 3:2 field aspect ratio.
+# Schematic sizing is kept fixed for the detector UI while coordinate math uses the measured field size.
 SCHEMATIC_WIDTH_PX = 900
 SCHEMATIC_HEIGHT_PX = 600
 SCHEMATIC_WINDOW_NAME = "2D Schematic"
@@ -1021,8 +1023,8 @@ def field_metric_cm_to_grid_node(point_cm: tuple[float, float]) -> tuple[int, in
     """Convert bottom-left metric coordinates to top-left grid nodes."""
     x_cm, y_cm = point_cm
     return (
-        int(np.clip(round(x_cm), 0, FIELD_WIDTH_CM - 1)),
-        int(np.clip(round(FIELD_HEIGHT_CM - y_cm), 0, FIELD_HEIGHT_CM - 1)),
+        int(np.clip(round(x_cm), 0, FIELD_GRID_WIDTH_CM - 1)),
+        int(np.clip(round(FIELD_HEIGHT_CM - y_cm), 0, FIELD_GRID_HEIGHT_CM - 1)),
     )
 
 
@@ -1051,11 +1053,11 @@ def schematic_to_field_metric_cm(point_px: tuple[int, int]) -> tuple[float, floa
 def source_point_to_field_cm(point: tuple[int, int], source_size: tuple[int, int]) -> tuple[int, int]:
     """Map a source-frame pixel to a 1 cm occupancy-grid coordinate."""
     src_width, src_height = source_size
-    x = int(round(point[0] * (FIELD_WIDTH_CM - 1) / max(1, src_width - 1)))
-    y = int(round(point[1] * (FIELD_HEIGHT_CM - 1) / max(1, src_height - 1)))
+    x = int(round(point[0] * (FIELD_GRID_WIDTH_CM - 1) / max(1, src_width - 1)))
+    y = int(round(point[1] * (FIELD_GRID_HEIGHT_CM - 1) / max(1, src_height - 1)))
     return (
-        int(np.clip(x, 0, FIELD_WIDTH_CM - 1)),
-        int(np.clip(y, 0, FIELD_HEIGHT_CM - 1)),
+        int(np.clip(x, 0, FIELD_GRID_WIDTH_CM - 1)),
+        int(np.clip(y, 0, FIELD_GRID_HEIGHT_CM - 1)),
     )
 
 
@@ -1063,7 +1065,7 @@ def field_cm_to_schematic(point_cm: tuple[int, int]) -> tuple[int, int]:
     """Map a 1 cm grid coordinate to the schematic window."""
     return map_point_between_frames(
         point_cm,
-        (FIELD_WIDTH_CM, FIELD_HEIGHT_CM),
+        (FIELD_GRID_WIDTH_CM, FIELD_GRID_HEIGHT_CM),
         (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
     )
 
@@ -1080,7 +1082,7 @@ def contour_to_field_grid(contour: np.ndarray, source_size: tuple[int, int]) -> 
 def build_occupancy_grid(frame_shape: tuple[int, int, int], red_zones: list[RedZoneDetection]) -> np.ndarray:
     """Build a 1 cm binary occupancy grid with a dilated red-zone safety margin."""
     source_height, source_width = frame_shape[:2]
-    grid = np.zeros((FIELD_HEIGHT_CM, FIELD_WIDTH_CM), dtype=np.uint8)
+    grid = np.zeros((FIELD_GRID_HEIGHT_CM, FIELD_GRID_WIDTH_CM), dtype=np.uint8)
 
     for zone in red_zones:
         grid_contour = contour_to_field_grid(zone.corrected_contour, (source_width, source_height))
@@ -1352,7 +1354,7 @@ def draw_schematic(
 
     cv2.putText(
         schematic,
-        f"Field {FIELD_WIDTH_CM}x{FIELD_HEIGHT_CM} cm",
+        f"Field {FIELD_WIDTH_CM:.1f}x{FIELD_HEIGHT_CM:.1f} cm",
         (20, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,

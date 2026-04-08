@@ -46,6 +46,7 @@ DEFAULT_IMAGE = REPO_ROOT / "test_topdown.png"
 WINDOW_NAME = "Top-Down Detector"
 MASK_WINDOW_NAME = "Segmentation Masks"
 CONTROL_WINDOW_NAME = "HSV Controls"
+MANUAL_SELECTOR_WINDOW_NAME = "Manual Top-Down Selector"
 CONTROL_WINDOW_SIZE = (1200, 900)
 TRACKBAR_NAMES = {
     "red1_h_min": "R1 H min",
@@ -80,7 +81,12 @@ TRACKBAR_NAMES = {
 
 # Still-image mode is the safest default for deterministic tuning.
 USE_LIVE_FEED = False
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
+TOPDOWN_WARP_SIZE = (800, 600)
+LOUPE_CROP_SIZE = 40
+LOUPE_SCALE = 5
+LOUPE_PADDING = 12
+POINT_RADIUS = 6
 
 # Schematic sizing is chosen to keep the correct 180:120 = 3:2 field aspect ratio.
 SCHEMATIC_WIDTH_PX = 900
@@ -134,9 +140,202 @@ class AppState:
     route_points_cm: list[tuple[int, int]] | None = None
 
 
+@dataclass
+class TopdownSelectionState:
+    """State for the manual 4-point top-down transform selector."""
+
+    points: list[tuple[int, int]]
+    cursor: tuple[int, int]
+    frame_size: tuple[int, int]
+    transform_matrix: np.ndarray | None = None
+
+    def clear_points(self) -> None:
+        self.points.clear()
+        self.transform_matrix = None
+
+
 def noop(_value: int) -> None:
     """Trackbar callback placeholder."""
     return None
+
+
+def order_points(points: list[tuple[int, int]]) -> np.ndarray:
+    """Order 4 selected corners as top-left, top-right, bottom-right, bottom-left."""
+    corners = np.array(points, dtype=np.float32)
+    sums = corners.sum(axis=1)
+    diffs = np.diff(corners, axis=1).reshape(4)
+
+    top_left = corners[np.argmin(sums)]
+    bottom_right = corners[np.argmax(sums)]
+    top_right = corners[np.argmin(diffs)]
+    bottom_left = corners[np.argmax(diffs)]
+    return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+
+
+def destination_corners(size: tuple[int, int]) -> np.ndarray:
+    """Build the destination rectangle for the perspective warp."""
+    width, height = size
+    return np.array(
+        [
+            [0, 0],
+            [width - 1, 0],
+            [width - 1, height - 1],
+            [0, height - 1],
+        ],
+        dtype=np.float32,
+    )
+
+
+def build_manual_topdown_transform(points: list[tuple[int, int]]) -> np.ndarray:
+    """Compute the manual perspective transform from the 4 selected corners."""
+    return cv2.getPerspectiveTransform(order_points(points), destination_corners(TOPDOWN_WARP_SIZE))
+
+
+def clamp_crop_bounds(center: int, crop_size: int, limit: int) -> tuple[int, int]:
+    """Clamp a crop region so the loupe stays inside the frame bounds."""
+    if limit <= crop_size:
+        return 0, limit
+
+    half = crop_size // 2
+    start = max(0, center - half)
+    end = start + crop_size
+    if end > limit:
+        end = limit
+        start = end - crop_size
+    return start, end
+
+
+def draw_loupe(frame: np.ndarray, state: TopdownSelectionState) -> np.ndarray:
+    """Draw the zoomed cursor loupe used during manual corner selection."""
+    overlay = frame.copy()
+    height, width = overlay.shape[:2]
+    crop_w = min(LOUPE_CROP_SIZE, width)
+    crop_h = min(LOUPE_CROP_SIZE, height)
+
+    x0, x1 = clamp_crop_bounds(state.cursor[0], crop_w, width)
+    y0, y1 = clamp_crop_bounds(state.cursor[1], crop_h, height)
+    crop = overlay[y0:y1, x0:x1]
+    loupe = cv2.resize(
+        crop,
+        (crop.shape[1] * LOUPE_SCALE, crop.shape[0] * LOUPE_SCALE),
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+    loupe_h, loupe_w = loupe.shape[:2]
+    dest_x1 = width - LOUPE_PADDING
+    dest_x0 = max(0, dest_x1 - loupe_w)
+    dest_y0 = LOUPE_PADDING
+    dest_y1 = min(height, dest_y0 + loupe_h)
+
+    visible_loupe = loupe[: dest_y1 - dest_y0, : dest_x1 - dest_x0]
+    overlay[dest_y0:dest_y1, dest_x0:dest_x1] = visible_loupe
+    cv2.rectangle(overlay, (dest_x0, dest_y0), (dest_x1, dest_y1), (255, 255, 255), 2)
+
+    center_x = dest_x0 + visible_loupe.shape[1] // 2
+    center_y = dest_y0 + visible_loupe.shape[0] // 2
+    cv2.line(overlay, (center_x, dest_y0), (center_x, dest_y1), (0, 255, 255), 1)
+    cv2.line(overlay, (dest_x0, center_y), (dest_x1, center_y), (0, 255, 255), 1)
+    cv2.putText(
+        overlay,
+        "Loupe",
+        (dest_x0, max(20, dest_y0 - 6)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return overlay
+
+
+def draw_manual_selection_overlay(frame: np.ndarray, state: TopdownSelectionState) -> np.ndarray:
+    """Render the manual top-down selection view with points, lines, and status."""
+    overlay = draw_loupe(frame, state)
+
+    for index, point in enumerate(state.points, start=1):
+        cv2.circle(overlay, point, POINT_RADIUS, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(overlay, point, POINT_RADIUS + 4, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            overlay,
+            str(index),
+            (point[0] + 10, point[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    if len(state.points) >= 2:
+        polyline = np.array(state.points, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(overlay, [polyline], False, (0, 255, 0), 2, cv2.LINE_AA)
+
+    if len(state.points) == 4:
+        ordered = order_points(state.points).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(overlay, [ordered], True, (255, 200, 0), 2, cv2.LINE_AA)
+
+    help_lines = [
+        f"Points: {len(state.points)}/4",
+        "Left click: add point",
+        "Right click or r: reset",
+        "q: quit",
+    ]
+    for line_index, text in enumerate(help_lines):
+        cv2.putText(
+            overlay,
+            text,
+            (16, 30 + line_index * 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    if state.transform_matrix is not None:
+        status = "Top-down transform active"
+        color = (0, 255, 0)
+    else:
+        status = "Select 4 inner corners for top-down warp"
+        color = (0, 165, 255)
+
+    cv2.putText(
+        overlay,
+        status,
+        (16, overlay.shape[0] - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    return overlay
+
+
+def on_manual_topdown_mouse(
+    event: int,
+    x: int,
+    y: int,
+    _flags: int,
+    param: TopdownSelectionState,
+) -> None:
+    """Handle point selection for the manual top-down warp."""
+    width, height = param.frame_size
+    if width > 0 and height > 0:
+        clamped_x = int(np.clip(x, 0, width - 1))
+        clamped_y = int(np.clip(y, 0, height - 1))
+        param.cursor = (clamped_x, clamped_y)
+
+    if event == cv2.EVENT_RBUTTONDOWN:
+        param.clear_points()
+        return
+
+    if event != cv2.EVENT_LBUTTONDOWN or len(param.points) >= 4:
+        return
+
+    param.points.append(param.cursor)
+    if len(param.points) == 4:
+        param.transform_matrix = build_manual_topdown_transform(param.points)
 
 
 def parse_args() -> argparse.Namespace:
@@ -961,15 +1160,44 @@ def resize_to_match_height(left: np.ndarray, right: np.ndarray) -> tuple[np.ndar
     return left, resized
 
 
-def prepare_live_topdown_frame(frame_bgr: np.ndarray, calibration_file: Path, balance: float) -> np.ndarray:
-    """Undistort the live frame and return the image used for detection.
+def make_topdown_placeholder(message: str) -> np.ndarray:
+    """Create a deterministic placeholder while the manual warp is not ready."""
+    width, height = TOPDOWN_WARP_SIZE
+    placeholder = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(
+        placeholder,
+        message,
+        (30, height // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return placeholder
 
-    This repository already has separate tools for perspective warping.
-    If your live camera stream is not already aligned as top-down after
-    undistortion, insert your existing warp step here.
-    """
+
+def prepare_live_topdown_frame(
+    frame_bgr: np.ndarray,
+    calibration_file: Path,
+    balance: float,
+    selection_state: TopdownSelectionState,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Undistort the live frame and apply the manually selected top-down warp."""
     undistorted = undistort_with_calibration(frame_bgr, str(calibration_file), balance=balance)
-    return undistorted
+    selection_state.frame_size = (int(undistorted.shape[1]), int(undistorted.shape[0]))
+    if selection_state.cursor == (0, 0):
+        selection_state.cursor = (
+            selection_state.frame_size[0] // 2,
+            selection_state.frame_size[1] // 2,
+        )
+
+    selector_view = draw_manual_selection_overlay(undistorted, selection_state)
+    if selection_state.transform_matrix is None:
+        return selector_view, make_topdown_placeholder("Waiting for 4 selected points")
+
+    topdown = cv2.warpPerspective(undistorted, selection_state.transform_matrix, TOPDOWN_WARP_SIZE)
+    return selector_view, topdown
 
 
 def load_image_frame(image_path: Path) -> np.ndarray:
@@ -1086,8 +1314,11 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
         cap.release()
         return 1
     app_state = AppState()
-    create_hsv_trackbars((int(initial_frame.shape[1]), int(initial_frame.shape[0])))
+    selection_state = TopdownSelectionState(points=[], cursor=(0, 0), frame_size=(0, 0))
+    create_hsv_trackbars(TOPDOWN_WARP_SIZE)
     cv2.namedWindow(SCHEMATIC_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(MANUAL_SELECTOR_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(MANUAL_SELECTOR_WINDOW_NAME, on_manual_topdown_mouse, selection_state)
     cv2.setMouseCallback(SCHEMATIC_WINDOW_NAME, on_schematic_mouse, app_state)
     last_tick = time.perf_counter()
 
@@ -1102,19 +1333,59 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                     return 1
 
             start = time.perf_counter()
-            topdown_frame = prepare_live_topdown_frame(raw_frame, CALIBRATION_FILE, balance)
+            selector_view, topdown_frame = prepare_live_topdown_frame(
+                raw_frame,
+                CALIBRATION_FILE,
+                balance,
+                selection_state,
+            )
             params = read_hsv_ranges()
 
             now = time.perf_counter()
             fps = 1.0 / max(1e-6, now - last_tick)
             last_tick = now
 
-            combined, masks, schematic = process_frame(
-                topdown_frame,
-                params,
-                fps=fps,
-                app_state=app_state,
-            )
+            if selection_state.transform_matrix is None:
+                app_state.latest_frame_shape = None
+                app_state.latest_red_zones = None
+                app_state.latest_white_balls = None
+                app_state.latest_orange_balls = None
+                app_state.selected_start_cm = None
+                app_state.route_points_cm = None
+                masks = build_mask_preview(
+                    np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
+                    np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
+                    np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
+                )
+                schematic = draw_schematic(
+                    frame_shape=topdown_frame.shape,
+                    red_zones=[],
+                    white_balls=[],
+                    orange_balls=[],
+                    camera_center_pixels=(
+                        float(params["camera_center_x"]),
+                        float(params["camera_center_y"]),
+                    ),
+                    app_state=app_state,
+                )
+                combined = np.hstack(resize_to_match_height(topdown_frame, schematic))
+                cv2.putText(
+                    combined,
+                    "Waiting for manual top-down selection",
+                    (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 165, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            else:
+                combined, masks, schematic = process_frame(
+                    topdown_frame,
+                    params,
+                    fps=fps,
+                    app_state=app_state,
+                )
             processing_ms = (time.perf_counter() - start) * 1000.0
 
             cv2.putText(
@@ -1128,12 +1399,17 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 cv2.LINE_AA,
             )
 
+            cv2.imshow(MANUAL_SELECTOR_WINDOW_NAME, selector_view)
             cv2.imshow(WINDOW_NAME, combined)
             cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
             cv2.imshow(MASK_WINDOW_NAME, masks)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
+            if key == ord("r"):
+                selection_state.clear_points()
+                app_state.selected_start_cm = None
+                app_state.route_points_cm = None
     finally:
         cap.release()
 

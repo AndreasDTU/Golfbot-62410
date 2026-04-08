@@ -19,6 +19,7 @@ The script intentionally keeps the detection pipeline simple and deterministic:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import heapq
 import math
 import sys
@@ -45,9 +46,11 @@ CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
 DEFAULT_IMAGE = REPO_ROOT / "test_topdown.png"
 WINDOW_NAME = "Top-Down Detector"
 MASK_WINDOW_NAME = "Segmentation Masks"
-CONTROL_WINDOW_NAME = "HSV Controls"
+CONTROL_COLOR_WINDOW_NAME = "HSV Controls - Colors"
+CONTROL_FILTER_WINDOW_NAME = "HSV Controls - Filters"
+CONTROL_GEOMETRY_WINDOW_NAME = "HSV Controls - Geometry"
 MANUAL_SELECTOR_WINDOW_NAME = "Manual Top-Down Selector"
-CONTROL_WINDOW_SIZE = (1200, 900)
+CONTROL_WINDOW_SIZE = (420, 520)
 TRACKBAR_NAMES = {
     "red1_h_min": "R1 H min",
     "red1_h_max": "R1 H max",
@@ -77,6 +80,36 @@ TRACKBAR_NAMES = {
     "calib_z_cm": "Border h cm",
     "cam_center_x": "Cam C X",
     "cam_center_y": "Cam C Y",
+}
+TRACKBAR_WINDOWS = {
+    "red1_h_min": CONTROL_COLOR_WINDOW_NAME,
+    "red1_h_max": CONTROL_COLOR_WINDOW_NAME,
+    "red2_h_min": CONTROL_COLOR_WINDOW_NAME,
+    "red2_h_max": CONTROL_COLOR_WINDOW_NAME,
+    "red_s_min": CONTROL_COLOR_WINDOW_NAME,
+    "red_s_max": CONTROL_COLOR_WINDOW_NAME,
+    "red_v_min": CONTROL_COLOR_WINDOW_NAME,
+    "red_v_max": CONTROL_COLOR_WINDOW_NAME,
+    "white_h_min": CONTROL_COLOR_WINDOW_NAME,
+    "white_h_max": CONTROL_COLOR_WINDOW_NAME,
+    "white_s_min": CONTROL_COLOR_WINDOW_NAME,
+    "white_s_max": CONTROL_COLOR_WINDOW_NAME,
+    "white_v_min": CONTROL_COLOR_WINDOW_NAME,
+    "white_v_max": CONTROL_COLOR_WINDOW_NAME,
+    "orange_h_min": CONTROL_FILTER_WINDOW_NAME,
+    "orange_h_max": CONTROL_FILTER_WINDOW_NAME,
+    "orange_s_min": CONTROL_FILTER_WINDOW_NAME,
+    "orange_s_max": CONTROL_FILTER_WINDOW_NAME,
+    "orange_v_min": CONTROL_FILTER_WINDOW_NAME,
+    "orange_v_max": CONTROL_FILTER_WINDOW_NAME,
+    "red_min_area": CONTROL_FILTER_WINDOW_NAME,
+    "ball_min_area": CONTROL_FILTER_WINDOW_NAME,
+    "ball_max_area": CONTROL_FILTER_WINDOW_NAME,
+    "ball_min_circ": CONTROL_FILTER_WINDOW_NAME,
+    "cam_height_cm": CONTROL_GEOMETRY_WINDOW_NAME,
+    "calib_z_cm": CONTROL_GEOMETRY_WINDOW_NAME,
+    "cam_center_x": CONTROL_GEOMETRY_WINDOW_NAME,
+    "cam_center_y": CONTROL_GEOMETRY_WINDOW_NAME,
 }
 
 # Still-image mode is the safest default for deterministic tuning.
@@ -132,35 +165,50 @@ class HSVRange:
 class SmoothedBallCoordinate:
     """Smoothed field coordinate paired with the detection that produced it."""
 
+    track_id: int
     label: str
     center_px: tuple[int, int]
     corrected_center_px: tuple[int, int]
+    radius_px: int
     cm_x: float
     cm_y: float
 
 
 @dataclass
 class SmoothedCoordinateTrack:
-    """Persistent EMA state for one detected ball."""
+    """Persistent smoothing state for one detected ball."""
 
     label: str
     x_cm: float
     y_cm: float
+    history_x_cm: deque[float] = field(default_factory=lambda: deque(maxlen=5))
+    history_y_cm: deque[float] = field(default_factory=lambda: deque(maxlen=5))
+    stationary_frames: int = 0
     missed_frames: int = 0
 
 
 class BallCoordinateSmoother:
-    """Smooth per-ball field coordinates over time with deterministic EMA matching."""
+    """Smooth per-ball field coordinates with median filtering and stationary hold."""
 
     def __init__(
         self,
-        alpha: float = 0.35,
-        max_match_distance_cm: float = 12.0,
+        alpha_stationary: float = 0.12,
+        alpha_moving: float = 0.35,
+        max_match_distance_cm: float = 10.0,
         max_missed_frames: int = 5,
+        median_window_size: int = 5,
+        stationary_deadband_cm: float = 0.75,
+        moving_threshold_cm: float = 2.0,
+        stationary_confirm_frames: int = 3,
     ) -> None:
-        self.alpha = alpha
+        self.alpha_stationary = alpha_stationary
+        self.alpha_moving = alpha_moving
         self.max_match_distance_cm = max_match_distance_cm
         self.max_missed_frames = max_missed_frames
+        self.median_window_size = median_window_size
+        self.stationary_deadband_cm = stationary_deadband_cm
+        self.moving_threshold_cm = moving_threshold_cm
+        self.stationary_confirm_frames = stationary_confirm_frames
         self.next_track_id = 0
         self.tracks: dict[int, SmoothedCoordinateTrack] = {}
 
@@ -221,18 +269,45 @@ class BallCoordinateSmoother:
                     detection.corrected_center,
                     (source_width, source_height),
                 )
-                track.x_cm = self.alpha * raw_x_cm + (1.0 - self.alpha) * track.x_cm
-                track.y_cm = self.alpha * raw_y_cm + (1.0 - self.alpha) * track.y_cm
+                if track.history_x_cm.maxlen != self.median_window_size:
+                    track.history_x_cm = deque(track.history_x_cm, maxlen=self.median_window_size)
+                if track.history_y_cm.maxlen != self.median_window_size:
+                    track.history_y_cm = deque(track.history_y_cm, maxlen=self.median_window_size)
+
+                track.history_x_cm.append(raw_x_cm)
+                track.history_y_cm.append(raw_y_cm)
+                median_x_cm = float(np.median(np.array(track.history_x_cm, dtype=np.float32)))
+                median_y_cm = float(np.median(np.array(track.history_y_cm, dtype=np.float32)))
+
+                delta_cm = math.hypot(median_x_cm - track.x_cm, median_y_cm - track.y_cm)
+                if delta_cm < self.stationary_deadband_cm:
+                    track.stationary_frames += 1
+                else:
+                    track.stationary_frames = 0
+
+                if track.stationary_frames >= self.stationary_confirm_frames:
+                    # Keep stationary balls visually stable until the change is meaningful.
+                    smoothed_x_cm = track.x_cm
+                    smoothed_y_cm = track.y_cm
+                else:
+                    alpha = self.alpha_moving if delta_cm >= self.moving_threshold_cm else self.alpha_stationary
+                    smoothed_x_cm = alpha * median_x_cm + (1.0 - alpha) * track.x_cm
+                    smoothed_y_cm = alpha * median_y_cm + (1.0 - alpha) * track.y_cm
+                    track.x_cm = smoothed_x_cm
+                    track.y_cm = smoothed_y_cm
+
                 track.missed_frames = 0
 
                 matched_tracks.add(track_id)
                 matched_observations.add(observation_index)
                 smoothed_results[observation_index] = SmoothedBallCoordinate(
+                    track_id=track_id,
                     label=detection.label,
                     center_px=detection.center,
                     corrected_center_px=detection.corrected_center,
-                    cm_x=track.x_cm,
-                    cm_y=track.y_cm,
+                    radius_px=detection.radius_px,
+                    cm_x=smoothed_x_cm,
+                    cm_y=smoothed_y_cm,
                 )
 
         for observation_index, detection, (raw_x_cm, raw_y_cm) in observations:
@@ -241,16 +316,21 @@ class BallCoordinateSmoother:
 
             track_id = self.next_track_id
             self.next_track_id += 1
-            self.tracks[track_id] = SmoothedCoordinateTrack(
+            new_track = SmoothedCoordinateTrack(
                 label=detection.label,
                 x_cm=raw_x_cm,
                 y_cm=raw_y_cm,
             )
+            new_track.history_x_cm.append(raw_x_cm)
+            new_track.history_y_cm.append(raw_y_cm)
+            self.tracks[track_id] = new_track
             matched_tracks.add(track_id)
             smoothed_results[observation_index] = SmoothedBallCoordinate(
+                track_id=track_id,
                 label=detection.label,
                 center_px=detection.center,
                 corrected_center_px=detection.corrected_center,
+                radius_px=detection.radius_px,
                 cm_x=raw_x_cm,
                 cm_y=raw_y_cm,
             )
@@ -278,6 +358,7 @@ class AppState:
     latest_white_balls: list[BallDetection] | None = None
     latest_orange_balls: list[BallDetection] | None = None
     latest_smoothed_ball_coordinates: list[SmoothedBallCoordinate] = field(default_factory=list)
+    selected_ball_track_id: int | None = None
     selected_start_cm: tuple[int, int] | None = None
     route_points_cm: list[tuple[int, int]] | None = None
     coordinate_smoother: BallCoordinateSmoother = field(default_factory=BallCoordinateSmoother)
@@ -541,8 +622,13 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
     Red uses two hue intervals because red wraps across the HSV hue boundary.
     """
     frame_width, frame_height = frame_size
-    cv2.namedWindow(CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CONTROL_WINDOW_NAME, *CONTROL_WINDOW_SIZE)
+    for window_name in (
+        CONTROL_COLOR_WINDOW_NAME,
+        CONTROL_FILTER_WINDOW_NAME,
+        CONTROL_GEOMETRY_WINDOW_NAME,
+    ):
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, *CONTROL_WINDOW_SIZE)
 
     defaults = {
         "red1_h_min": 0,
@@ -577,6 +663,7 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
 
     for key, value in defaults.items():
         name = TRACKBAR_NAMES[key]
+        window_name = TRACKBAR_WINDOWS[key]
         max_value = 179 if "_h_" in key else 255
         if key.endswith("min_area"):
             max_value = 20000
@@ -592,7 +679,12 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
             max_value = max(1, frame_width)
         if key == "cam_center_y":
             max_value = max(1, frame_height)
-        cv2.createTrackbar(name, CONTROL_WINDOW_NAME, value, max_value, noop)
+        cv2.createTrackbar(name, window_name, value, max_value, noop)
+
+
+def get_trackbar_value(key: str) -> int:
+    """Read a trackbar value from the window that owns it."""
+    return cv2.getTrackbarPos(TRACKBAR_NAMES[key], TRACKBAR_WINDOWS[key])
 
 
 def read_hsv_ranges() -> dict[str, object]:
@@ -600,17 +692,17 @@ def read_hsv_ranges() -> dict[str, object]:
     red_1 = HSVRange(
         lower=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red1_h_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_s_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_v_min"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("red1_h_min"),
+                get_trackbar_value("red_s_min"),
+                get_trackbar_value("red_v_min"),
             ],
             dtype=np.uint8,
         ),
         upper=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red1_h_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_s_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_v_max"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("red1_h_max"),
+                get_trackbar_value("red_s_max"),
+                get_trackbar_value("red_v_max"),
             ],
             dtype=np.uint8,
         ),
@@ -618,17 +710,17 @@ def read_hsv_ranges() -> dict[str, object]:
     red_2 = HSVRange(
         lower=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red2_h_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_s_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_v_min"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("red2_h_min"),
+                get_trackbar_value("red_s_min"),
+                get_trackbar_value("red_v_min"),
             ],
             dtype=np.uint8,
         ),
         upper=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red2_h_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_s_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["red_v_max"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("red2_h_max"),
+                get_trackbar_value("red_s_max"),
+                get_trackbar_value("red_v_max"),
             ],
             dtype=np.uint8,
         ),
@@ -636,17 +728,17 @@ def read_hsv_ranges() -> dict[str, object]:
     white = HSVRange(
         lower=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["white_h_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["white_s_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["white_v_min"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("white_h_min"),
+                get_trackbar_value("white_s_min"),
+                get_trackbar_value("white_v_min"),
             ],
             dtype=np.uint8,
         ),
         upper=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["white_h_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["white_s_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["white_v_max"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("white_h_max"),
+                get_trackbar_value("white_s_max"),
+                get_trackbar_value("white_v_max"),
             ],
             dtype=np.uint8,
         ),
@@ -654,17 +746,17 @@ def read_hsv_ranges() -> dict[str, object]:
     orange = HSVRange(
         lower=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["orange_h_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["orange_s_min"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["orange_v_min"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("orange_h_min"),
+                get_trackbar_value("orange_s_min"),
+                get_trackbar_value("orange_v_min"),
             ],
             dtype=np.uint8,
         ),
         upper=np.array(
             [
-                cv2.getTrackbarPos(TRACKBAR_NAMES["orange_h_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["orange_s_max"], CONTROL_WINDOW_NAME),
-                cv2.getTrackbarPos(TRACKBAR_NAMES["orange_v_max"], CONTROL_WINDOW_NAME),
+                get_trackbar_value("orange_h_max"),
+                get_trackbar_value("orange_s_max"),
+                get_trackbar_value("orange_v_max"),
             ],
             dtype=np.uint8,
         ),
@@ -675,14 +767,14 @@ def read_hsv_ranges() -> dict[str, object]:
         "red_2": red_2,
         "white": white,
         "orange": orange,
-        "red_min_area": float(cv2.getTrackbarPos(TRACKBAR_NAMES["red_min_area"], CONTROL_WINDOW_NAME)),
-        "ball_min_area": float(cv2.getTrackbarPos(TRACKBAR_NAMES["ball_min_area"], CONTROL_WINDOW_NAME)),
-        "ball_max_area": float(cv2.getTrackbarPos(TRACKBAR_NAMES["ball_max_area"], CONTROL_WINDOW_NAME)),
-        "ball_min_circularity": cv2.getTrackbarPos(TRACKBAR_NAMES["ball_min_circ"], CONTROL_WINDOW_NAME) / 100.0,
-        "h_cam_cm": float(cv2.getTrackbarPos(TRACKBAR_NAMES["cam_height_cm"], CONTROL_WINDOW_NAME)),
-        "z_calib_cm": float(cv2.getTrackbarPos(TRACKBAR_NAMES["calib_z_cm"], CONTROL_WINDOW_NAME)),
-        "camera_center_x": float(cv2.getTrackbarPos(TRACKBAR_NAMES["cam_center_x"], CONTROL_WINDOW_NAME)),
-        "camera_center_y": float(cv2.getTrackbarPos(TRACKBAR_NAMES["cam_center_y"], CONTROL_WINDOW_NAME)),
+        "red_min_area": float(get_trackbar_value("red_min_area")),
+        "ball_min_area": float(get_trackbar_value("ball_min_area")),
+        "ball_max_area": float(get_trackbar_value("ball_max_area")),
+        "ball_min_circularity": get_trackbar_value("ball_min_circ") / 100.0,
+        "h_cam_cm": float(get_trackbar_value("cam_height_cm")),
+        "z_calib_cm": float(get_trackbar_value("calib_z_cm")),
+        "camera_center_x": float(get_trackbar_value("cam_center_x")),
+        "camera_center_y": float(get_trackbar_value("cam_center_y")),
     }
 
 
@@ -925,6 +1017,37 @@ def pixel_to_field_cm(point: tuple[int, int], source_size: tuple[int, int]) -> t
     )
 
 
+def field_metric_cm_to_grid_node(point_cm: tuple[float, float]) -> tuple[int, int]:
+    """Convert bottom-left metric coordinates to top-left grid nodes."""
+    x_cm, y_cm = point_cm
+    return (
+        int(np.clip(round(x_cm), 0, FIELD_WIDTH_CM - 1)),
+        int(np.clip(round(FIELD_HEIGHT_CM - y_cm), 0, FIELD_HEIGHT_CM - 1)),
+    )
+
+
+def field_metric_cm_to_schematic(point_cm: tuple[float, float]) -> tuple[int, int]:
+    """Convert bottom-left metric coordinates to schematic pixels."""
+    x_cm, y_cm = point_cm
+    x_px = int(round(x_cm * (SCHEMATIC_WIDTH_PX - 1) / max(1.0, FIELD_WIDTH_CM)))
+    y_px = int(round((FIELD_HEIGHT_CM - y_cm) * (SCHEMATIC_HEIGHT_PX - 1) / max(1.0, FIELD_HEIGHT_CM)))
+    return (
+        int(np.clip(x_px, 0, SCHEMATIC_WIDTH_PX - 1)),
+        int(np.clip(y_px, 0, SCHEMATIC_HEIGHT_PX - 1)),
+    )
+
+
+def schematic_to_field_metric_cm(point_px: tuple[int, int]) -> tuple[float, float]:
+    """Convert schematic pixels back to bottom-left metric coordinates."""
+    x_px, y_px = point_px
+    x_cm = float(x_px) * FIELD_WIDTH_CM / max(1, SCHEMATIC_WIDTH_PX - 1)
+    y_cm = FIELD_HEIGHT_CM - (float(y_px) * FIELD_HEIGHT_CM / max(1, SCHEMATIC_HEIGHT_PX - 1))
+    return (
+        float(np.clip(x_cm, 0.0, FIELD_WIDTH_CM)),
+        float(np.clip(y_cm, 0.0, FIELD_HEIGHT_CM)),
+    )
+
+
 def source_point_to_field_cm(point: tuple[int, int], source_size: tuple[int, int]) -> tuple[int, int]:
     """Map a source-frame pixel to a 1 cm occupancy-grid coordinate."""
     src_width, src_height = source_size
@@ -1069,22 +1192,29 @@ def update_route_from_state(app_state: AppState) -> None:
     if (
         app_state.latest_frame_shape is None
         or app_state.latest_red_zones is None
-        or app_state.latest_white_balls is None
-        or app_state.latest_orange_balls is None
-        or app_state.selected_start_cm is None
+        or app_state.selected_ball_track_id is None
     ):
         app_state.route_points_cm = None
         return
 
-    all_balls = app_state.latest_white_balls + app_state.latest_orange_balls
-    if not all_balls:
+    smoothed_balls = app_state.latest_smoothed_ball_coordinates
+    if not smoothed_balls:
         app_state.route_points_cm = None
         return
 
-    source_height, source_width = app_state.latest_frame_shape[:2]
+    selected_ball = next(
+        (ball for ball in smoothed_balls if ball.track_id == app_state.selected_ball_track_id),
+        None,
+    )
+    if selected_ball is None:
+        app_state.selected_start_cm = None
+        app_state.route_points_cm = None
+        return
+
+    app_state.selected_start_cm = field_metric_cm_to_grid_node((selected_ball.cm_x, selected_ball.cm_y))
     ball_nodes_cm = [
-        source_point_to_field_cm(ball.corrected_center, (source_width, source_height))
-        for ball in all_balls
+        field_metric_cm_to_grid_node((ball.cm_x, ball.cm_y))
+        for ball in smoothed_balls
     ]
     occupancy_grid = build_occupancy_grid(app_state.latest_frame_shape, app_state.latest_red_zones)
     app_state.route_points_cm = build_greedy_route(
@@ -1099,33 +1229,23 @@ def on_schematic_mouse(event: int, x: int, y: int, _flags: int, userdata: AppSta
     if event != cv2.EVENT_LBUTTONDOWN:
         return
 
-    if userdata.latest_frame_shape is None or userdata.latest_white_balls is None or userdata.latest_orange_balls is None:
+    if userdata.latest_frame_shape is None:
         return
 
-    all_balls = userdata.latest_white_balls + userdata.latest_orange_balls
+    all_balls = userdata.latest_smoothed_ball_coordinates
     if not all_balls:
         return
 
-    click_cm = map_point_between_frames(
-        (x, y),
-        (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
-        (FIELD_WIDTH_CM, FIELD_HEIGHT_CM),
-    )
-    source_height, source_width = userdata.latest_frame_shape[:2]
+    click_cm = schematic_to_field_metric_cm((x, y))
     nearest_ball = min(
         all_balls,
-        key=lambda ball: math.hypot(
-            source_point_to_field_cm(ball.corrected_center, (source_width, source_height))[0] - click_cm[0],
-            source_point_to_field_cm(ball.corrected_center, (source_width, source_height))[1] - click_cm[1],
-        ),
+        key=lambda ball: math.hypot(ball.cm_x - click_cm[0], ball.cm_y - click_cm[1]),
     )
-    userdata.selected_start_cm = source_point_to_field_cm(nearest_ball.corrected_center, (source_width, source_height))
+    userdata.selected_ball_track_id = nearest_ball.track_id
     update_route_from_state(userdata)
 def draw_schematic(
     frame_shape: tuple[int, int, int],
     red_zones: list[RedZoneDetection],
-    white_balls: list[BallDetection],
-    orange_balls: list[BallDetection],
     smoothed_ball_coordinates: list[SmoothedBallCoordinate],
     camera_center_pixels: tuple[float, float],
     app_state: AppState,
@@ -1150,32 +1270,19 @@ def draw_schematic(
         mapped_contour = mapped_contour.astype(np.int32)
         cv2.polylines(schematic, [mapped_contour], True, (0, 0, 255), 3, cv2.LINE_AA)
 
-    for ball in white_balls:
-        center = map_point_between_frames(
-            ball.corrected_center,
-            (source_width, source_height),
-            (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
-        )
-        radius = max(4, int(ball.radius_px * SCHEMATIC_WIDTH_PX / max(1, source_width)))
-        cv2.circle(schematic, center, radius, (245, 245, 245), -1, cv2.LINE_AA)
-        cv2.circle(schematic, center, radius, (120, 120, 120), 1, cv2.LINE_AA)
-
-    for orange_ball in orange_balls:
-        center = map_point_between_frames(
-            orange_ball.corrected_center,
-            (source_width, source_height),
-            (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
-        )
-        radius = max(4, int(orange_ball.radius_px * SCHEMATIC_WIDTH_PX / max(1, source_width)))
-        cv2.circle(schematic, center, radius, (0, 140, 255), -1, cv2.LINE_AA)
-        cv2.circle(schematic, center, radius, (0, 80, 180), 1, cv2.LINE_AA)
-
     for smoothed_ball in smoothed_ball_coordinates:
-        text_anchor = map_point_between_frames(
-            smoothed_ball.corrected_center_px,
-            (source_width, source_height),
-            (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
-        )
+        center = field_metric_cm_to_schematic((smoothed_ball.cm_x, smoothed_ball.cm_y))
+        radius = max(4, int(smoothed_ball.radius_px * SCHEMATIC_WIDTH_PX / max(1, source_width)))
+        if smoothed_ball.label == "white":
+            fill_color = (245, 245, 245)
+            edge_color = (120, 120, 120)
+        else:
+            fill_color = (0, 140, 255)
+            edge_color = (0, 80, 180)
+        cv2.circle(schematic, center, radius, fill_color, -1, cv2.LINE_AA)
+        cv2.circle(schematic, center, radius, edge_color, 1, cv2.LINE_AA)
+
+        text_anchor = center
         label = f"X: {smoothed_ball.cm_x:.1f}, Y: {smoothed_ball.cm_y:.1f}"
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.45
@@ -1211,7 +1318,14 @@ def draw_schematic(
             cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
 
     if app_state.selected_start_cm is not None:
-        selected_start = field_cm_to_schematic(app_state.selected_start_cm)
+        selected_ball = next(
+            (ball for ball in smoothed_ball_coordinates if ball.track_id == app_state.selected_ball_track_id),
+            None,
+        )
+        if selected_ball is not None:
+            selected_start = field_metric_cm_to_schematic((selected_ball.cm_x, selected_ball.cm_y))
+        else:
+            selected_start = field_cm_to_schematic(app_state.selected_start_cm)
         cv2.circle(schematic, selected_start, 8, (0, 255, 255), 2, cv2.LINE_AA)
 
     camera_center_schematic = map_point_between_frames(
@@ -1248,7 +1362,9 @@ def draw_schematic(
     )
     cv2.putText(
         schematic,
-        f"White balls: {len(white_balls)}  Orange balls: {len(orange_balls)}",
+        "White balls: "
+        f"{sum(ball.label == 'white' for ball in smoothed_ball_coordinates)}  Orange balls: "
+        f"{sum(ball.label == 'orange' for ball in smoothed_ball_coordinates)}",
         (20, 60),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -1430,8 +1546,6 @@ def process_frame(
     schematic = draw_schematic(
         frame_shape=frame_bgr.shape,
         red_zones=red_zones,
-        white_balls=white_balls,
-        orange_balls=orange_balls,
         smoothed_ball_coordinates=smoothed_ball_coordinates,
         camera_center_pixels=camera_center_pixels,
         app_state=app_state,
@@ -1544,6 +1658,7 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 app_state.latest_white_balls = None
                 app_state.latest_orange_balls = None
                 app_state.latest_smoothed_ball_coordinates = []
+                app_state.selected_ball_track_id = None
                 app_state.selected_start_cm = None
                 app_state.route_points_cm = None
                 app_state.coordinate_smoother.reset()
@@ -1555,8 +1670,6 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 schematic = draw_schematic(
                     frame_shape=topdown_frame.shape,
                     red_zones=[],
-                    white_balls=[],
-                    orange_balls=[],
                     smoothed_ball_coordinates=[],
                     camera_center_pixels=(
                         float(params["camera_center_x"]),
@@ -1606,6 +1719,7 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 selection_state.clear_points()
                 app_state.coordinate_smoother.reset()
                 app_state.latest_smoothed_ball_coordinates = []
+                app_state.selected_ball_track_id = None
                 app_state.selected_start_cm = None
                 app_state.route_points_cm = None
     finally:

@@ -1176,14 +1176,29 @@ def draw_schematic(
             (source_width, source_height),
             (SCHEMATIC_WIDTH_PX, SCHEMATIC_HEIGHT_PX),
         )
+        label = f"X: {smoothed_ball.cm_x:.1f}, Y: {smoothed_ball.cm_y:.1f}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+        thickness = 2
+        (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+        text_x = text_anchor[0] + 10
+        if text_x + text_width > SCHEMATIC_WIDTH_PX - 1:
+            text_x = max(0, text_anchor[0] - 10 - text_width)
+
+        text_y = text_anchor[1] - 10
+        min_text_y = text_height + baseline
+        if text_y < min_text_y:
+            text_y = min(SCHEMATIC_HEIGHT_PX - baseline - 1, text_anchor[1] + text_height + 10)
+
         cv2.putText(
             schematic,
-            f"X: {smoothed_ball.cm_x:.1f}, Y: {smoothed_ball.cm_y:.1f}",
-            (text_anchor[0] + 10, max(20, text_anchor[1] - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            label,
+            (text_x, text_y),
+            font,
+            font_scale,
             (255, 255, 255),
-            2,
+            thickness,
             cv2.LINE_AA,
         )
 

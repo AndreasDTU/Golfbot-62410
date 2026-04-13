@@ -9,9 +9,10 @@ Det nuvaerende workflow er:
 1. Kalibrer kameraet med et checkerboard.
 2. Gem kalibreringskonstanter i `calibration_data.npz`.
 3. Brug konstanterne til at undistorte billeder eller livefeed.
-4. Segmenter den orange baneramme i HSV.
+4. Vaelg top-down metode: ArUco-markers, HSV-baseret baneramme eller manuel 4-punkts selection.
 5. Find banens geometri.
 6. Warp billedet til et top-down view.
+7. Brug manuel 4-punkts selection som fallback hvis den automatiske hjoernefinding er ustabil.
 
 ## Centrale filer
 
@@ -108,6 +109,40 @@ Hvis det undistortede billede ser helt sort ud, er kalibreringen typisk ustabil 
 
 ## Top-down workflow
 
+### [tools/auto_topdown_aruco.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/auto_topdown_aruco.py)
+
+Dette script laver et automatisk top-down view baseret paa 4 ArUco-markers i stedet for HSV-segmentering.
+
+Det:
+
+1. loader `calibration_data.npz`
+2. aabner livefeed fra kameraet
+3. undistorter hvert frame foerst med `undistort_with_calibration(...)`
+4. detekterer ArUco markers med `cv2.aruco.DICT_4X4_50`
+5. forventer ID `0`, `1`, `2`, `3` som henholdsvis top-left, top-right, bottom-right og bottom-left
+6. bygger `src_points` i fast clockwise orden fra marker-centrene
+7. beregner en homography mod et padded top-down output, saa arenaens yderkanter kommer med
+8. cacher transformationsmatrixen, saa top-down viewet stadig virker, hvis en marker kortvarigt bliver daekket
+
+Vinduer:
+
+- `Live Feed (Debug)`: undistortet livefeed med marker-highlights, centerpunkter og status
+- `Top-Down View`: warpet top-down output eller placeholder, indtil alle 4 markers er laast
+
+Konfiguration:
+
+- `MARKER_DIST_X_CM` og `MARKER_DIST_Y_CM` skal opdateres til de faktiske center-til-center afstande, naar jig-placeringen er endelig
+- `EDGE_OFFSET_CM` bruges til at tage de sidste centimeter fra marker-center til fysisk banevaeg med i warp'en
+- `PIXELS_PER_CM` styrer output-oploesningen
+
+Bruges saadan:
+
+```bash
+python3 tools/auto_topdown_aruco.py
+```
+
+Tryk `q` for at afslutte.
+
 ### [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py)
 
 Dette er det mest komplette live-debug-script i den nuvaerende gren.
@@ -133,6 +168,33 @@ Bruges saadan:
 
 ```bash
 python3 tools/live_topdown_view.py
+```
+
+Tryk `q` for at afslutte.
+
+### [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py)
+
+Dette script er den manuelle fallback til top-down view, naar den automatiske HSV-baserede hjoernefinding ikke er stabil nok.
+
+Det:
+
+1. aabner livefeed fra kameraet
+2. undistorter hvert frame med `undistort_with_calibration(...)`
+3. viser en loupe / forstorrelsesvisning af omraadet under musen
+4. lader brugeren vaelge 4 punkter med venstreklik
+5. nulstiller valgte punkter med hoejreklik eller `r`
+6. bygger en perspektivtransformation, saa snart der er valgt praecist 4 punkter
+7. viser et live `Top-Down View`, som opdateres med den gemte transformationsmatrix
+
+Vinduer:
+
+- `Manual Top-Down Selector`: undistortet livefeed med punkter, linjer og loupe
+- `Top-Down View`: live warp baseret paa de 4 manuelt valgte punkter
+
+Bruges saadan:
+
+```bash
+python3 tools/manual_topdown_view.py
 ```
 
 Tryk `q` for at afslutte.
@@ -192,8 +254,11 @@ Hvis man vil arbejde fra start til slut, er den normale rækkefølge:
 1. Koer [tools/calibrate_camera.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/calibrate_camera.py)
 2. Kontroller at `calibration_data.npz` bliver oprettet
 3. Test undistortion med [tools/live_undistort.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_undistort.py) eller [tools/undistort_bane.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/undistort_bane.py)
-4. Koer [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py) for at tune HSV og teste top-down warp
-5. Integrer de dele, der virker, ind i den endelige vision-pipeline
+4. Hvis arenaen er sat op med ArUco-jig, koer [tools/auto_topdown_aruco.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/auto_topdown_aruco.py) for marker-baseret top-down warp
+5. Ellers koer [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py) for at tune HSV og teste top-down warp
+6. Hvis den automatiske hjoernefinding er ustabil, koer [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py) som manuel fallback
+7. Brug [tools/topdown_object_detector.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/topdown_object_detector.py) hvis du vil detektere roede zoner, hvide bolde og orange bolde i et top-down billede og se baade annoteret kameravisning og 2D-skema. Koer f.eks. `python3 tools/topdown_object_detector.py --image test_topdown.png` eller `python3 tools/topdown_object_detector.py --live`.
+8. Integrer de dele, der virker, ind i den endelige vision-pipeline
 
 ## Kort opsummering
 
@@ -201,4 +266,10 @@ Hvis man kun skal huske tre filer, er det:
 
 - [tools/calibrate_camera.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/calibrate_camera.py): laver kalibreringen
 - [camera/imageprocessing.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/camera/imageprocessing.py): anvender kalibreringen
+- [tools/auto_topdown_aruco.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/auto_topdown_aruco.py): laver top-down warp ud fra 4 ArUco-markers med cached homography
 - [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py): viser den samlede live-debugkæde
+- [tools/topdown_object_detector.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/topdown_object_detector.py): detekterer bolde og roede zoner i top-down view med trackbars og 2D-skema
+
+Hvis den automatiske top-down detection fejler, er den vigtigste fallback:
+
+- [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py): manuel 4-punkts selection med loupe og live top-down warp

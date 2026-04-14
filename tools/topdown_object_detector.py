@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from enum import Enum
 import heapq
 import math
 import sys
@@ -116,18 +117,30 @@ TRACKBAR_WINDOWS = {
 
 # Still-image mode is the safest default for deterministic tuning.
 USE_LIVE_FEED = False
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 TOPDOWN_WARP_SIZE = (800, 600)
 LOUPE_CROP_SIZE = 40
 LOUPE_SCALE = 5
 LOUPE_PADDING = 12
 POINT_RADIUS = 6
+REQUIRED_ARUCO_IDS = (0, 1, 2, 3)
+WALL_THICKNESS_CM = 2.0
+MARKER_OUTER_OFFSET_CM = 10.0
 
 # Schematic sizing is kept fixed for the detector UI while coordinate math uses the measured field size.
 SCHEMATIC_WIDTH_PX = 900
 SCHEMATIC_HEIGHT_PX = 600
 SCHEMATIC_WINDOW_NAME = "2D Schematic"
 ROBOT_RADIUS_CM = 15
+
+
+class CalibrationState(Enum):
+    """Current top-down calibration mode."""
+
+    NEEDS_CALIBRATION = "needs_calibration"
+    CALIBRATED_AUTO = "calibrated_auto"
+    CALIBRATING_MANUAL = "calibrating_manual"
+    CALIBRATED_MANUAL = "calibrated_manual"
 
 
 @dataclass(frozen=True)
@@ -374,10 +387,32 @@ class TopdownSelectionState:
     cursor: tuple[int, int]
     frame_size: tuple[int, int]
     transform_matrix: np.ndarray | None = None
+    calibration_state: CalibrationState = CalibrationState.NEEDS_CALIBRATION
+    aruco_dictionary: object | None = None
+    aruco_detector: object | None = None
+    latest_aruco_centers: dict[int, np.ndarray] = field(default_factory=dict)
+    aruco_available: bool = False
 
     def clear_points(self) -> None:
         self.points.clear()
         self.transform_matrix = None
+        self.latest_aruco_centers.clear()
+        if self.calibration_state in (CalibrationState.CALIBRATING_MANUAL, CalibrationState.CALIBRATED_MANUAL):
+            self.calibration_state = CalibrationState.CALIBRATING_MANUAL
+        else:
+            self.calibration_state = CalibrationState.NEEDS_CALIBRATION
+
+    def start_manual_calibration(self) -> None:
+        self.points.clear()
+        self.transform_matrix = None
+        self.latest_aruco_centers.clear()
+        self.calibration_state = CalibrationState.CALIBRATING_MANUAL
+
+    def start_auto_calibration(self) -> None:
+        self.points.clear()
+        self.transform_matrix = None
+        self.latest_aruco_centers.clear()
+        self.calibration_state = CalibrationState.NEEDS_CALIBRATION
 
 
 def noop(_value: int) -> None:
@@ -415,6 +450,92 @@ def destination_corners(size: tuple[int, int]) -> np.ndarray:
 def build_manual_topdown_transform(points: list[tuple[int, int]]) -> np.ndarray:
     """Compute the manual perspective transform from the 4 selected corners."""
     return cv2.getPerspectiveTransform(order_points(points), destination_corners(TOPDOWN_WARP_SIZE))
+
+
+def build_aruco_detector() -> tuple[object | None, object | None]:
+    """Create an ArUco detector that works across OpenCV versions."""
+    if not hasattr(cv2, "aruco"):
+        return None, None
+
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    if hasattr(cv2.aruco, "DetectorParameters"):
+        parameters = cv2.aruco.DetectorParameters()
+    else:
+        parameters = cv2.aruco.DetectorParameters_create()
+
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        return dictionary, cv2.aruco.ArucoDetector(dictionary, parameters)
+    return dictionary, parameters
+
+
+def detect_aruco_markers(
+    frame: np.ndarray,
+    dictionary: object,
+    detector_or_parameters: object,
+) -> tuple[list[np.ndarray], np.ndarray | None]:
+    """Detect ArUco markers in the already undistorted frame."""
+    if hasattr(detector_or_parameters, "detectMarkers"):
+        corners, ids, _rejected = detector_or_parameters.detectMarkers(frame)
+    else:
+        corners, ids, _rejected = cv2.aruco.detectMarkers(frame, dictionary, parameters=detector_or_parameters)
+    return corners, ids
+
+
+def marker_center(corners: np.ndarray) -> np.ndarray:
+    """Compute the center of one detected marker from its four corners."""
+    return corners.reshape(4, 2).mean(axis=0).astype(np.float32)
+
+
+def extract_required_marker_centers(corners: list[np.ndarray], ids: np.ndarray | None) -> dict[int, np.ndarray]:
+    """Keep only the marker centers needed for automatic homography calibration."""
+    centers: dict[int, np.ndarray] = {}
+    if ids is None:
+        return centers
+
+    for marker_id, marker_corners in zip(ids.flatten().tolist(), corners):
+        if marker_id in REQUIRED_ARUCO_IDS:
+            centers[marker_id] = marker_center(marker_corners)
+    return centers
+
+
+def field_cm_to_topdown_px(x_cm: float, y_cm: float) -> tuple[float, float]:
+    """Map field/world coordinates in centimeters to the fixed top-down pixel plane."""
+    width, height = TOPDOWN_WARP_SIZE
+    scale_x = (width - 1) / FIELD_WIDTH_CM
+    scale_y = (height - 1) / FIELD_HEIGHT_CM
+    return x_cm * scale_x, y_cm * scale_y
+
+
+def aruco_destination_points() -> np.ndarray:
+    """Build the target marker-center positions in the cropped top-down pixel space."""
+    total_offset_cm = WALL_THICKNESS_CM + MARKER_OUTER_OFFSET_CM
+    world_points_cm = (
+        (-total_offset_cm, -total_offset_cm),
+        (FIELD_WIDTH_CM + total_offset_cm, -total_offset_cm),
+        (-total_offset_cm, FIELD_HEIGHT_CM + total_offset_cm),
+        (FIELD_WIDTH_CM + total_offset_cm, FIELD_HEIGHT_CM + total_offset_cm),
+    )
+    return np.array(
+        [field_cm_to_topdown_px(x_cm, y_cm) for x_cm, y_cm in world_points_cm],
+        dtype=np.float32,
+    )
+
+
+def build_auto_topdown_transform(marker_centers: dict[int, np.ndarray]) -> np.ndarray | None:
+    """Compute the perspective transform when all four required markers are visible."""
+    if not all(marker_id in marker_centers for marker_id in REQUIRED_ARUCO_IDS):
+        return None
+
+    src_points = np.array(
+        [
+            marker_centers[0],
+            marker_centers[1],
+            marker_centers[2],
+            marker_centers[3],
+        ],
+        dtype=np.float32,
+    )
+    return cv2.getPerspectiveTransform(src_points, aruco_destination_points())
 
 
 def clamp_crop_bounds(center: int, crop_size: int, limit: int) -> tuple[int, int]:
@@ -502,8 +623,11 @@ def draw_manual_selection_overlay(frame: np.ndarray, state: TopdownSelectionStat
 
     help_lines = [
         f"Points: {len(state.points)}/4",
+        f"Mode: {state.calibration_state.value}",
         "Left click: add point",
         "Right click or r: reset",
+        "a: auto ArUco calibration",
+        "m: manual calibration",
         "q: quit",
     ]
     for line_index, text in enumerate(help_lines):
@@ -518,11 +642,21 @@ def draw_manual_selection_overlay(frame: np.ndarray, state: TopdownSelectionStat
             cv2.LINE_AA,
         )
 
-    if state.transform_matrix is not None:
-        status = "Top-down transform active"
+    if state.transform_matrix is not None and state.calibration_state == CalibrationState.CALIBRATED_AUTO:
+        status = "Top-down transform active (ArUco auto)"
         color = (0, 255, 0)
+    elif state.transform_matrix is not None:
+        status = "Top-down transform active (manual)"
+        color = (0, 255, 0)
+    elif state.calibration_state == CalibrationState.CALIBRATING_MANUAL:
+        status = "Select 4 inner corners for manual top-down warp"
+        color = (0, 165, 255)
+    elif not state.aruco_available:
+        status = "ArUco unavailable, press m for manual calibration"
+        color = (0, 0, 255)
     else:
-        status = "Select 4 inner corners for top-down warp"
+        missing = [str(marker_id) for marker_id in REQUIRED_ARUCO_IDS if marker_id not in state.latest_aruco_centers]
+        status = "Scanning for ArUco markers 0,1,2,3" if not missing else f"Missing ArUco IDs: {', '.join(missing)}"
         color = (0, 165, 255)
 
     cv2.putText(
@@ -562,6 +696,7 @@ def on_manual_topdown_mouse(
     param.points.append(param.cursor)
     if len(param.points) == 4:
         param.transform_matrix = build_manual_topdown_transform(param.points)
+        param.calibration_state = CalibrationState.CALIBRATED_MANUAL
 
 
 def parse_args() -> argparse.Namespace:
@@ -1482,13 +1617,49 @@ def make_topdown_placeholder(message: str) -> np.ndarray:
     return placeholder
 
 
+def draw_detected_aruco_centers(frame: np.ndarray, marker_centers: dict[int, np.ndarray]) -> np.ndarray:
+    """Overlay the detected ArUco marker centers used for auto calibration."""
+    overlay = frame.copy()
+    for marker_id in REQUIRED_ARUCO_IDS:
+        if marker_id not in marker_centers:
+            continue
+
+        center = marker_centers[marker_id]
+        point = (int(round(center[0])), int(round(center[1])))
+        cv2.circle(overlay, point, 6, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.putText(
+            overlay,
+            f"ID {marker_id}",
+            (point[0] + 10, point[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    return overlay
+
+
+def reset_detection_state(app_state: AppState) -> None:
+    """Clear detection state when calibration is not yet valid."""
+    app_state.latest_frame_shape = None
+    app_state.latest_red_zones = None
+    app_state.latest_white_balls = None
+    app_state.latest_orange_balls = None
+    app_state.latest_smoothed_ball_coordinates = []
+    app_state.selected_ball_track_id = None
+    app_state.selected_start_cm = None
+    app_state.route_points_cm = None
+    app_state.coordinate_smoother.reset()
+
+
 def prepare_live_topdown_frame(
     frame_bgr: np.ndarray,
     calibration_file: Path,
     balance: float,
     selection_state: TopdownSelectionState,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Undistort the live frame and apply the manually selected top-down warp."""
+    """Undistort the live frame and apply automatic or manual top-down calibration."""
     undistorted = undistort_with_calibration(frame_bgr, str(calibration_file), balance=balance)
     selection_state.frame_size = (int(undistorted.shape[1]), int(undistorted.shape[0]))
     if selection_state.cursor == (0, 0):
@@ -1497,9 +1668,31 @@ def prepare_live_topdown_frame(
             selection_state.frame_size[1] // 2,
         )
 
-    selector_view = draw_manual_selection_overlay(undistorted, selection_state)
+    debug_view = undistorted.copy()
+    if selection_state.aruco_available and selection_state.calibration_state != CalibrationState.CALIBRATING_MANUAL:
+        corners, ids = detect_aruco_markers(
+            undistorted,
+            selection_state.aruco_dictionary,
+            selection_state.aruco_detector,
+        )
+        selection_state.latest_aruco_centers = extract_required_marker_centers(corners, ids)
+        if ids is not None and len(corners) > 0:
+            cv2.aruco.drawDetectedMarkers(debug_view, corners, ids)
+        debug_view = draw_detected_aruco_centers(debug_view, selection_state.latest_aruco_centers)
+
+        auto_transform = build_auto_topdown_transform(selection_state.latest_aruco_centers)
+        if auto_transform is not None:
+            selection_state.transform_matrix = auto_transform
+            selection_state.calibration_state = CalibrationState.CALIBRATED_AUTO
+            selection_state.points.clear()
+
+    selector_view = draw_manual_selection_overlay(debug_view, selection_state)
     if selection_state.transform_matrix is None:
-        return selector_view, make_topdown_placeholder("Waiting for 4 selected points")
+        if selection_state.calibration_state == CalibrationState.CALIBRATING_MANUAL:
+            return selector_view, make_topdown_placeholder("Waiting for 4 selected points")
+        if not selection_state.aruco_available:
+            return selector_view, make_topdown_placeholder("ArUco unavailable, press m for manual mode")
+        return selector_view, make_topdown_placeholder("Waiting for ArUco markers 0,1,2,3")
 
     topdown = cv2.warpPerspective(undistorted, selection_state.transform_matrix, TOPDOWN_WARP_SIZE)
     return selector_view, topdown
@@ -1623,7 +1816,16 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
         cap.release()
         return 1
     app_state = AppState()
-    selection_state = TopdownSelectionState(points=[], cursor=(0, 0), frame_size=(0, 0))
+    aruco_dictionary, aruco_detector = build_aruco_detector()
+    selection_state = TopdownSelectionState(
+        points=[],
+        cursor=(0, 0),
+        frame_size=(0, 0),
+        calibration_state=CalibrationState.NEEDS_CALIBRATION,
+        aruco_dictionary=aruco_dictionary,
+        aruco_detector=aruco_detector,
+        aruco_available=aruco_dictionary is not None and aruco_detector is not None,
+    )
     create_hsv_trackbars(TOPDOWN_WARP_SIZE)
     cv2.namedWindow(SCHEMATIC_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.namedWindow(MANUAL_SELECTOR_WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -1655,15 +1857,7 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
             last_tick = now
 
             if selection_state.transform_matrix is None:
-                app_state.latest_frame_shape = None
-                app_state.latest_red_zones = None
-                app_state.latest_white_balls = None
-                app_state.latest_orange_balls = None
-                app_state.latest_smoothed_ball_coordinates = []
-                app_state.selected_ball_track_id = None
-                app_state.selected_start_cm = None
-                app_state.route_points_cm = None
-                app_state.coordinate_smoother.reset()
+                reset_detection_state(app_state)
                 masks = build_mask_preview(
                     np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
                     np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
@@ -1682,7 +1876,11 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 combined = np.hstack(resize_to_match_height(topdown_frame, schematic))
                 cv2.putText(
                     combined,
-                    "Waiting for manual top-down selection",
+                    (
+                        "Waiting for manual top-down selection"
+                        if selection_state.calibration_state == CalibrationState.CALIBRATING_MANUAL
+                        else "Waiting for ArUco auto-calibration"
+                    ),
                     (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
@@ -1719,11 +1917,13 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
                 break
             if key == ord("r"):
                 selection_state.clear_points()
-                app_state.coordinate_smoother.reset()
-                app_state.latest_smoothed_ball_coordinates = []
-                app_state.selected_ball_track_id = None
-                app_state.selected_start_cm = None
-                app_state.route_points_cm = None
+                reset_detection_state(app_state)
+            if key == ord("a"):
+                selection_state.start_auto_calibration()
+                reset_detection_state(app_state)
+            if key == ord("m"):
+                selection_state.start_manual_calibration()
+                reset_detection_state(app_state)
     finally:
         cap.release()
 

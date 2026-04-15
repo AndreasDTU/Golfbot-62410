@@ -117,15 +117,15 @@ TRACKBAR_WINDOWS = {
 
 # Still-image mode is the safest default for deterministic tuning.
 USE_LIVE_FEED = False
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 TOPDOWN_WARP_SIZE = (800, 600)
 LOUPE_CROP_SIZE = 40
 LOUPE_SCALE = 5
 LOUPE_PADDING = 12
 POINT_RADIUS = 6
 REQUIRED_ARUCO_IDS = (0, 1, 2, 3)
-WALL_THICKNESS_CM = 2.0
-MARKER_OUTER_OFFSET_CM = 10.0
+WALL_THICKNESS_CM = 1.6
+MARKER_OUTER_OFFSET_CM = 8.0
 
 # Schematic sizing is kept fixed for the detector UI while coordinate math uses the measured field size.
 SCHEMATIC_WIDTH_PX = 900
@@ -512,13 +512,18 @@ def aruco_destination_points() -> np.ndarray:
     world_points_cm = (
         (-total_offset_cm, -total_offset_cm),
         (FIELD_WIDTH_CM + total_offset_cm, -total_offset_cm),
-        (-total_offset_cm, FIELD_HEIGHT_CM + total_offset_cm),
         (FIELD_WIDTH_CM + total_offset_cm, FIELD_HEIGHT_CM + total_offset_cm),
+        (-total_offset_cm, FIELD_HEIGHT_CM + total_offset_cm),
     )
     return np.array(
         [field_cm_to_topdown_px(x_cm, y_cm) for x_cm, y_cm in world_points_cm],
         dtype=np.float32,
     )
+
+
+def topdown_field_corners() -> np.ndarray:
+    """Return the playable field rectangle in the warped top-down pixel plane."""
+    return destination_corners(TOPDOWN_WARP_SIZE)
 
 
 def build_auto_topdown_transform(marker_centers: dict[int, np.ndarray]) -> np.ndarray | None:
@@ -530,8 +535,8 @@ def build_auto_topdown_transform(marker_centers: dict[int, np.ndarray]) -> np.nd
         [
             marker_centers[0],
             marker_centers[1],
-            marker_centers[2],
             marker_centers[3],
+            marker_centers[2],
         ],
         dtype=np.float32,
     )
@@ -1640,6 +1645,66 @@ def draw_detected_aruco_centers(frame: np.ndarray, marker_centers: dict[int, np.
     return overlay
 
 
+def draw_projected_aruco_debug(frame: np.ndarray, transform_matrix: np.ndarray) -> np.ndarray:
+    """Project the field and marker-center geometry back onto the selector view."""
+    overlay = frame.copy()
+    inverse_transform = np.linalg.inv(transform_matrix)
+
+    field_outline = cv2.perspectiveTransform(
+        topdown_field_corners().reshape(-1, 1, 2),
+        inverse_transform,
+    ).astype(np.int32)
+    marker_outline = cv2.perspectiveTransform(
+        aruco_destination_points().reshape(-1, 1, 2),
+        inverse_transform,
+    ).astype(np.int32)
+
+    cv2.polylines(overlay, [field_outline], True, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.polylines(overlay, [marker_outline], True, (255, 200, 0), 2, cv2.LINE_AA)
+
+    field_labels = ("Field TL", "Field TR", "Field BR", "Field BL")
+    for label, point in zip(field_labels, field_outline.reshape(-1, 2)):
+        point_xy = (int(point[0]), int(point[1]))
+        cv2.circle(overlay, point_xy, 5, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            overlay,
+            label,
+            (point_xy[0] + 8, point_xy[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    marker_labels = ("Marker TL", "Marker TR", "Marker BR", "Marker BL")
+    for label, point in zip(marker_labels, marker_outline.reshape(-1, 2)):
+        point_xy = (int(point[0]), int(point[1]))
+        cv2.circle(overlay, point_xy, 4, (255, 200, 0), -1, cv2.LINE_AA)
+        cv2.putText(
+            overlay,
+            label,
+            (point_xy[0] + 8, point_xy[1] + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 200, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        overlay,
+        "Yellow: inferred inner field   Blue: expected ArUco center quad",
+        (16, overlay.shape[0] - 48),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return overlay
+
+
 def reset_detection_state(app_state: AppState) -> None:
     """Clear detection state when calibration is not yet valid."""
     app_state.latest_frame_shape = None
@@ -1685,6 +1750,12 @@ def prepare_live_topdown_frame(
             selection_state.transform_matrix = auto_transform
             selection_state.calibration_state = CalibrationState.CALIBRATED_AUTO
             selection_state.points.clear()
+            debug_view = draw_projected_aruco_debug(debug_view, auto_transform)
+        elif (
+            selection_state.transform_matrix is not None
+            and selection_state.calibration_state == CalibrationState.CALIBRATED_AUTO
+        ):
+            debug_view = draw_projected_aruco_debug(debug_view, selection_state.transform_matrix)
 
     selector_view = draw_manual_selection_overlay(debug_view, selection_state)
     if selection_state.transform_matrix is None:

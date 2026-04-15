@@ -1734,7 +1734,11 @@ def prepare_live_topdown_frame(
         )
 
     debug_view = undistorted.copy()
-    if selection_state.aruco_available and selection_state.calibration_state != CalibrationState.CALIBRATING_MANUAL:
+    manual_mode_active = selection_state.calibration_state in (
+        CalibrationState.CALIBRATING_MANUAL,
+        CalibrationState.CALIBRATED_MANUAL,
+    )
+    if selection_state.aruco_available and not manual_mode_active:
         corners, ids = detect_aruco_markers(
             undistorted,
             selection_state.aruco_dictionary,

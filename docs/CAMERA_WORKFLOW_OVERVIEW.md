@@ -199,6 +199,55 @@ python3 tools/manual_topdown_view.py
 
 Tryk `q` for at afslutte.
 
+### [tools/robot_origin_calibration.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/robot_origin_calibration.py)
+
+Dette script kalibrerer robotens lokale nulpunkt / center of rotation ud fra en eller to ArUco-markers monteret paa robotten.
+
+Det:
+
+1. loader `calibration_data.npz`
+2. undistorter livefeedet
+3. laver eller genbruger en top-down homography
+4. detekterer robot-markerne i top-down billedet
+5. samler marker-positioner mens robotten drejer paa stedet
+6. fitter en cirkel med `cv2.minEnclosingCircle(...)`
+7. checker om spin-banen ligner en ellipse med `cv2.fitEllipse(...)`
+8. gemmer `dx`, `dy` og `alpha` i `robot_calibration.json`
+9. viser live robot-origin som debug-overlay efter kalibrering
+
+Bruges f.eks. saadan med marker ID `10`:
+
+```bash
+python3 tools/robot_origin_calibration.py --camera-index 0 --marker-ids 10 --marker-height-cm 8 --camera-height-cm 100
+```
+
+Eller med to markers, f.eks. ID `10` og `11`:
+
+```bash
+python3 tools/robot_origin_calibration.py --camera-index 0 --marker-ids 10 11 --marker-height-cm 8 --camera-height-cm 100
+```
+
+Foerste gang scriptet startes, skal der vaelges fire arena-hjoerner i det undistortede billede:
+
+- venstreklik: tilfoej punkt
+- hoejreklik eller `r`: nulstil punkter
+- `q`: afslut
+
+Naar top-down viewet er aktivt:
+
+- `c`: start dataopsamling mens robotten spinnes 360 grader paa stedet
+- `s`: stop dataopsamling og beregn robot-origin
+- `Enter`: gem offsets efter robotten er rettet fremad langs top-down billedets positive Y-retning
+- `r`: vaelg ny homography
+- `q`: afslut
+
+Outputfiler:
+
+- `robot_topdown_homography.npz`: gemt manuel top-down transform, saa de fire hjoerner ikke skal klikkes hver gang
+- `robot_calibration.json`: robot-marker offsets `dx`, `dy`, `alpha_rad` og `alpha_deg`
+
+Hvis ellipse-ratioen bliver for hoej, viser scriptet en advarsel. Det betyder typisk, at robotten glider under spin, eller at top-down homographyen skal laves om.
+
 ## Main flow og ældre filer
 
 ### [Main.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/Main.py)
@@ -257,8 +306,9 @@ Hvis man vil arbejde fra start til slut, er den normale rækkefølge:
 4. Hvis arenaen er sat op med ArUco-jig, koer [tools/auto_topdown_aruco.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/auto_topdown_aruco.py) for marker-baseret top-down warp
 5. Ellers koer [tools/live_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/live_topdown_view.py) for at tune HSV og teste top-down warp
 6. Hvis den automatiske hjoernefinding er ustabil, koer [tools/manual_topdown_view.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/manual_topdown_view.py) som manuel fallback
-7. Brug [tools/topdown_object_detector.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/topdown_object_detector.py) hvis du vil detektere roede zoner, hvide bolde og orange bolde i et top-down billede og se baade annoteret kameravisning og 2D-skema. Koer f.eks. `python3 tools/topdown_object_detector.py --image test_topdown.png` eller `python3 tools/topdown_object_detector.py --live`.
-8. Integrer de dele, der virker, ind i den endelige vision-pipeline
+7. Koer [tools/robot_origin_calibration.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/robot_origin_calibration.py), naar robot-marker offsets og center of rotation skal kalibreres
+8. Brug [tools/topdown_object_detector.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/tools/topdown_object_detector.py) hvis du vil detektere roede zoner, hvide bolde og orange bolde i et top-down billede og se baade annoteret kameravisning og 2D-skema. Koer f.eks. `python3 tools/topdown_object_detector.py --image test_topdown.png` eller `python3 tools/topdown_object_detector.py --live`.
+9. Integrer de dele, der virker, ind i den endelige vision-pipeline
 
 ## Kort opsummering
 

@@ -29,7 +29,7 @@ DEFAULT_HOMOGRAPHY_FILE = REPO_ROOT / "robot_topdown_homography.npz"
 LIVE_WINDOW = "Robot Origin Calibration - Undistorted"
 TOPDOWN_WINDOW = "Robot Origin Calibration - Top Down"
 TOPDOWN_SIZE = (1000, 800)
-MARKER_HEIGHT_CM = 8.0
+MARKER_HEIGHT_CM = 9.0
 CAMERA_HEIGHT_CM = 100.0
 MIN_POINTS_PER_MARKER = 20
 ELLIPSE_WARNING_RATIO = 1.12
@@ -263,6 +263,11 @@ def parallax_correct_point(
     return (camera_ground_point + (point - camera_ground_point) * scale).astype(np.float32)
 
 
+def transform_point(point: tuple[float, float], matrix: np.ndarray) -> np.ndarray:
+    src = np.array([[[point[0], point[1]]]], dtype=np.float32)
+    return cv2.perspectiveTransform(src, matrix).reshape(2).astype(np.float32)
+
+
 def marker_yaw(corners: np.ndarray) -> float:
     pts = corners.reshape(4, 2).astype(np.float32)
     top_mid = (pts[0] + pts[1]) * 0.5
@@ -323,16 +328,17 @@ def ellipse_ratio(points: list[tuple[float, float]]) -> float | None:
     return major / minor
 
 
-def rotation_matrix(angle: float) -> np.ndarray:
+def image_yaw_rotation_matrix(angle: float) -> np.ndarray:
+    """Rotate top-down image vectors for yaw measured from +Y with Y pointing down."""
     c = math.cos(angle)
     s = math.sin(angle)
-    return np.array([[c, -s], [s, c]], dtype=np.float32)
+    return np.array([[c, s], [-s, c]], dtype=np.float32)
 
 
 def robot_origin_from_observation(observation: MarkerObservation, marker_calibration: dict[str, float]) -> np.ndarray:
     offset = np.array([marker_calibration["dx"], marker_calibration["dy"]], dtype=np.float32)
     delta_angle = normalize_angle(observation.yaw_rad - float(marker_calibration["alpha_rad"]))
-    rotated_offset = rotation_matrix(delta_angle) @ offset
+    rotated_offset = image_yaw_rotation_matrix(delta_angle) @ offset
     return observation.ground_center - rotated_offset
 
 
@@ -408,15 +414,19 @@ def draw_marker_overlay(frame: np.ndarray, observations: dict[int, MarkerObserva
     for observation in observations.values():
         pts = observation.corners.astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(frame, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
-        center = tuple(int(round(v)) for v in observation.ground_center)
-        cv2.circle(frame, center, 5, (255, 255, 0), -1, cv2.LINE_AA)
+        raw_center = tuple(int(round(v)) for v in observation.center)
+        ground_center = tuple(int(round(v)) for v in observation.ground_center)
+        cv2.circle(frame, raw_center, 4, (255, 0, 0), -1, cv2.LINE_AA)
+        cv2.drawMarker(frame, ground_center, (255, 255, 0), cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+        if np.linalg.norm(observation.ground_center - observation.center) > 1.0:
+            cv2.line(frame, raw_center, ground_center, (255, 255, 0), 1, cv2.LINE_AA)
         axis_len = 45
         end = (
-            int(round(center[0] + math.sin(observation.yaw_rad) * axis_len)),
-            int(round(center[1] + math.cos(observation.yaw_rad) * axis_len)),
+            int(round(raw_center[0] + math.sin(observation.yaw_rad) * axis_len)),
+            int(round(raw_center[1] + math.cos(observation.yaw_rad) * axis_len)),
         )
-        cv2.arrowedLine(frame, center, end, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.25)
-        cv2.putText(frame, f"ID {observation.marker_id}", (center[0] + 8, center[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        cv2.arrowedLine(frame, raw_center, end, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.25)
+        cv2.putText(frame, f"ID {observation.marker_id}", (raw_center[0] + 8, raw_center[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
 
 def draw_path_overlay(frame: np.ndarray, collected_points: dict[int, list[tuple[float, float]]]) -> None:
@@ -460,7 +470,13 @@ def calibration_lines(state: RuntimeState, marker_ids: tuple[int, ...], fps: flo
     else:
         mode = "LIVE VALIDATION"
         action = "c: collect spin | q: quit"
-    return [f"FPS: {fps:.1f}", f"Mode: {mode}", action, f"Points: {counts}"]
+    return [
+        f"FPS: {fps:.1f}",
+        f"Mode: {mode}",
+        action,
+        f"Points: {counts}",
+        "Blue dot: raw marker center | Yellow cross: parallax-corrected tracking point",
+    ]
 
 
 def compute_fitted_centers(state: RuntimeState, marker_ids: tuple[int, ...], min_points: int, warning_ratio: float) -> bool:
@@ -492,13 +508,9 @@ def main() -> int:
         return 2
 
     topdown_size = (int(args.topdown_width), int(args.topdown_height))
-    camera_ground_point = np.array(
-        [
-            args.camera_ground_x if args.camera_ground_x is not None else topdown_size[0] / 2.0,
-            args.camera_ground_y if args.camera_ground_y is not None else topdown_size[1] / 2.0,
-        ],
-        dtype=np.float32,
-    )
+    camera_ground_point: np.ndarray | None = None
+    if args.camera_ground_x is not None and args.camera_ground_y is not None:
+        camera_ground_point = np.array([args.camera_ground_x, args.camera_ground_y], dtype=np.float32)
 
     cv2.ocl.setUseOpenCL(False)
     if not args.calibration_file.exists():
@@ -572,6 +584,12 @@ def main() -> int:
                     homography_state.matrix = build_homography(homography_state.points, topdown_size)
                     save_homography(args.homography_file, homography_state.matrix, topdown_size)
                 continue
+
+            if camera_ground_point is None:
+                camera_ground_point = transform_point(
+                    (undistorted.shape[1] / 2.0, undistorted.shape[0] / 2.0),
+                    homography_state.matrix,
+                )
 
             topdown = cv2.warpPerspective(undistorted, homography_state.matrix, topdown_size)
             observations = extract_observations(

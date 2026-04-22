@@ -46,13 +46,22 @@ from tools.topdown_object_detector import (  # noqa: E402
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
 HOMOGRAPHY_FILE = REPO_ROOT / "robot_topdown_homography.npz"
 ROBOT_CALIBRATION_FILE = REPO_ROOT / "robot_calibration.json"
+NAVIGATOR_TUNING_FILE = REPO_ROOT / "navigator_tuning.json"
 WINDOW_NAME = "Autonomous Navigator"
 MASK_WINDOW_NAME = "Autonomous Masks"
+TUNING_WINDOW_NAME = "Robot Body Tuning"
 
-ROBOT_ARUCO_ID = 0
+# Edit these once for your robot, then run with only --dry or --drive.
+ROBOT_ARUCO_ID = 4
+ROBOT_HOST = "192.168.0.0"  # Replace with the EV3 IP address before using --drive.
+ROBOT_PORT = 5555
+ROBOT_SPEED_COMMAND = "motors"
+DEFAULT_DRY_RUN = True
+
 ROBOT_RADIUS_CM = 15.0
 ROBOT_LENGTH_CM = 30.0
 ROBOT_WIDTH_CM = 25.0
+ROBOT_HEADING_OFFSET_DEG = 0.0
 LOOKAHEAD_CM = 15.0
 GOAL_STOP_DISTANCE_CM = 6.0
 MIN_RED_CLEARANCE_CM = 2.0
@@ -78,6 +87,18 @@ class RobotPose:
 
 
 @dataclass(frozen=True)
+class RobotMarkerCalibration:
+    """Robot marker calibration stored by tools/robot_origin_calibration.py."""
+
+    dx_px: float
+    dy_px: float
+    alpha_rad: float
+    marker_height_cm: float
+    camera_height_cm: float
+    topdown_size: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class TargetBall:
     """Ball selected as the current navigation goal."""
 
@@ -96,6 +117,17 @@ class ControlCommand:
     distance_error_cm: float
     heading_error_rad: float
     waypoint_cm: tuple[float, float]
+
+
+@dataclass
+class RobotBodyTuning:
+    """Visual and heading tuning persisted between runs."""
+
+    length_cm: float = ROBOT_LENGTH_CM
+    width_cm: float = ROBOT_WIDTH_CM
+    heading_offset_deg: float = ROBOT_HEADING_OFFSET_DEG
+    last_saved: tuple[float, float, float] | None = None
+    last_save_time: float = 0.0
 
 
 class SafeMotorInterface:
@@ -121,24 +153,34 @@ class SafeMotorInterface:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run closed-loop autonomous ball navigation.")
+    drive_mode = parser.add_mutually_exclusive_group()
+    drive_mode.add_argument("--dry", dest="dry_run", action="store_true", help="Never connect to or command the robot.")
+    drive_mode.add_argument("--drive", dest="dry_run", action="store_false", help="Connect to the EV3 and send motor commands.")
+    parser.set_defaults(dry_run=DEFAULT_DRY_RUN)
     parser.add_argument("--camera-index", type=int, default=CAMERA_INDEX)
     parser.add_argument("--width", type=int, default=0, help="Optional camera width; 0 uses calibration width.")
     parser.add_argument("--height", type=int, default=0, help="Optional camera height; 0 uses calibration height.")
     parser.add_argument("--balance", type=float, default=FISHEYE_BALANCE)
-    parser.add_argument("--robot-marker-id", type=int, default=ROBOT_ARUCO_ID)
-    parser.add_argument("--motor-module", default="motor_control", help="Module exposing set_motors(left, right).")
-    parser.add_argument("--robot-host", default="", help="EV3 host/IP for the TCP server in robot code/robot_server.py.")
-    parser.add_argument("--robot-port", type=int, default=5555)
+    parser.add_argument("--robot-marker-id", type=int, default=ROBOT_ARUCO_ID, help=argparse.SUPPRESS)
+    parser.add_argument("--motor-module", default="motor_control", help=argparse.SUPPRESS)
+    parser.add_argument("--robot-host", default=ROBOT_HOST, help=argparse.SUPPRESS)
+    parser.add_argument("--robot-port", type=int, default=ROBOT_PORT, help=argparse.SUPPRESS)
     parser.add_argument(
         "--robot-speed-command",
-        default="motors",
-        help="TCP command verb for non-blocking left/right speed, e.g. 'motors <left> <right>'.",
+        default=ROBOT_SPEED_COMMAND,
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--require-motors", action="store_true", help="Exit if set_motors cannot be imported.")
+    parser.add_argument("--require-motors", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--max-speed", type=float, default=MAX_SAFE_SPEED)
     parser.add_argument("--kp-distance", type=float, default=KP_DISTANCE)
     parser.add_argument("--kp-turn", type=float, default=KP_TURN)
     parser.add_argument("--lookahead-cm", type=float, default=LOOKAHEAD_CM)
+    parser.add_argument(
+        "--heading-offset-deg",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--control-hz", type=float, default=CONTROL_HZ)
     parser.add_argument("--no-display", action="store_true")
     return parser.parse_args()
@@ -216,6 +258,65 @@ def default_hsv_params(frame_size: tuple[int, int]) -> dict[str, object]:
     }
 
 
+def load_body_tuning(path: Path) -> RobotBodyTuning:
+    tuning = RobotBodyTuning()
+    if not path.exists():
+        return tuning
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return tuning
+
+    tuning.length_cm = float(data.get("length_cm", tuning.length_cm))
+    tuning.width_cm = float(data.get("width_cm", tuning.width_cm))
+    tuning.heading_offset_deg = float(data.get("heading_offset_deg", tuning.heading_offset_deg))
+    tuning.length_cm = float(np.clip(tuning.length_cm, 5.0, 100.0))
+    tuning.width_cm = float(np.clip(tuning.width_cm, 5.0, 80.0))
+    tuning.heading_offset_deg = float(np.clip(tuning.heading_offset_deg, -180.0, 180.0))
+    tuning.last_saved = (tuning.length_cm, tuning.width_cm, tuning.heading_offset_deg)
+    return tuning
+
+
+def save_body_tuning(path: Path, tuning: RobotBodyTuning) -> None:
+    data = {
+        "length_cm": round(float(tuning.length_cm), 3),
+        "width_cm": round(float(tuning.width_cm), 3),
+        "heading_offset_deg": round(float(tuning.heading_offset_deg), 3),
+    }
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tuning.last_saved = (tuning.length_cm, tuning.width_cm, tuning.heading_offset_deg)
+    tuning.last_save_time = time.perf_counter()
+
+
+def noop(_value: int) -> None:
+    return None
+
+
+def create_body_tuning_sliders(tuning: RobotBodyTuning) -> None:
+    cv2.namedWindow(TUNING_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(TUNING_WINDOW_NAME, 420, 180)
+    cv2.createTrackbar("Body length cm", TUNING_WINDOW_NAME, int(round(tuning.length_cm)), 100, noop)
+    cv2.createTrackbar("Body width cm", TUNING_WINDOW_NAME, int(round(tuning.width_cm)), 80, noop)
+    heading_value = int(round(np.clip(tuning.heading_offset_deg + 180.0, 0.0, 360.0)))
+    cv2.createTrackbar("Heading deg +180", TUNING_WINDOW_NAME, heading_value, 360, noop)
+
+
+def read_body_tuning_sliders(tuning: RobotBodyTuning) -> None:
+    tuning.length_cm = float(np.clip(cv2.getTrackbarPos("Body length cm", TUNING_WINDOW_NAME), 5, 100))
+    tuning.width_cm = float(np.clip(cv2.getTrackbarPos("Body width cm", TUNING_WINDOW_NAME), 5, 80))
+    tuning.heading_offset_deg = float(cv2.getTrackbarPos("Heading deg +180", TUNING_WINDOW_NAME) - 180)
+
+
+def autosave_body_tuning(path: Path, tuning: RobotBodyTuning) -> None:
+    current = (tuning.length_cm, tuning.width_cm, tuning.heading_offset_deg)
+    if tuning.last_saved == current:
+        return
+    now = time.perf_counter()
+    if now - tuning.last_save_time < 0.5:
+        return
+    save_body_tuning(path, tuning)
+
+
 def load_undistort_maps(calibration_file: Path, balance: float) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
     data = np.load(str(calibration_file))
     camera_matrix = data["K"]
@@ -246,18 +347,55 @@ def load_homography(homography_file: Path) -> tuple[np.ndarray, tuple[int, int]]
     return homography, size
 
 
-def load_robot_offsets(calibration_file: Path, marker_id: int) -> tuple[float, float, float]:
+def load_robot_calibration(calibration_file: Path, marker_id: int) -> RobotMarkerCalibration:
     with calibration_file.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     marker = data.get("markers", {}).get(str(marker_id))
     if marker is None:
         raise KeyError(f"robot_calibration.json has no marker entry for ID {marker_id}")
-    return float(marker["dx"]), float(marker["dy"]), float(marker["alpha_rad"])
+    topdown_size = tuple(int(value) for value in data.get("topdown_size", TOPDOWN_WARP_SIZE))
+    return RobotMarkerCalibration(
+        dx_px=float(marker["dx"]),
+        dy_px=float(marker["dy"]),
+        alpha_rad=float(marker["alpha_rad"]),
+        marker_height_cm=float(data.get("marker_height_cm", 0.0)),
+        camera_height_cm=float(data.get("camera_height_cm", 0.0)),
+        topdown_size=topdown_size,
+    )
 
 
 def normalize_angle(angle_rad: float) -> float:
     """Normalize an angle to [-pi, pi]."""
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+
+def image_yaw_rotation_matrix(angle_rad: float) -> np.ndarray:
+    """Match robot_origin_calibration.py yaw rotation in top-down image coordinates."""
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    return np.array([[cos_a, sin_a], [-sin_a, cos_a]], dtype=np.float32)
+
+
+def marker_yaw_topdown_px(corners_px: np.ndarray) -> float:
+    """Return ArUco yaw measured from +Y in the top-down image coordinate system."""
+    pts = corners_px.reshape(4, 2).astype(np.float32)
+    top_mid = (pts[0] + pts[1]) * 0.5
+    bottom_mid = (pts[2] + pts[3]) * 0.5
+    marker_forward = bottom_mid - top_mid
+    return float(math.atan2(marker_forward[0], marker_forward[1]))
+
+
+def parallax_correct_topdown_point(
+    point_px: np.ndarray,
+    camera_ground_point_px: np.ndarray,
+    marker_height_cm: float,
+    camera_height_cm: float,
+) -> np.ndarray:
+    """Apply the same marker-height correction used when robot_calibration.json is saved."""
+    if marker_height_cm <= 0.0 or camera_height_cm <= marker_height_cm:
+        return point_px.astype(np.float32)
+    scale = (camera_height_cm - marker_height_cm) / camera_height_cm
+    return (camera_ground_point_px + (point_px - camera_ground_point_px) * scale).astype(np.float32)
 
 
 def transform_points(points: np.ndarray, homography: np.ndarray) -> np.ndarray:
@@ -283,7 +421,9 @@ def detect_robot_pose(
     homography: np.ndarray,
     topdown_size: tuple[int, int],
     marker_id: int,
-    offsets: tuple[float, float, float],
+    robot_calibration: RobotMarkerCalibration,
+    camera_ground_point_px: np.ndarray,
+    heading_offset_rad: float,
     aruco_dictionary: object,
     aruco_detector: object,
 ) -> tuple[RobotPose | None, list[np.ndarray], np.ndarray | None]:
@@ -291,23 +431,24 @@ def detect_robot_pose(
     if ids is None:
         return None, corners, ids
 
-    dx_cm, dy_cm, alpha_rad = offsets
     for detected_id, marker_corners in zip(ids.flatten().tolist(), corners):
         if detected_id != marker_id:
             continue
 
         topdown_corners = transform_points(marker_corners.reshape(4, 2), homography)
-        field_corners = [topdown_px_to_field_cm_float(tuple(point), topdown_size) for point in topdown_corners]
-        marker_center = np.mean(np.array(field_corners, dtype=np.float64), axis=0)
-
-        # ArUco corners are top-left, top-right, bottom-right, bottom-left in marker-local orientation.
-        heading_vector = np.array(field_corners[1], dtype=np.float64) - np.array(field_corners[0], dtype=np.float64)
-        marker_theta = math.atan2(float(heading_vector[1]), float(heading_vector[0]))
-        robot_theta = normalize_angle(marker_theta + alpha_rad)
-        cos_t = math.cos(marker_theta)
-        sin_t = math.sin(marker_theta)
-        robot_x = float(marker_center[0] + cos_t * dx_cm - sin_t * dy_cm)
-        robot_y = float(marker_center[1] + sin_t * dx_cm + cos_t * dy_cm)
+        marker_center_px = np.mean(topdown_corners.astype(np.float32), axis=0)
+        ground_center_px = parallax_correct_topdown_point(
+            marker_center_px,
+            camera_ground_point_px,
+            robot_calibration.marker_height_cm,
+            robot_calibration.camera_height_cm,
+        )
+        marker_yaw_rad = marker_yaw_topdown_px(topdown_corners)
+        robot_yaw_image_rad = normalize_angle(marker_yaw_rad - robot_calibration.alpha_rad)
+        offset_px = np.array([robot_calibration.dx_px, robot_calibration.dy_px], dtype=np.float32)
+        origin_px = ground_center_px - image_yaw_rotation_matrix(robot_yaw_image_rad) @ offset_px
+        robot_x, robot_y = topdown_px_to_field_cm_float(tuple(origin_px), topdown_size)
+        robot_theta = normalize_angle(robot_yaw_image_rad - math.pi / 2.0 + heading_offset_rad)
 
         if not (math.isfinite(robot_x) and math.isfinite(robot_y) and math.isfinite(robot_theta)):
             return None, corners, ids
@@ -376,7 +517,12 @@ def clearance_cm(occupancy_grid: np.ndarray, robot_node: tuple[int, int]) -> flo
     return float(dist[y, x])
 
 
-def draw_robot(overlay: np.ndarray, pose: RobotPose, topdown_size: tuple[int, int]) -> None:
+def draw_robot(
+    overlay: np.ndarray,
+    pose: RobotPose,
+    topdown_size: tuple[int, int],
+    body_tuning: RobotBodyTuning,
+) -> None:
     center_px = field_cm_to_topdown_px((pose.x_cm, pose.y_cm), topdown_size)
     heading_end = (
         pose.x_cm + math.cos(pose.theta_rad) * ROBOT_RADIUS_CM,
@@ -386,8 +532,8 @@ def draw_robot(overlay: np.ndarray, pose: RobotPose, topdown_size: tuple[int, in
     cv2.circle(overlay, center_px, 6, (255, 0, 255), -1, cv2.LINE_AA)
     cv2.line(overlay, center_px, heading_px, (255, 0, 255), 3, cv2.LINE_AA)
 
-    half_l = ROBOT_LENGTH_CM / 2.0
-    half_w = ROBOT_WIDTH_CM / 2.0
+    half_l = body_tuning.length_cm / 2.0
+    half_w = body_tuning.width_cm / 2.0
     local = np.array([(half_l, half_w), (half_l, -half_w), (-half_l, -half_w), (-half_l, half_w)])
     cos_t = math.cos(pose.theta_rad)
     sin_t = math.sin(pose.theta_rad)
@@ -414,9 +560,23 @@ def draw_path_debug(
         cv2.circle(overlay, field_cm_to_topdown_px(command.waypoint_cm, topdown_size), 7, (255, 255, 0), -1, cv2.LINE_AA)
 
 
-def draw_status(overlay: np.ndarray, state: str, fps: float, command: ControlCommand | None, motor: SafeMotorInterface) -> None:
+def draw_status(
+    overlay: np.ndarray,
+    state: str,
+    fps: float,
+    command: ControlCommand | None,
+    motor: SafeMotorInterface,
+    body_tuning: RobotBodyTuning,
+    dry_run: bool,
+) -> None:
     left, right = motor.last_command
-    lines = [f"State: {state}", f"FPS: {fps:.1f}", f"Motors L/R: {left:.1f} {right:.1f}"]
+    lines = [
+        f"State: {state}",
+        f"Mode: {'DRY' if dry_run else 'DRIVE'}",
+        f"FPS: {fps:.1f}",
+        f"Motors L/R: {left:.1f} {right:.1f}",
+        f"Body L/W/rot: {body_tuning.length_cm:.0f} {body_tuning.width_cm:.0f} {body_tuning.heading_offset_deg:.0f} deg",
+    ]
     if command is not None:
         lines.append(f"Heading err: {math.degrees(command.heading_error_rad):.1f} deg")
         lines.append(f"Distance err: {command.distance_error_cm:.1f} cm")
@@ -451,17 +611,33 @@ def run() -> int:
 
     map1, map2, calibration_size = load_undistort_maps(CALIBRATION_FILE, args.balance)
     homography, topdown_size = load_homography(HOMOGRAPHY_FILE)
-    offsets = load_robot_offsets(ROBOT_CALIBRATION_FILE, args.robot_marker_id)
+    robot_calibration = load_robot_calibration(ROBOT_CALIBRATION_FILE, args.robot_marker_id)
+    if robot_calibration.topdown_size != topdown_size:
+        raise RuntimeError(
+            f"robot_calibration.json topdown_size {robot_calibration.topdown_size} "
+            f"does not match homography topdown_size {topdown_size}"
+        )
     aruco_dictionary, aruco_detector = build_aruco_detector()
     if aruco_dictionary is None or aruco_detector is None:
         raise RuntimeError("OpenCV ArUco support is required for localization")
 
+    body_tuning = load_body_tuning(NAVIGATOR_TUNING_FILE)
+    if args.heading_offset_deg is not None:
+        body_tuning.heading_offset_deg = float(args.heading_offset_deg)
+    if not args.no_display:
+        create_body_tuning_sliders(body_tuning)
+
     socket_client: RobotSocketMotorClient | None = None
-    if args.robot_host:
+    if args.dry_run:
+        def dry_run_set_motors(left_speed: float, right_speed: float) -> None:
+            return None
+
+        motor_setter = dry_run_set_motors
+    elif args.robot_host and args.robot_host != "192.168.0.0":
         socket_client = RobotSocketMotorClient(args.robot_host, args.robot_port, args.robot_speed_command)
         motor_setter = socket_client.set_motors
     else:
-        motor_setter = load_motor_setter(args.motor_module, args.require_motors)
+        raise RuntimeError("Set ROBOT_HOST at the top of autonomous_navigator.py before running with --drive.")
     motor = SafeMotorInterface(motor_setter, args.max_speed)
     cap = cv2.VideoCapture(args.camera_index)
     if not cap.isOpened():
@@ -469,6 +645,10 @@ def run() -> int:
     configure_camera(cap, args.width, args.height, calibration_size)
 
     params = default_hsv_params(topdown_size)
+    camera_ground_point_px = transform_points(
+        np.array([[calibration_size[0] / 2.0, calibration_size[1] / 2.0]], dtype=np.float32),
+        homography,
+    )[0].astype(np.float32)
     min_period_s = 1.0 / max(1.0, float(args.control_hz))
     last_frame_time = time.perf_counter()
 
@@ -490,13 +670,19 @@ def run() -> int:
             undistorted = cv2.remap(frame, map1, map2, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
             topdown = cv2.warpPerspective(undistorted, homography, topdown_size)
             camera_center_pixels = (float(params["camera_center_x"]), float(params["camera_center_y"]))
+            if not args.no_display:
+                read_body_tuning_sliders(body_tuning)
+                autosave_body_tuning(NAVIGATOR_TUNING_FILE, body_tuning)
+            heading_offset_rad = math.radians(body_tuning.heading_offset_deg)
 
             pose, aruco_corners, aruco_ids = detect_robot_pose(
                 undistorted,
                 homography,
                 topdown_size,
                 args.robot_marker_id,
-                offsets,
+                robot_calibration,
+                camera_ground_point_px,
+                heading_offset_rad,
                 aruco_dictionary,
                 aruco_detector,
             )
@@ -560,9 +746,9 @@ def run() -> int:
                 for ball in orange_balls:
                     cv2.circle(overlay, ball.corrected_center, ball.radius_px, (0, 140, 255), 2, cv2.LINE_AA)
                 if pose is not None:
-                    draw_robot(overlay, pose, topdown_size)
+                    draw_robot(overlay, pose, topdown_size, body_tuning)
                 draw_path_debug(overlay, path_cm, target, command, topdown_size)
-                draw_status(overlay, state, fps, command, motor)
+                draw_status(overlay, state, fps, command, motor, body_tuning, args.dry_run)
 
                 cv2.imshow(WINDOW_NAME, overlay)
                 masks = np.hstack(
@@ -582,6 +768,8 @@ def run() -> int:
                 time.sleep(min_period_s - elapsed)
     finally:
         motor.stop()
+        if not args.no_display:
+            save_body_tuning(NAVIGATOR_TUNING_FILE, body_tuning)
         if socket_client is not None:
             socket_client.close()
         cap.release()

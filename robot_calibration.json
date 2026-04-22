@@ -1,0 +1,37 @@
+{
+  "calibration_plane_height_cm": 9.0,
+  "camera_center_x": 408.0,
+  "camera_center_y": 475.0,
+  "camera_height_cm": 120.0,
+  "created_unix": 1776845752.641856,
+  "marker_height_cm": 9.0,
+  "marker_ids": [
+    4,
+    5
+  ],
+  "markers": {
+    "4": {
+      "alpha_deg": 86.50128684441405,
+      "alpha_rad": 1.509732262647081,
+      "dx": 17.30657958984375,
+      "dy": -72.61788940429688,
+      "ellipse_ratio": 1.0993943544556781,
+      "origin_x": 498.142822265625,
+      "origin_y": 429.8311767578125
+    },
+    "5": {
+      "alpha_deg": 77.1036656591208,
+      "alpha_rad": 1.3457128311085416,
+      "dx": 4.195220947265625,
+      "dy": 71.29638671875,
+      "ellipse_ratio": 1.0998826100186327,
+      "origin_x": 498.8778991699219,
+      "origin_y": 429.9312744140625
+    }
+  },
+  "topdown_size": [
+    1000,
+    800
+  ],
+  "version": 1
+}

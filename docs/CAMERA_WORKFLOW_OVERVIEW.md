@@ -215,16 +215,24 @@ Det:
 8. gemmer `dx`, `dy` og `alpha` i `robot_calibration.json`
 9. viser live robot-origin som debug-overlay efter kalibrering
 
-Bruges f.eks. saadan med marker ID `10`:
+Standardvaerdierne for kamera, marker-ID og parallax-parametre ligger som variabler oeverst i scriptet:
+
+- `CAMERA_INDEX`
+- `ROBOT_MARKER_IDS`
+- `MARKER_HEIGHT_CM`
+- `CAMERA_HEIGHT_CM`
+- `CALIBRATION_PLANE_HEIGHT_CM`
+
+Bruges normalt saadan:
 
 ```bash
-python3 tools/robot_origin_calibration.py --camera-index 0 --marker-ids 10 --marker-height-cm 8 --camera-height-cm 100
+python3 tools/robot_origin_calibration.py
 ```
 
-Eller med to markers, f.eks. ID `10` og `11`:
+Man kan stadig midlertidigt overskrive variablerne fra terminalen, f.eks. med to markers:
 
 ```bash
-python3 tools/robot_origin_calibration.py --camera-index 0 --marker-ids 10 11 --marker-height-cm 8 --camera-height-cm 100
+python3 tools/robot_origin_calibration.py --camera-index 0 --marker-ids 10 11 --marker-height-cm 9 --camera-height-cm 179 --calib-z-cm 7
 ```
 
 Foerste gang scriptet startes, skal der vaelges fire arena-hjoerner i det undistortede billede:
@@ -240,6 +248,15 @@ Naar top-down viewet er aktivt:
 - `Enter`: gem offsets efter robotten er rettet fremad langs top-down billedets positive Y-retning
 - `r`: vaelg ny homography
 - `q`: afslut
+
+Scriptet aabner ogsaa et `Robot Origin Calibration - Geometry` vindue med samme type parallax-parametre som `topdown_object_detector.py`:
+
+- `Cam h cm`: kameraets hoejde over gulvet
+- `Marker h cm`: ArUco-markerens hoejde over gulvet
+- `Calib z cm`: hoejden paa det plan, som top-down homographyen er kalibreret paa
+- `Cam C X` / `Cam C Y`: kameraets optiske centrum i top-down billedet
+
+Hvis `robot_calibration.json` allerede findes, bruges de gemte parallax-vaerdier som startvaerdier for sliders. Hvis man vil koere uden sliders, kan man bruge `--no-geometry-trackbars`.
 
 Outputfiler:
 

@@ -26,14 +26,27 @@ DEFAULT_CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
 DEFAULT_OUTPUT_FILE = REPO_ROOT / "robot_calibration.json"
 DEFAULT_HOMOGRAPHY_FILE = REPO_ROOT / "robot_topdown_homography.npz"
 
+CAMERA_INDEX = 0
+ROBOT_MARKER_IDS = (4,5)
+ARUCO_DICTIONARY = "DICT_4X4_50"
 LIVE_WINDOW = "Robot Origin Calibration - Undistorted"
 TOPDOWN_WINDOW = "Robot Origin Calibration - Top Down"
+GEOMETRY_WINDOW = "Robot Origin Calibration - Geometry"
 TOPDOWN_SIZE = (1000, 800)
 MARKER_HEIGHT_CM = 9.0
-CAMERA_HEIGHT_CM = 100.0
+CAMERA_HEIGHT_CM = 170.0
+CALIBRATION_PLANE_HEIGHT_CM = 9.0
 MIN_POINTS_PER_MARKER = 20
 ELLIPSE_WARNING_RATIO = 1.12
 EXPOSURE_VALUE = -6.0
+
+TRACKBAR_NAMES = {
+    "camera_height_cm": "Cam h cm",
+    "marker_height_cm": "Marker h cm",
+    "calibration_plane_height_cm": "Calib z cm",
+    "camera_center_x": "Cam C X",
+    "camera_center_y": "Cam C Y",
+}
 
 
 @dataclass
@@ -42,6 +55,7 @@ class MarkerObservation:
     center: np.ndarray
     ground_center: np.ndarray
     corners: np.ndarray
+    ground_corners: np.ndarray
     yaw_rad: float
 
 
@@ -69,22 +83,32 @@ class RuntimeState:
     warning: str = ""
 
 
+@dataclass(frozen=True)
+class ParallaxConfig:
+    marker_height_cm: float
+    camera_height_cm: float
+    calibration_plane_height_cm: float
+    camera_center: np.ndarray
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Calibrate robot center of rotation from ArUco marker spin data.",
     )
-    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--camera-index", type=int, default=CAMERA_INDEX)
     parser.add_argument("--calibration-file", type=Path, default=DEFAULT_CALIBRATION_FILE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FILE)
     parser.add_argument("--homography-file", type=Path, default=DEFAULT_HOMOGRAPHY_FILE)
-    parser.add_argument("--marker-ids", type=int, nargs="+", required=True, help="One or two marker IDs.")
-    parser.add_argument("--aruco-dict", default="DICT_4X4_50")
+    parser.add_argument("--marker-ids", type=int, nargs="+", default=list(ROBOT_MARKER_IDS), help="One or two marker IDs.")
+    parser.add_argument("--aruco-dict", default=ARUCO_DICTIONARY)
     parser.add_argument("--topdown-width", type=int, default=TOPDOWN_SIZE[0])
     parser.add_argument("--topdown-height", type=int, default=TOPDOWN_SIZE[1])
     parser.add_argument("--marker-height-cm", type=float, default=MARKER_HEIGHT_CM)
     parser.add_argument("--camera-height-cm", type=float, default=CAMERA_HEIGHT_CM)
-    parser.add_argument("--camera-ground-x", type=float, default=None)
-    parser.add_argument("--camera-ground-y", type=float, default=None)
+    parser.add_argument("--calib-z-cm", type=float, default=CALIBRATION_PLANE_HEIGHT_CM)
+    parser.add_argument("--camera-center-x", "--camera-ground-x", type=float, default=None)
+    parser.add_argument("--camera-center-y", "--camera-ground-y", type=float, default=None)
+    parser.add_argument("--no-geometry-trackbars", action="store_true")
     parser.add_argument("--min-points", type=int, default=MIN_POINTS_PER_MARKER)
     parser.add_argument("--ellipse-warning-ratio", type=float, default=ELLIPSE_WARNING_RATIO)
     parser.add_argument("--exposure", type=float, default=EXPOSURE_VALUE)
@@ -161,6 +185,102 @@ def configure_camera(cap: cv2.VideoCapture, image_size: tuple[int, int], exposur
     cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
 
 
+def noop(_value: int) -> None:
+    return None
+
+
+def clamp_int(value: float, minimum: int, maximum: int) -> int:
+    return int(max(minimum, min(maximum, round(value))))
+
+
+def calibration_geometry_value(
+    calibration: dict[str, Any] | None,
+    key: str,
+    fallback: float,
+) -> float:
+    if calibration is None:
+        return fallback
+    value = calibration.get(key)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return fallback
+
+
+def create_geometry_trackbars(
+    args: argparse.Namespace,
+    topdown_size: tuple[int, int],
+    calibration: dict[str, Any] | None,
+) -> None:
+    cv2.namedWindow(GEOMETRY_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(GEOMETRY_WINDOW, 420, 240)
+    width, height = topdown_size
+    default_center_x = args.camera_center_x if args.camera_center_x is not None else width / 2.0
+    default_center_y = args.camera_center_y if args.camera_center_y is not None else height / 2.0
+    defaults = {
+        "camera_height_cm": clamp_int(
+            calibration_geometry_value(calibration, "camera_height_cm", args.camera_height_cm),
+            1,
+            300,
+        ),
+        "marker_height_cm": clamp_int(
+            calibration_geometry_value(calibration, "marker_height_cm", args.marker_height_cm),
+            0,
+            100,
+        ),
+        "calibration_plane_height_cm": clamp_int(
+            calibration_geometry_value(calibration, "calibration_plane_height_cm", args.calib_z_cm),
+            0,
+            100,
+        ),
+        "camera_center_x": clamp_int(
+            calibration_geometry_value(calibration, "camera_center_x", default_center_x),
+            0,
+            width,
+        ),
+        "camera_center_y": clamp_int(
+            calibration_geometry_value(calibration, "camera_center_y", default_center_y),
+            0,
+            height,
+        ),
+    }
+    maximums = {
+        "camera_height_cm": 300,
+        "marker_height_cm": 100,
+        "calibration_plane_height_cm": 100,
+        "camera_center_x": max(1, width),
+        "camera_center_y": max(1, height),
+    }
+    for key, value in defaults.items():
+        cv2.createTrackbar(TRACKBAR_NAMES[key], GEOMETRY_WINDOW, value, maximums[key], noop)
+
+
+def read_parallax_config(args: argparse.Namespace, topdown_size: tuple[int, int]) -> ParallaxConfig:
+    if args.no_geometry_trackbars:
+        camera_center_x = args.camera_center_x if args.camera_center_x is not None else topdown_size[0] / 2.0
+        camera_center_y = args.camera_center_y if args.camera_center_y is not None else topdown_size[1] / 2.0
+        return ParallaxConfig(
+            marker_height_cm=float(args.marker_height_cm),
+            camera_height_cm=float(args.camera_height_cm),
+            calibration_plane_height_cm=float(args.calib_z_cm),
+            camera_center=np.array([camera_center_x, camera_center_y], dtype=np.float32),
+        )
+
+    return ParallaxConfig(
+        marker_height_cm=float(cv2.getTrackbarPos(TRACKBAR_NAMES["marker_height_cm"], GEOMETRY_WINDOW)),
+        camera_height_cm=float(cv2.getTrackbarPos(TRACKBAR_NAMES["camera_height_cm"], GEOMETRY_WINDOW)),
+        calibration_plane_height_cm=float(
+            cv2.getTrackbarPos(TRACKBAR_NAMES["calibration_plane_height_cm"], GEOMETRY_WINDOW)
+        ),
+        camera_center=np.array(
+            [
+                cv2.getTrackbarPos(TRACKBAR_NAMES["camera_center_x"], GEOMETRY_WINDOW),
+                cv2.getTrackbarPos(TRACKBAR_NAMES["camera_center_y"], GEOMETRY_WINDOW),
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
 def aruco_dictionary(name: str) -> object:
     if not hasattr(cv2, "aruco"):
         raise RuntimeError("This OpenCV build does not include cv2.aruco.")
@@ -174,6 +294,12 @@ def build_aruco_detector(dictionary: object) -> tuple[object, object]:
         parameters = cv2.aruco.DetectorParameters()
     else:
         parameters = cv2.aruco.DetectorParameters_create()
+
+    if hasattr(cv2.aruco, "CORNER_REFINE_SUBPIX"):
+        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        parameters.cornerRefinementWinSize = 5
+        parameters.cornerRefinementMaxIterations = 30
+        parameters.cornerRefinementMinAccuracy = 0.01
 
     if hasattr(cv2.aruco, "ArucoDetector"):
         return dictionary, cv2.aruco.ArucoDetector(dictionary, parameters)
@@ -250,22 +376,15 @@ def on_mouse(event: int, x: int, y: int, _flags: int, state: HomographySelection
 
 def parallax_correct_point(
     point: np.ndarray,
-    camera_ground_point: np.ndarray,
-    marker_height_cm: float,
-    camera_height_cm: float,
+    config: ParallaxConfig,
 ) -> np.ndarray:
-    if marker_height_cm <= 0.0:
+    """Project a marker point from its mounted height back to the configured ground plane."""
+    denominator = config.camera_height_cm - config.calibration_plane_height_cm
+    if abs(denominator) < 1e-6:
         return point.astype(np.float32)
-    if camera_height_cm <= marker_height_cm:
-        return point.astype(np.float32)
 
-    scale = (camera_height_cm - marker_height_cm) / camera_height_cm
-    return (camera_ground_point + (point - camera_ground_point) * scale).astype(np.float32)
-
-
-def transform_point(point: tuple[float, float], matrix: np.ndarray) -> np.ndarray:
-    src = np.array([[[point[0], point[1]]]], dtype=np.float32)
-    return cv2.perspectiveTransform(src, matrix).reshape(2).astype(np.float32)
+    scale = (config.camera_height_cm - config.marker_height_cm) / denominator
+    return (config.camera_center + (point - config.camera_center) * scale).astype(np.float32)
 
 
 def marker_yaw(corners: np.ndarray) -> float:
@@ -285,9 +404,7 @@ def extract_observations(
     dictionary: object,
     detector_or_parameters: object,
     marker_ids: tuple[int, ...],
-    camera_ground_point: np.ndarray,
-    marker_height_cm: float,
-    camera_height_cm: float,
+    parallax_config: ParallaxConfig,
 ) -> dict[int, MarkerObservation]:
     corners, ids = detect_markers(frame, dictionary, detector_or_parameters)
     observations: dict[int, MarkerObservation] = {}
@@ -301,13 +418,15 @@ def extract_observations(
             continue
         pts = marker_corners.reshape(4, 2).astype(np.float32)
         center = pts.mean(axis=0).astype(np.float32)
-        ground_center = parallax_correct_point(center, camera_ground_point, marker_height_cm, camera_height_cm)
+        ground_pts = np.array([parallax_correct_point(point, parallax_config) for point in pts], dtype=np.float32)
+        ground_center = ground_pts.mean(axis=0).astype(np.float32)
         observations[marker_id] = MarkerObservation(
             marker_id=marker_id,
             center=center,
             ground_center=ground_center,
             corners=pts,
-            yaw_rad=marker_yaw(pts),
+            ground_corners=ground_pts,
+            yaw_rad=marker_yaw(ground_pts),
         )
     return observations
 
@@ -363,6 +482,7 @@ def save_robot_calibration(
     observations: dict[int, MarkerObservation],
     ellipse_ratios: dict[int, float],
     args: argparse.Namespace,
+    parallax_config: ParallaxConfig,
 ) -> dict[str, Any]:
     markers: dict[str, dict[str, float]] = {}
     for marker_id in marker_ids:
@@ -385,8 +505,11 @@ def save_robot_calibration(
         "version": 1,
         "created_unix": time.time(),
         "marker_ids": list(marker_ids),
-        "marker_height_cm": float(args.marker_height_cm),
-        "camera_height_cm": float(args.camera_height_cm),
+        "marker_height_cm": float(parallax_config.marker_height_cm),
+        "camera_height_cm": float(parallax_config.camera_height_cm),
+        "calibration_plane_height_cm": float(parallax_config.calibration_plane_height_cm),
+        "camera_center_x": float(parallax_config.camera_center[0]),
+        "camera_center_y": float(parallax_config.camera_center[1]),
         "topdown_size": [int(args.topdown_width), int(args.topdown_height)],
         "markers": markers,
     }
@@ -413,7 +536,9 @@ def draw_homography_selection(frame: np.ndarray, state: HomographySelection) -> 
 def draw_marker_overlay(frame: np.ndarray, observations: dict[int, MarkerObservation]) -> None:
     for observation in observations.values():
         pts = observation.corners.astype(np.int32).reshape(-1, 1, 2)
+        ground_pts = observation.ground_corners.astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(frame, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.polylines(frame, [ground_pts], True, (255, 255, 0), 1, cv2.LINE_AA)
         raw_center = tuple(int(round(v)) for v in observation.center)
         ground_center = tuple(int(round(v)) for v in observation.ground_center)
         cv2.circle(frame, raw_center, 4, (255, 0, 0), -1, cv2.LINE_AA)
@@ -422,10 +547,10 @@ def draw_marker_overlay(frame: np.ndarray, observations: dict[int, MarkerObserva
             cv2.line(frame, raw_center, ground_center, (255, 255, 0), 1, cv2.LINE_AA)
         axis_len = 45
         end = (
-            int(round(raw_center[0] + math.sin(observation.yaw_rad) * axis_len)),
-            int(round(raw_center[1] + math.cos(observation.yaw_rad) * axis_len)),
+            int(round(ground_center[0] + math.sin(observation.yaw_rad) * axis_len)),
+            int(round(ground_center[1] + math.cos(observation.yaw_rad) * axis_len)),
         )
-        cv2.arrowedLine(frame, raw_center, end, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.25)
+        cv2.arrowedLine(frame, ground_center, end, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.25)
         cv2.putText(frame, f"ID {observation.marker_id}", (raw_center[0] + 8, raw_center[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
 
@@ -448,6 +573,14 @@ def draw_robot_origin(frame: np.ndarray, origin: np.ndarray, color: tuple[int, i
     cv2.putText(frame, "ROBOT ORIGIN", (x + 18, y - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
 
+def draw_camera_center(frame: np.ndarray, camera_center: np.ndarray) -> None:
+    x = int(round(camera_center[0]))
+    y = int(round(camera_center[1]))
+    cv2.line(frame, (x - 8, y), (x + 8, y), (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.line(frame, (x, y - 8), (x, y + 8), (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, "cam", (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+
 def draw_text_block(
     frame: np.ndarray,
     lines: list[str],
@@ -459,7 +592,12 @@ def draw_text_block(
         cv2.putText(frame, line, (x, y + index * 26), cv2.FONT_HERSHEY_SIMPLEX, 0.64, color, 2, cv2.LINE_AA)
 
 
-def calibration_lines(state: RuntimeState, marker_ids: tuple[int, ...], fps: float) -> list[str]:
+def calibration_lines(
+    state: RuntimeState,
+    marker_ids: tuple[int, ...],
+    fps: float,
+    parallax_config: ParallaxConfig,
+) -> list[str]:
     counts = ", ".join(f"ID {marker_id}: {len(state.collected_points.get(marker_id, []))}" for marker_id in marker_ids)
     if state.collecting:
         mode = "COLLECTING SPIN DATA"
@@ -475,7 +613,13 @@ def calibration_lines(state: RuntimeState, marker_ids: tuple[int, ...], fps: flo
         f"Mode: {mode}",
         action,
         f"Points: {counts}",
-        "Blue dot: raw marker center | Yellow cross: parallax-corrected tracking point",
+        (
+            f"Parallax: marker={parallax_config.marker_height_cm:.0f}cm "
+            f"cam={parallax_config.camera_height_cm:.0f}cm "
+            f"calib_z={parallax_config.calibration_plane_height_cm:.0f}cm "
+            f"center=({parallax_config.camera_center[0]:.0f},{parallax_config.camera_center[1]:.0f})"
+        ),
+        "Green: raw marker | Yellow: parallax-corrected marker geometry",
     ]
 
 
@@ -508,10 +652,6 @@ def main() -> int:
         return 2
 
     topdown_size = (int(args.topdown_width), int(args.topdown_height))
-    camera_ground_point: np.ndarray | None = None
-    if args.camera_ground_x is not None and args.camera_ground_y is not None:
-        camera_ground_point = np.array([args.camera_ground_x, args.camera_ground_y], dtype=np.float32)
-
     cv2.ocl.setUseOpenCL(False)
     if not args.calibration_file.exists():
         print(f"Calibration file not found: {args.calibration_file}", file=sys.stderr)
@@ -537,6 +677,8 @@ def main() -> int:
 
     cv2.namedWindow(LIVE_WINDOW, cv2.WINDOW_NORMAL)
     cv2.namedWindow(TOPDOWN_WINDOW, cv2.WINDOW_NORMAL)
+    if not args.no_geometry_trackbars:
+        create_geometry_trackbars(args, topdown_size, runtime.calibration)
     cv2.setMouseCallback(LIVE_WINDOW, on_mouse, homography_state)
 
     map1: np.ndarray | None = None
@@ -585,11 +727,7 @@ def main() -> int:
                     save_homography(args.homography_file, homography_state.matrix, topdown_size)
                 continue
 
-            if camera_ground_point is None:
-                camera_ground_point = transform_point(
-                    (undistorted.shape[1] / 2.0, undistorted.shape[0] / 2.0),
-                    homography_state.matrix,
-                )
+            parallax_config = read_parallax_config(args, topdown_size)
 
             topdown = cv2.warpPerspective(undistorted, homography_state.matrix, topdown_size)
             observations = extract_observations(
@@ -597,9 +735,7 @@ def main() -> int:
                 dictionary,
                 detector_or_parameters,
                 marker_ids,
-                camera_ground_point,
-                args.marker_height_cm,
-                args.camera_height_cm,
+                parallax_config,
             )
 
             if runtime.collecting:
@@ -611,6 +747,7 @@ def main() -> int:
             debug = topdown.copy()
             draw_marker_overlay(debug, observations)
             draw_path_overlay(debug, runtime.collected_points)
+            draw_camera_center(debug, parallax_config.camera_center)
 
             if runtime.waiting_for_alignment:
                 for marker_id, center in runtime.fitted_centers.items():
@@ -624,7 +761,7 @@ def main() -> int:
                 if origins:
                     draw_robot_origin(debug, np.mean(np.array(origins, dtype=np.float32), axis=0))
 
-            lines = calibration_lines(runtime, marker_ids, fps)
+            lines = calibration_lines(runtime, marker_ids, fps, parallax_config)
             if runtime.calibration is None and not runtime.collecting and not runtime.waiting_for_alignment:
                 lines.append("No robot calibration loaded. Press c to start.")
             if runtime.warning:
@@ -663,6 +800,7 @@ def main() -> int:
                         observations,
                         runtime.ellipse_ratios,
                         args,
+                        parallax_config,
                     )
                     runtime.waiting_for_alignment = False
                     runtime.phase = "validation"

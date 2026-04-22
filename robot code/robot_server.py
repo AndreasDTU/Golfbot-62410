@@ -80,7 +80,7 @@ def cmd_move(parts, forward=True):
     motor_deg = units_to_degrees(units)
     spd = speed if forward else -speed
     tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(-spd),
-                        degrees=motor_deg, brake=True, block=True)
+                        degrees=motor_deg, brake=True, block=False)
     direction = "forward" if forward else "backward"
     return "ok: moved {} {} units".format(direction, units)
 
@@ -95,11 +95,11 @@ def cmd_turn(parts):
     if angle >= 0:
         # Turn right: left motor forward, right motor backward
         tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(spd),
-                            degrees=motor_deg, brake=True, block=True)
+                            degrees=motor_deg, brake=True, block=False)
     else:
         # Turn left: right motor forward, left motor backward
         tank.on_for_degrees(left_speed=SpeedPercent(spd), right_speed=SpeedPercent(-spd),
-                            degrees=motor_deg, brake=True, block=True)
+                            degrees=motor_deg, brake=True, block=False)
     return "ok: turned {} degrees".format(angle)
 
 
@@ -140,8 +140,8 @@ def cmd_pipe(parts):
     return "ok: pipe {} {} units".format(subaction, units)
 
 def cmd_pickup():
-    units = 10
-    speed = 30
+    units = 20
+    speed = 35
     motor_deg = units * PIPE_DEGREES_PER_UNIT
 
     pipe_motor.on_for_degrees(
@@ -152,7 +152,7 @@ def cmd_pickup():
     )
 
     pipe_motor.on_for_degrees(
-        speed=SpeedPercent(-speed),
+        speed=SpeedPercent(-100),
         degrees=motor_deg,
         brake=True,
         block=True
@@ -161,8 +161,8 @@ def cmd_pickup():
     return "ok: pipe pickup completed"
 
 def cmd_dropoff():
-    units = 20
-    speed = 30
+    units = 22
+    speed = 75
     motor_deg = units * PIPE_DEGREES_PER_UNIT
 
     pipe_motor.on_for_degrees(

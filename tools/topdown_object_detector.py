@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Detect red zones, white balls, and one orange ball in a top-down arena view.
 
-This tool supports two input modes:
+This tool supports three input modes:
 1. Still image input for repeatable offline tuning.
 2. Live camera input for on-table tuning with HSV trackbars.
+3. Recorded video input for replaying real camera runs through the live pipeline.
 
 The output is shown as:
 - Left: annotated top-down camera frame
@@ -47,6 +48,7 @@ Z_BALL_CM = 2.0
 Z_FLOOR_CM = 0.0
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
 DEFAULT_IMAGE = REPO_ROOT / "test_topdown.png"
+DEFAULT_VIDEO_DIR = REPO_ROOT / "videos"
 WINDOW_NAME = "Top-Down Detector"
 MASK_WINDOW_NAME = "Segmentation Masks"
 CONTROL_COLOR_WINDOW_NAME = "HSV Controls - Colors"
@@ -709,7 +711,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Detect red zones, white ping-pong balls, and one orange ball from a "
-            "top-down arena image or live camera feed."
+            "top-down arena image, live camera feed, or recorded camera video."
         )
     )
     mode_group = parser.add_mutually_exclusive_group()
@@ -723,6 +725,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_IMAGE,
         help=f"Path to a top-down test image. Default: {DEFAULT_IMAGE}",
+    )
+    mode_group.add_argument(
+        "--video",
+        type=Path,
+        help=f"Path to a recorded camera video. Store local recordings under {DEFAULT_VIDEO_DIR}.",
     )
     parser.add_argument(
         "--camera-index",
@@ -747,6 +754,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Optional live camera height. 0 keeps the driver default.",
+    )
+    parser.add_argument(
+        "--resize-video-to-calibration",
+        action="store_true",
+        help=(
+            "Video mode only: resize each recorded frame to calibration_data.npz size "
+            "before undistortion if the recording resolution differs."
+        ),
     )
     return parser.parse_args()
 
@@ -1833,6 +1848,21 @@ def configure_camera(cap: cv2.VideoCapture, width: int, height: int) -> None:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
 
+def resize_frame_to_size(frame_bgr: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
+    """Resize a raw frame to the calibration size using deterministic interpolation."""
+    target_width, target_height = target_size
+    frame_height, frame_width = frame_bgr.shape[:2]
+    if (frame_width, frame_height) == target_size:
+        return frame_bgr
+
+    interpolation = (
+        cv2.INTER_AREA
+        if frame_width > target_width or frame_height > target_height
+        else cv2.INTER_LINEAR
+    )
+    return cv2.resize(frame_bgr, target_size, interpolation=interpolation)
+
+
 def run_image_mode(image_path: Path) -> int:
     """Run repeated processing on one still image so HSV sliders remain interactive."""
     frame = load_image_frame(image_path)
@@ -1868,28 +1898,24 @@ def run_image_mode(image_path: Path) -> int:
     return 0
 
 
-def run_live_mode(camera_index: int, balance: float, width: int, height: int) -> int:
-    """Run live detection from the camera."""
+def run_raw_stream_mode(
+    cap: cv2.VideoCapture,
+    source_name: str,
+    balance: float,
+    mode_label: str,
+    frame_delay_ms: int,
+    resize_to_size: tuple[int, int] | None = None,
+) -> int:
+    """Run live-style detection from any raw frame stream."""
     if not CALIBRATION_FILE.exists():
         print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
         return 1
 
-    calibration_width, calibration_height = load_calibration_image_size(CALIBRATION_FILE)
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        print(f"Could not open camera {camera_index}", file=sys.stderr)
-        return 1
-
-    configure_camera(
-        cap,
-        width if width > 0 else calibration_width,
-        height if height > 0 else calibration_height,
-    )
     ok, initial_frame = cap.read()
     if not ok or initial_frame is None:
-        print("Camera read failed", file=sys.stderr)
-        cap.release()
+        print(f"Could not read first frame from {source_name}", file=sys.stderr)
         return 1
+
     app_state = AppState()
     aruco_dictionary, aruco_detector = build_aruco_detector()
     selection_state = TopdownSelectionState(
@@ -1907,102 +1933,177 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
     cv2.setMouseCallback(MANUAL_SELECTOR_WINDOW_NAME, on_manual_topdown_mouse, selection_state)
     cv2.setMouseCallback(SCHEMATIC_WINDOW_NAME, on_schematic_mouse, app_state)
     last_tick = time.perf_counter()
+    resize_notice_shown = False
 
-    try:
-        while True:
-            raw_frame = initial_frame
-            initial_frame = None
-            if raw_frame is None:
-                ok, raw_frame = cap.read()
-                if not ok or raw_frame is None:
-                    print("Camera read failed", file=sys.stderr)
+    while True:
+        raw_frame = initial_frame
+        initial_frame = None
+        if raw_frame is None:
+            ok, raw_frame = cap.read()
+            if not ok or raw_frame is None:
+                if mode_label == "Video":
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, raw_frame = cap.read()
+                    if not ok or raw_frame is None:
+                        print(f"Could not restart video: {source_name}", file=sys.stderr)
+                        return 1
+                    last_tick = time.perf_counter()
+                    reset_detection_state(app_state)
+                else:
+                    print(f"Frame read failed from {source_name}", file=sys.stderr)
                     return 1
 
-            start = time.perf_counter()
-            selector_view, topdown_frame = prepare_live_topdown_frame(
-                raw_frame,
-                CALIBRATION_FILE,
-                balance,
-                selection_state,
+        if resize_to_size is not None:
+            original_size = (int(raw_frame.shape[1]), int(raw_frame.shape[0]))
+            raw_frame = resize_frame_to_size(raw_frame, resize_to_size)
+            if original_size != resize_to_size and not resize_notice_shown:
+                print(
+                    f"Resizing video frames from {original_size} to {resize_to_size} "
+                    "before undistortion."
+                )
+                resize_notice_shown = True
+
+        start = time.perf_counter()
+        selector_view, topdown_frame = prepare_live_topdown_frame(
+            raw_frame,
+            CALIBRATION_FILE,
+            balance,
+            selection_state,
+        )
+        params = read_hsv_ranges()
+
+        now = time.perf_counter()
+        fps = 1.0 / max(1e-6, now - last_tick)
+        last_tick = now
+
+        if selection_state.transform_matrix is None:
+            reset_detection_state(app_state)
+            masks = build_mask_preview(
+                np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
+                np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
+                np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
             )
-            params = read_hsv_ranges()
-
-            now = time.perf_counter()
-            fps = 1.0 / max(1e-6, now - last_tick)
-            last_tick = now
-
-            if selection_state.transform_matrix is None:
-                reset_detection_state(app_state)
-                masks = build_mask_preview(
-                    np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
-                    np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
-                    np.zeros(topdown_frame.shape[:2], dtype=np.uint8),
-                )
-                schematic = draw_schematic(
-                    frame_shape=topdown_frame.shape,
-                    red_zones=[],
-                    smoothed_ball_coordinates=[],
-                    camera_center_pixels=(
-                        float(params["camera_center_x"]),
-                        float(params["camera_center_y"]),
-                    ),
-                    app_state=app_state,
-                )
-                combined = np.hstack(resize_to_match_height(topdown_frame, schematic))
-                cv2.putText(
-                    combined,
-                    (
-                        "Waiting for manual top-down selection"
-                        if selection_state.calibration_state == CalibrationState.CALIBRATING_MANUAL
-                        else "Waiting for ArUco auto-calibration"
-                    ),
-                    (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 165, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-            else:
-                combined, masks, schematic = process_frame(
-                    topdown_frame,
-                    params,
-                    fps=fps,
-                    app_state=app_state,
-                )
-            processing_ms = (time.perf_counter() - start) * 1000.0
-
+            schematic = draw_schematic(
+                frame_shape=topdown_frame.shape,
+                red_zones=[],
+                smoothed_ball_coordinates=[],
+                camera_center_pixels=(
+                    float(params["camera_center_x"]),
+                    float(params["camera_center_y"]),
+                ),
+                app_state=app_state,
+            )
+            combined = np.hstack(resize_to_match_height(topdown_frame, schematic))
             cv2.putText(
                 combined,
-                f"Live mode  Proc: {processing_ms:.1f} ms",
-                (20, combined.shape[0] - 20),
+                (
+                    "Waiting for manual top-down selection"
+                    if selection_state.calibration_state == CalibrationState.CALIBRATING_MANUAL
+                    else "Waiting for ArUco auto-calibration"
+                ),
+                (20, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
+                0.8,
+                (0, 165, 255),
                 2,
                 cv2.LINE_AA,
             )
+        else:
+            combined, masks, schematic = process_frame(
+                topdown_frame,
+                params,
+                fps=fps,
+                app_state=app_state,
+            )
+        processing_ms = (time.perf_counter() - start) * 1000.0
 
-            cv2.imshow(MANUAL_SELECTOR_WINDOW_NAME, selector_view)
-            cv2.imshow(WINDOW_NAME, combined)
-            cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
-            cv2.imshow(MASK_WINDOW_NAME, masks)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
-                break
-            if key == ord("r"):
-                selection_state.clear_points()
-                reset_detection_state(app_state)
-            if key == ord("a"):
-                selection_state.start_auto_calibration()
-                reset_detection_state(app_state)
-            if key == ord("m"):
-                selection_state.start_manual_calibration()
-                reset_detection_state(app_state)
+        cv2.putText(
+            combined,
+            f"{mode_label} mode  Proc: {processing_ms:.1f} ms",
+            (20, combined.shape[0] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.imshow(MANUAL_SELECTOR_WINDOW_NAME, selector_view)
+        cv2.imshow(WINDOW_NAME, combined)
+        cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
+        cv2.imshow(MASK_WINDOW_NAME, masks)
+        wait_ms = max(1, frame_delay_ms - int(round(processing_ms)))
+        key = cv2.waitKey(wait_ms) & 0xFF
+        if key in (27, ord("q")):
+            break
+        if key == ord("r"):
+            selection_state.clear_points()
+            reset_detection_state(app_state)
+        if key == ord("a"):
+            selection_state.start_auto_calibration()
+            reset_detection_state(app_state)
+        if key == ord("m"):
+            selection_state.start_manual_calibration()
+            reset_detection_state(app_state)
+
+    return 0
+
+
+def run_live_mode(camera_index: int, balance: float, width: int, height: int) -> int:
+    """Run live detection from the camera."""
+    if not CALIBRATION_FILE.exists():
+        print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
+        return 1
+
+    calibration_width, calibration_height = load_calibration_image_size(CALIBRATION_FILE)
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print(f"Could not open camera {camera_index}", file=sys.stderr)
+        return 1
+
+    configure_camera(
+        cap,
+        width if width > 0 else calibration_width,
+        height if height > 0 else calibration_height,
+    )
+    try:
+        return run_raw_stream_mode(cap, f"camera {camera_index}", balance, "Live", 1)
     finally:
         cap.release()
 
-    return 0
+
+def run_video_mode(video_path: Path, balance: float, resize_to_calibration: bool) -> int:
+    """Replay a recorded camera video through the live detector pipeline."""
+    if not video_path.exists():
+        print(f"Video file not found: {video_path}", file=sys.stderr)
+        return 1
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Could not open video: {video_path}", file=sys.stderr)
+        return 1
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_delay_ms = int(round(1000.0 / fps)) if fps and fps > 0.0 else 1
+    if resize_to_calibration and not CALIBRATION_FILE.exists():
+        print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
+        cap.release()
+        return 1
+    resize_to_size = (
+        load_calibration_image_size(CALIBRATION_FILE) if resize_to_calibration else None
+    )
+
+    try:
+        return run_raw_stream_mode(
+            cap,
+            str(video_path),
+            balance,
+            "Video",
+            frame_delay_ms,
+            resize_to_size=resize_to_size,
+        )
+    finally:
+        cap.release()
 
 
 def main() -> int:
@@ -2013,6 +2114,8 @@ def main() -> int:
     try:
         if args.live or USE_LIVE_FEED:
             return run_live_mode(args.camera_index, args.balance, args.width, args.height)
+        if args.video is not None:
+            return run_video_mode(args.video, args.balance, args.resize_video_to_calibration)
         return run_image_mode(args.image)
     finally:
         cv2.destroyAllWindows()

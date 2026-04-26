@@ -191,6 +191,10 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local recorded camera runs. Keep large videos out of git.
+/videos/*
+!/videos/README.md
+
 # PyPI configuration file
 .pypirc
 

@@ -590,8 +590,16 @@ def image_yaw_to_field_heading(angle: float) -> float:
     return normalize_angle(math.atan2(-math.cos(angle), math.sin(angle)))
 
 
-def robot_parallax_config(params: dict[str, object], calibration: dict[str, Any] | None) -> ParallaxConfig:
-    """Build robot marker parallax config, preferring saved robot geometry when present."""
+def robot_parallax_config_from_live_params(
+    params: dict[str, object],
+    calibration: dict[str, Any] | None,
+) -> ParallaxConfig:
+    """Build robot marker parallax config from the current UI values.
+
+    The JSON calibration contributes only marker height here. Camera center,
+    camera height, and calibration-plane height must come from the live
+    trackbar state every frame so robot and ball parallax stay synchronized.
+    """
     marker_height_cm = ROBOT_MARKER_HEIGHT_CM
     if calibration is not None and isinstance(calibration.get("marker_height_cm"), (int, float)):
         marker_height_cm = float(calibration["marker_height_cm"])
@@ -930,7 +938,7 @@ def load_calibration_image_size(calibration_file: Path) -> tuple[int, int]:
     return image_size
 
 
-def create_hsv_trackbars(frame_size: tuple[int, int], robot_calibration: dict[str, Any] | None = None) -> None:
+def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
     """Create trackbars for the three color classes.
 
     Red uses two hue intervals because red wraps across the HSV hue boundary.
@@ -974,17 +982,6 @@ def create_hsv_trackbars(frame_size: tuple[int, int], robot_calibration: dict[st
         "cam_center_x": frame_width // 2,
         "cam_center_y": frame_height // 2,
     }
-    if robot_calibration is not None:
-        calibration_defaults = {
-            "cam_height_cm": robot_calibration.get("camera_height_cm"),
-            "calib_z_cm": robot_calibration.get("calibration_plane_height_cm"),
-            "cam_center_x": robot_calibration.get("camera_center_x"),
-            "cam_center_y": robot_calibration.get("camera_center_y"),
-        }
-        for key, value in calibration_defaults.items():
-            if isinstance(value, (int, float)):
-                defaults[key] = int(round(float(value)))
-
     for key, value in defaults.items():
         name = TRACKBAR_NAMES[key]
         window_name = TRACKBAR_WINDOWS[key]
@@ -1489,13 +1486,35 @@ def robot_origin_from_observation(
 
 
 def estimate_robot_pose(
-    observations: dict[int, RobotMarkerObservation],
+    frame_bgr: np.ndarray,
+    params: dict[str, object],
     calibration: dict[str, Any] | None,
-    frame_shape: tuple[int, int, int],
-) -> tuple[RobotPose | None, tuple[float, float] | None]:
-    """Fuse calibrated marker observations into a single field-coordinate robot pose."""
+    dictionary: object | None,
+    detector_or_parameters: object | None,
+) -> tuple[
+    RobotPose | None,
+    tuple[float, float] | None,
+    dict[int, RobotMarkerObservation],
+    ParallaxConfig,
+]:
+    """Estimate the robot pose from the current warped frame and live camera state.
+
+    This function intentionally recalculates everything from scratch every
+    frame. The live ``params`` dictionary is the same trackbar/state object
+    used by ball parallax correction, so changing camera center/height or a
+    refreshed top-down homography immediately affects the robot schematic pose.
+    """
+    parallax_config = robot_parallax_config_from_live_params(params, calibration)
+    observations = extract_robot_marker_observations(
+        frame_bgr,
+        dictionary,
+        detector_or_parameters,
+        ROBOT_MARKER_IDS,
+        parallax_config,
+    )
+
     if calibration is None:
-        return None, None
+        return None, None, observations, parallax_config
 
     origins: list[np.ndarray] = []
     field_headings: list[float] = []
@@ -1508,16 +1527,21 @@ def estimate_robot_pose(
         field_headings.append(image_yaw_to_field_heading(true_image_heading))
 
     if not origins:
-        return None, None
+        return None, None, observations, parallax_config
 
     origin = np.mean(np.array(origins, dtype=np.float32), axis=0)
-    source_height, source_width = frame_shape[:2]
+    source_height, source_width = frame_bgr.shape[:2]
     x_cm, y_cm = pixel_float_to_field_cm(origin, (source_width, source_height))
     heading_rad = math.atan2(
         sum(math.sin(angle) for angle in field_headings),
         sum(math.cos(angle) for angle in field_headings),
     )
-    return RobotPose(x_cm=x_cm, y_cm=y_cm, heading_rad=normalize_angle(heading_rad)), (float(origin[0]), float(origin[1]))
+    return (
+        RobotPose(x_cm=x_cm, y_cm=y_cm, heading_rad=normalize_angle(heading_rad)),
+        (float(origin[0]), float(origin[1])),
+        observations,
+        parallax_config,
+    )
 
 
 def field_metric_cm_to_grid_node(point_cm: tuple[float, float]) -> tuple[int, int]:
@@ -2377,22 +2401,21 @@ def process_frame(
     )
     robot_observations: dict[int, RobotMarkerObservation] = {}
     if robot_runtime is not None:
-        parallax_config = robot_parallax_config(params, robot_runtime.calibration)
-        robot_observations = extract_robot_marker_observations(
-            frame_bgr,
-            aruco_dictionary_obj,
-            aruco_detector_obj,
-            ROBOT_MARKER_IDS,
+        (
+            app_state.robot_pose,
+            app_state.robot_topdown_px,
+            robot_observations,
             parallax_config,
+        ) = estimate_robot_pose(
+            frame_bgr=frame_bgr,
+            params=params,
+            calibration=robot_runtime.calibration,
+            dictionary=aruco_dictionary_obj,
+            detector_or_parameters=aruco_detector_obj,
         )
         robot_runtime.latest_observations = robot_observations
         robot_runtime.latest_parallax_config = parallax_config
         update_robot_calibration_collection(robot_runtime, robot_observations)
-        app_state.robot_pose, app_state.robot_topdown_px = estimate_robot_pose(
-            robot_observations,
-            robot_runtime.calibration,
-            frame_bgr.shape,
-        )
 
     red_zones, red_mask = detect_red_zones(frame_bgr, params, camera_center_pixels)
     white_balls, orange_balls, ball_masks = detect_balls(frame_bgr, params, camera_center_pixels)
@@ -2527,7 +2550,7 @@ def run_raw_stream_mode(
         aruco_detector=aruco_detector,
         aruco_available=aruco_dictionary is not None and aruco_detector is not None,
     )
-    create_hsv_trackbars(TOPDOWN_WARP_SIZE, robot_runtime.calibration)
+    create_hsv_trackbars(TOPDOWN_WARP_SIZE)
     cv2.namedWindow(SCHEMATIC_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.namedWindow(MANUAL_SELECTOR_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(MANUAL_SELECTOR_WINDOW_NAME, on_manual_topdown_mouse, selection_state)
@@ -2649,7 +2672,7 @@ def run_raw_stream_mode(
             selection_state.start_manual_calibration()
             reset_detection_state(app_state)
         if selection_state.transform_matrix is not None:
-            parallax_config = robot_runtime.latest_parallax_config or robot_parallax_config(
+            parallax_config = robot_runtime.latest_parallax_config or robot_parallax_config_from_live_params(
                 params,
                 robot_runtime.calibration,
             )

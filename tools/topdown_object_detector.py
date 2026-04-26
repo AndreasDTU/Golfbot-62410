@@ -88,6 +88,7 @@ TRACKBAR_NAMES = {
     "calib_z_cm": "Border h cm",
     "cam_center_x": "Cam C X",
     "cam_center_y": "Cam C Y",
+    "heading_tuning": "Heading Tuning",
 }
 TRACKBAR_WINDOWS = {
     "red1_h_min": CONTROL_COLOR_WINDOW_NAME,
@@ -118,6 +119,7 @@ TRACKBAR_WINDOWS = {
     "calib_z_cm": CONTROL_GEOMETRY_WINDOW_NAME,
     "cam_center_x": CONTROL_GEOMETRY_WINDOW_NAME,
     "cam_center_y": CONTROL_GEOMETRY_WINDOW_NAME,
+    "heading_tuning": CONTROL_GEOMETRY_WINDOW_NAME,
 }
 
 # Still-image mode is the safest default for deterministic tuning.
@@ -137,7 +139,7 @@ SCHEMATIC_WIDTH_PX = 900
 SCHEMATIC_HEIGHT_PX = 600
 SCHEMATIC_WINDOW_NAME = "2D Schematic"
 ROBOT_RADIUS_CM = 15
-ROBOT_MARKER_IDS = (4,5)
+ROBOT_MARKER_IDS = (4,)
 ROBOT_MARKER_HEIGHT_CM = 9.0
 ROBOT_FOOTPRINT_LENGTH_CM = 30.0
 ROBOT_FOOTPRINT_WIDTH_CM = 24.0
@@ -975,12 +977,13 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         "orange_v_max": 255,
         "red_min_area": 400,
         "ball_min_area": 157,
-        "ball_max_area": 2500,
+        "ball_max_area": 1000,
         "ball_min_circ": 70,
         "cam_height_cm": 179,
         "calib_z_cm": 7,
         "cam_center_x": frame_width // 2,
         "cam_center_y": frame_height // 2,
+        "heading_tuning": 180,
     }
     for key, value in defaults.items():
         name = TRACKBAR_NAMES[key]
@@ -1000,6 +1003,8 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
             max_value = max(1, frame_width)
         if key == "cam_center_y":
             max_value = max(1, frame_height)
+        if key == "heading_tuning":
+            max_value = 360
         cv2.createTrackbar(name, window_name, value, max_value, noop)
 
 
@@ -1096,6 +1101,7 @@ def read_hsv_ranges() -> dict[str, object]:
         "z_calib_cm": float(get_trackbar_value("calib_z_cm")),
         "camera_center_x": float(get_trackbar_value("cam_center_x")),
         "camera_center_y": float(get_trackbar_value("cam_center_y")),
+        "heading_tuning_rad": math.radians(float(get_trackbar_value("heading_tuning")) - 180.0),
     }
 
 
@@ -1536,8 +1542,9 @@ def estimate_robot_pose(
         sum(math.sin(angle) for angle in field_headings),
         sum(math.cos(angle) for angle in field_headings),
     )
+    heading_rad = normalize_angle(heading_rad + float(params.get("heading_tuning_rad", 0.0)))
     return (
-        RobotPose(x_cm=x_cm, y_cm=y_cm, heading_rad=normalize_angle(heading_rad)),
+        RobotPose(x_cm=x_cm, y_cm=y_cm, heading_rad=heading_rad),
         (float(origin[0]), float(origin[1])),
         observations,
         parallax_config,
@@ -2276,6 +2283,48 @@ def handle_robot_calibration_key(
         runtime.warning = f"Saved robot calibration to {ROBOT_CALIBRATION_FILE}"
 
 
+def save_heading_tuning_to_robot_calibration(
+    runtime: RobotCalibrationRuntime,
+    tuning_offset_rad: float,
+) -> bool:
+    """Fold the live heading trim into robot_calibration.json and reset trim to zero.
+
+    ``alpha_rad`` is subtracted during pose estimation. To preserve the current
+    on-screen heading after resetting the slider, the saved alpha baseline moves
+    opposite the live tuning angle. The marker offset vector is rotated by the
+    compensating angle so the robot center does not jump after saving.
+    """
+    if runtime.calibration is None:
+        runtime.warning = "Cannot save heading tuning: no robot calibration loaded."
+        return False
+    if abs(tuning_offset_rad) < 1e-9:
+        runtime.warning = "Heading tuning is already zero."
+        return False
+
+    for marker_config in runtime.calibration.get("markers", {}).values():
+        old_alpha = float(marker_config["alpha_rad"])
+        old_offset = np.array(
+            [float(marker_config["dx"]), float(marker_config["dy"])],
+            dtype=np.float32,
+        )
+        new_offset = image_yaw_rotation_matrix(-tuning_offset_rad) @ old_offset
+        new_alpha = normalize_angle(old_alpha - tuning_offset_rad)
+
+        marker_config["dx"] = float(new_offset[0])
+        marker_config["dy"] = float(new_offset[1])
+        marker_config["alpha_rad"] = float(new_alpha)
+        marker_config["alpha_deg"] = float(math.degrees(new_alpha))
+
+    runtime.calibration["created_unix"] = time.time()
+    ROBOT_CALIBRATION_FILE.write_text(
+        json.dumps(runtime.calibration, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    cv2.setTrackbarPos(TRACKBAR_NAMES["heading_tuning"], TRACKBAR_WINDOWS["heading_tuning"], 180)
+    runtime.warning = f"Saved heading baseline to {ROBOT_CALIBRATION_FILE}"
+    return True
+
+
 def draw_robot_calibration_status(
     frame: np.ndarray,
     runtime: RobotCalibrationRuntime,
@@ -2294,7 +2343,7 @@ def draw_robot_calibration_status(
         action = "Face robot forward, press Enter"
     else:
         mode = "ROBOT TRACKING"
-        action = "c: calibrate spin"
+        action = "c: calibrate spin | w: save heading"
 
     lines = [mode, action, f"Spin points: {counts}"]
     if robot_pose is not None:
@@ -2671,6 +2720,11 @@ def run_raw_stream_mode(
         if key == ord("m"):
             selection_state.start_manual_calibration()
             reset_detection_state(app_state)
+        if key == ord("w") and selection_state.transform_matrix is not None:
+            save_heading_tuning_to_robot_calibration(
+                robot_runtime,
+                float(params.get("heading_tuning_rad", 0.0)),
+            )
         if selection_state.transform_matrix is not None:
             parallax_config = robot_runtime.latest_parallax_config or robot_parallax_config_from_live_params(
                 params,

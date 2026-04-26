@@ -20,6 +20,7 @@ The script intentionally keeps the detection pipeline simple and deterministic:
 from __future__ import annotations
 
 import argparse
+import json
 from collections import deque
 from enum import Enum
 import heapq
@@ -28,6 +29,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -47,6 +49,7 @@ FIELD_GRID_HEIGHT_CM = int(round(FIELD_HEIGHT_CM))
 Z_BALL_CM = 2.0
 Z_FLOOR_CM = 0.0
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
+ROBOT_CALIBRATION_FILE = REPO_ROOT / "robot_calibration.json"
 DEFAULT_IMAGE = REPO_ROOT / "test_topdown.png"
 DEFAULT_VIDEO_DIR = REPO_ROOT / "videos"
 WINDOW_NAME = "Top-Down Detector"
@@ -134,6 +137,20 @@ SCHEMATIC_WIDTH_PX = 900
 SCHEMATIC_HEIGHT_PX = 600
 SCHEMATIC_WINDOW_NAME = "2D Schematic"
 ROBOT_RADIUS_CM = 15
+ROBOT_MARKER_IDS = (4,5)
+ROBOT_MARKER_HEIGHT_CM = 9.0
+ROBOT_FOOTPRINT_LENGTH_CM = 30.0
+ROBOT_FOOTPRINT_WIDTH_CM = 24.0
+MIN_ROBOT_SPIN_POINTS = 20
+ELLIPSE_WARNING_RATIO = 1.12
+
+
+class RobotCalibrationPhase(Enum):
+    """Non-blocking robot origin calibration state."""
+
+    STATE_NORMAL = "normal"
+    STATE_CALIBRATING_SPIN = "calibrating_spin"
+    STATE_CALIBRATING_FORWARD = "calibrating_forward"
 
 
 class CalibrationState(Enum):
@@ -143,6 +160,53 @@ class CalibrationState(Enum):
     CALIBRATED_AUTO = "calibrated_auto"
     CALIBRATING_MANUAL = "calibrating_manual"
     CALIBRATED_MANUAL = "calibrated_manual"
+
+
+@dataclass(frozen=True)
+class RobotPose:
+    """Robot center pose in field coordinates with bottom-left cm origin."""
+
+    x_cm: float
+    y_cm: float
+    heading_rad: float
+
+
+@dataclass(frozen=True)
+class ParallaxConfig:
+    """Geometry needed to project elevated points onto the ground plane."""
+
+    marker_height_cm: float
+    camera_height_cm: float
+    calibration_plane_height_cm: float
+    camera_center: np.ndarray
+
+
+@dataclass(frozen=True)
+class RobotMarkerObservation:
+    """Detected robot marker after strict parallax projection to the ground plane."""
+
+    marker_id: int
+    center: np.ndarray
+    ground_center: np.ndarray
+    corners: np.ndarray
+    ground_corners: np.ndarray
+    yaw_rad: float
+
+
+@dataclass
+class RobotCalibrationRuntime:
+    """Mutable robot calibration state used by the live detector loop."""
+
+    phase: RobotCalibrationPhase = RobotCalibrationPhase.STATE_NORMAL
+    calibration: dict[str, Any] | None = None
+    collected_points: dict[int, list[tuple[float, float]]] = field(
+        default_factory=lambda: {marker_id: [] for marker_id in ROBOT_MARKER_IDS}
+    )
+    fitted_centers: dict[int, tuple[float, float]] = field(default_factory=dict)
+    ellipse_ratios: dict[int, float] = field(default_factory=dict)
+    latest_observations: dict[int, RobotMarkerObservation] = field(default_factory=dict)
+    latest_parallax_config: ParallaxConfig | None = None
+    warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -375,6 +439,8 @@ class AppState:
     latest_white_balls: list[BallDetection] | None = None
     latest_orange_balls: list[BallDetection] | None = None
     latest_smoothed_ball_coordinates: list[SmoothedBallCoordinate] = field(default_factory=list)
+    robot_pose: RobotPose | None = None
+    robot_topdown_px: tuple[float, float] | None = None
     selected_ball_track_id: int | None = None
     selected_start_cm: tuple[int, int] | None = None
     route_points_cm: list[tuple[int, int]] | None = None
@@ -486,6 +552,97 @@ def detect_aruco_markers(
 def marker_center(corners: np.ndarray) -> np.ndarray:
     """Compute the center of one detected marker from its four corners."""
     return corners.reshape(4, 2).mean(axis=0).astype(np.float32)
+
+
+def normalize_angle(angle: float) -> float:
+    """Normalize an angle to [-pi, pi)."""
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def parallax_correct_point_float(point: np.ndarray, config: ParallaxConfig) -> np.ndarray:
+    """Project an elevated point down to the configured calibration plane."""
+    denominator = config.camera_height_cm - config.calibration_plane_height_cm
+    if abs(denominator) < 1e-6:
+        return point.astype(np.float32)
+
+    scale = (config.camera_height_cm - config.marker_height_cm) / denominator
+    return (config.camera_center + (point - config.camera_center) * scale).astype(np.float32)
+
+
+def marker_yaw_from_ground_corners(ground_corners: np.ndarray) -> float:
+    """Return marker yaw in top-down image coordinates; 0 points toward image +Y."""
+    pts = ground_corners.reshape(4, 2).astype(np.float32)
+    top_mid = (pts[0] + pts[1]) * 0.5
+    bottom_mid = (pts[2] + pts[3]) * 0.5
+    marker_forward = bottom_mid - top_mid
+    return float(math.atan2(marker_forward[0], marker_forward[1]))
+
+
+def image_yaw_rotation_matrix(angle: float) -> np.ndarray:
+    """Rotate top-down image vectors for yaw measured from +Y with image Y down."""
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return np.array([[c, s], [-s, c]], dtype=np.float32)
+
+
+def image_yaw_to_field_heading(angle: float) -> float:
+    """Convert image yaw to standard field heading, where +X is 0 and +Y is pi/2."""
+    return normalize_angle(math.atan2(-math.cos(angle), math.sin(angle)))
+
+
+def robot_parallax_config(params: dict[str, object], calibration: dict[str, Any] | None) -> ParallaxConfig:
+    """Build robot marker parallax config, preferring saved robot geometry when present."""
+    marker_height_cm = ROBOT_MARKER_HEIGHT_CM
+    if calibration is not None and isinstance(calibration.get("marker_height_cm"), (int, float)):
+        marker_height_cm = float(calibration["marker_height_cm"])
+
+    return ParallaxConfig(
+        marker_height_cm=marker_height_cm,
+        camera_height_cm=float(params["h_cam_cm"]),
+        calibration_plane_height_cm=float(params["z_calib_cm"]),
+        camera_center=np.array(
+            [float(params["camera_center_x"]), float(params["camera_center_y"])],
+            dtype=np.float32,
+        ),
+    )
+
+
+def extract_robot_marker_observations(
+    frame: np.ndarray,
+    dictionary: object | None,
+    detector_or_parameters: object | None,
+    marker_ids: tuple[int, ...],
+    parallax_config: ParallaxConfig,
+) -> dict[int, RobotMarkerObservation]:
+    """Detect robot markers and immediately project their geometry to the ground plane."""
+    observations: dict[int, RobotMarkerObservation] = {}
+    if dictionary is None or detector_or_parameters is None:
+        return observations
+
+    corners, ids = detect_aruco_markers(frame, dictionary, detector_or_parameters)
+    if ids is None:
+        return observations
+
+    wanted = set(marker_ids)
+    for marker_corners, raw_id in zip(corners, ids.flatten().tolist()):
+        marker_id = int(raw_id)
+        if marker_id not in wanted:
+            continue
+
+        pts = marker_corners.reshape(4, 2).astype(np.float32)
+        ground_pts = np.array(
+            [parallax_correct_point_float(point, parallax_config) for point in pts],
+            dtype=np.float32,
+        )
+        observations[marker_id] = RobotMarkerObservation(
+            marker_id=marker_id,
+            center=pts.mean(axis=0).astype(np.float32),
+            ground_center=ground_pts.mean(axis=0).astype(np.float32),
+            corners=pts,
+            ground_corners=ground_pts,
+            yaw_rad=marker_yaw_from_ground_corners(ground_pts),
+        )
+    return observations
 
 
 def extract_required_marker_centers(corners: list[np.ndarray], ids: np.ndarray | None) -> dict[int, np.ndarray]:
@@ -773,7 +930,7 @@ def load_calibration_image_size(calibration_file: Path) -> tuple[int, int]:
     return image_size
 
 
-def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
+def create_hsv_trackbars(frame_size: tuple[int, int], robot_calibration: dict[str, Any] | None = None) -> None:
     """Create trackbars for the three color classes.
 
     Red uses two hue intervals because red wraps across the HSV hue boundary.
@@ -817,6 +974,16 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         "cam_center_x": frame_width // 2,
         "cam_center_y": frame_height // 2,
     }
+    if robot_calibration is not None:
+        calibration_defaults = {
+            "cam_height_cm": robot_calibration.get("camera_height_cm"),
+            "calib_z_cm": robot_calibration.get("calibration_plane_height_cm"),
+            "cam_center_x": robot_calibration.get("camera_center_x"),
+            "cam_center_y": robot_calibration.get("camera_center_y"),
+        }
+        for key, value in calibration_defaults.items():
+            if isinstance(value, (int, float)):
+                defaults[key] = int(round(float(value)))
 
     for key, value in defaults.items():
         name = TRACKBAR_NAMES[key]
@@ -1174,6 +1341,185 @@ def pixel_to_field_cm(point: tuple[int, int], source_size: tuple[int, int]) -> t
     )
 
 
+def pixel_float_to_field_cm(point: np.ndarray, source_size: tuple[int, int]) -> tuple[float, float]:
+    """Convert a floating-point top-down pixel coordinate to bottom-left field cm."""
+    return pixel_to_field_cm((int(round(float(point[0]))), int(round(float(point[1])))), source_size)
+
+
+def scale_robot_calibration_to_topdown(calibration: dict[str, Any], topdown_size: tuple[int, int]) -> dict[str, Any]:
+    """Scale saved top-down pixel calibration values if the detector warp size differs."""
+    stored_size = calibration.get("topdown_size")
+    if not isinstance(stored_size, list) or len(stored_size) != 2:
+        return calibration
+
+    stored_width = float(stored_size[0])
+    stored_height = float(stored_size[1])
+    target_width = float(topdown_size[0])
+    target_height = float(topdown_size[1])
+    if stored_width <= 0.0 or stored_height <= 0.0:
+        return calibration
+    if int(stored_width) == topdown_size[0] and int(stored_height) == topdown_size[1]:
+        return calibration
+
+    scale_x = target_width / stored_width
+    scale_y = target_height / stored_height
+    scaled = json.loads(json.dumps(calibration))
+    for key, scale in (("camera_center_x", scale_x), ("camera_center_y", scale_y)):
+        if isinstance(scaled.get(key), (int, float)):
+            scaled[key] = float(scaled[key]) * scale
+
+    for marker_config in scaled.get("markers", {}).values():
+        for key, scale in (("dx", scale_x), ("origin_x", scale_x), ("dy", scale_y), ("origin_y", scale_y)):
+            if isinstance(marker_config.get(key), (int, float)):
+                marker_config[key] = float(marker_config[key]) * scale
+    scaled["topdown_size"] = [topdown_size[0], topdown_size[1]]
+    print(
+        f"Scaled robot calibration from {(int(stored_width), int(stored_height))} to {topdown_size}. "
+        "Recalibrate in this detector for best accuracy.",
+        file=sys.stderr,
+    )
+    return scaled
+
+
+def load_robot_calibration(path: Path, marker_ids: tuple[int, ...], topdown_size: tuple[int, int]) -> dict[str, Any] | None:
+    """Load robot marker offsets from JSON if all requested marker IDs are present."""
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        calibration = json.load(handle)
+
+    markers = calibration.get("markers", {})
+    if not all(str(marker_id) in markers for marker_id in marker_ids):
+        print(f"Robot calibration missing marker IDs {marker_ids}: {path}", file=sys.stderr)
+        return None
+    return scale_robot_calibration_to_topdown(calibration, topdown_size)
+
+
+def fit_circle(points: list[tuple[float, float]]) -> tuple[float, float, float]:
+    """Fit a deterministic enclosing circle to collected spin points."""
+    pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+    (x, y), radius = cv2.minEnclosingCircle(pts)
+    return float(x), float(y), float(radius)
+
+
+def ellipse_ratio(points: list[tuple[float, float]]) -> float | None:
+    """Estimate how circular the spin path is; >1 means ellipse-like."""
+    if len(points) < 5:
+        return None
+    pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+    _center, axes, _angle = cv2.fitEllipse(pts)
+    minor = max(1e-6, float(min(axes)))
+    major = float(max(axes))
+    return major / minor
+
+
+def compute_robot_spin_centers(runtime: RobotCalibrationRuntime) -> bool:
+    """Finalize spin collection by fitting one circle center per visible robot marker."""
+    runtime.fitted_centers.clear()
+    runtime.ellipse_ratios.clear()
+    warnings: list[str] = []
+
+    for marker_id in ROBOT_MARKER_IDS:
+        points = runtime.collected_points.get(marker_id, [])
+        if len(points) < MIN_ROBOT_SPIN_POINTS:
+            runtime.warning = f"Need {MIN_ROBOT_SPIN_POINTS} spin points for ID {marker_id}; got {len(points)}."
+            return False
+        xc, yc, _radius = fit_circle(points)
+        runtime.fitted_centers[marker_id] = (xc, yc)
+        ratio = ellipse_ratio(points)
+        if ratio is not None:
+            runtime.ellipse_ratios[marker_id] = ratio
+            if ratio > ELLIPSE_WARNING_RATIO:
+                warnings.append(f"ID {marker_id} ellipse ratio {ratio:.2f}")
+
+    runtime.warning = "WARNING: Elliptical spin path. Check floor slip or homography." if warnings else ""
+    return True
+
+
+def save_robot_calibration(
+    path: Path,
+    runtime: RobotCalibrationRuntime,
+    observations: dict[int, RobotMarkerObservation],
+    parallax_config: ParallaxConfig,
+    topdown_size: tuple[int, int],
+) -> dict[str, Any]:
+    """Save marker-to-robot-origin offsets from the forward-facing alignment frame."""
+    markers: dict[str, dict[str, float]] = {}
+    for marker_id in ROBOT_MARKER_IDS:
+        observation = observations[marker_id]
+        origin = runtime.fitted_centers[marker_id]
+        dx = float(observation.ground_center[0] - origin[0])
+        dy = float(observation.ground_center[1] - origin[1])
+        alpha_rad = float(observation.yaw_rad)
+        markers[str(marker_id)] = {
+            "dx": dx,
+            "dy": dy,
+            "alpha_rad": alpha_rad,
+            "alpha_deg": math.degrees(alpha_rad),
+            "origin_x": float(origin[0]),
+            "origin_y": float(origin[1]),
+            "ellipse_ratio": float(runtime.ellipse_ratios.get(marker_id, 0.0)),
+        }
+
+    calibration = {
+        "version": 1,
+        "created_unix": time.time(),
+        "marker_ids": list(ROBOT_MARKER_IDS),
+        "marker_height_cm": float(parallax_config.marker_height_cm),
+        "camera_height_cm": float(parallax_config.camera_height_cm),
+        "calibration_plane_height_cm": float(parallax_config.calibration_plane_height_cm),
+        "camera_center_x": float(parallax_config.camera_center[0]),
+        "camera_center_y": float(parallax_config.camera_center[1]),
+        "topdown_size": [int(topdown_size[0]), int(topdown_size[1])],
+        "markers": markers,
+    }
+    path.write_text(json.dumps(calibration, indent=2, sort_keys=True), encoding="utf-8")
+    return calibration
+
+
+def robot_origin_from_observation(
+    observation: RobotMarkerObservation,
+    marker_calibration: dict[str, float],
+) -> tuple[np.ndarray, float]:
+    """Apply saved offset after parallax correction to get the ground robot origin."""
+    offset = np.array([marker_calibration["dx"], marker_calibration["dy"]], dtype=np.float32)
+    true_image_heading = normalize_angle(observation.yaw_rad - float(marker_calibration["alpha_rad"]))
+    rotated_offset = image_yaw_rotation_matrix(true_image_heading) @ offset
+    return observation.ground_center - rotated_offset, true_image_heading
+
+
+def estimate_robot_pose(
+    observations: dict[int, RobotMarkerObservation],
+    calibration: dict[str, Any] | None,
+    frame_shape: tuple[int, int, int],
+) -> tuple[RobotPose | None, tuple[float, float] | None]:
+    """Fuse calibrated marker observations into a single field-coordinate robot pose."""
+    if calibration is None:
+        return None, None
+
+    origins: list[np.ndarray] = []
+    field_headings: list[float] = []
+    for marker_id, observation in observations.items():
+        marker_config = calibration.get("markers", {}).get(str(marker_id))
+        if marker_config is None:
+            continue
+        origin_px, true_image_heading = robot_origin_from_observation(observation, marker_config)
+        origins.append(origin_px)
+        field_headings.append(image_yaw_to_field_heading(true_image_heading))
+
+    if not origins:
+        return None, None
+
+    origin = np.mean(np.array(origins, dtype=np.float32), axis=0)
+    source_height, source_width = frame_shape[:2]
+    x_cm, y_cm = pixel_float_to_field_cm(origin, (source_width, source_height))
+    heading_rad = math.atan2(
+        sum(math.sin(angle) for angle in field_headings),
+        sum(math.cos(angle) for angle in field_headings),
+    )
+    return RobotPose(x_cm=x_cm, y_cm=y_cm, heading_rad=normalize_angle(heading_rad)), (float(origin[0]), float(origin[1]))
+
+
 def field_metric_cm_to_grid_node(point_cm: tuple[float, float]) -> tuple[int, int]:
     """Convert bottom-left metric coordinates to top-left grid nodes."""
     x_cm, y_cm = point_cm
@@ -1321,14 +1667,13 @@ def build_greedy_route(
     ball_nodes_cm: list[tuple[int, int]],
     start_node_cm: tuple[int, int],
 ) -> list[tuple[int, int]]:
-    """Greedily connect the start ball to the nearest reachable unvisited balls."""
+    """Greedily connect the robot start node to the nearest reachable balls."""
     if not ball_nodes_cm:
         return []
 
     unvisited = list(ball_nodes_cm)
-    current = min(unvisited, key=lambda node: math.hypot(node[0] - start_node_cm[0], node[1] - start_node_cm[1]))
+    current = start_node_cm
     route: list[tuple[int, int]] = [current]
-    unvisited.remove(current)
 
     while unvisited:
         candidate = min(unvisited, key=lambda node: math.hypot(node[0] - current[0], node[1] - current[1]))
@@ -1349,7 +1694,6 @@ def update_route_from_state(app_state: AppState) -> None:
     if (
         app_state.latest_frame_shape is None
         or app_state.latest_red_zones is None
-        or app_state.selected_ball_track_id is None
     ):
         app_state.route_points_cm = None
         return
@@ -1359,16 +1703,24 @@ def update_route_from_state(app_state: AppState) -> None:
         app_state.route_points_cm = None
         return
 
-    selected_ball = next(
-        (ball for ball in smoothed_balls if ball.track_id == app_state.selected_ball_track_id),
-        None,
-    )
-    if selected_ball is None:
-        app_state.selected_start_cm = None
-        app_state.route_points_cm = None
-        return
+    if app_state.robot_pose is not None:
+        app_state.selected_start_cm = field_metric_cm_to_grid_node(
+            (app_state.robot_pose.x_cm, app_state.robot_pose.y_cm)
+        )
+    else:
+        if app_state.selected_ball_track_id is None:
+            app_state.route_points_cm = None
+            return
+        selected_ball = next(
+            (ball for ball in smoothed_balls if ball.track_id == app_state.selected_ball_track_id),
+            None,
+        )
+        if selected_ball is None:
+            app_state.selected_start_cm = None
+            app_state.route_points_cm = None
+            return
+        app_state.selected_start_cm = field_metric_cm_to_grid_node((selected_ball.cm_x, selected_ball.cm_y))
 
-    app_state.selected_start_cm = field_metric_cm_to_grid_node((selected_ball.cm_x, selected_ball.cm_y))
     ball_nodes_cm = [
         field_metric_cm_to_grid_node((ball.cm_x, ball.cm_y))
         for ball in smoothed_balls
@@ -1475,15 +1827,40 @@ def draw_schematic(
             cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
 
     if app_state.selected_start_cm is not None:
-        selected_ball = next(
-            (ball for ball in smoothed_ball_coordinates if ball.track_id == app_state.selected_ball_track_id),
-            None,
-        )
-        if selected_ball is not None:
-            selected_start = field_metric_cm_to_schematic((selected_ball.cm_x, selected_ball.cm_y))
+        if app_state.robot_pose is not None:
+            selected_start = field_metric_cm_to_schematic((app_state.robot_pose.x_cm, app_state.robot_pose.y_cm))
         else:
-            selected_start = field_cm_to_schematic(app_state.selected_start_cm)
+            selected_ball = next(
+                (ball for ball in smoothed_ball_coordinates if ball.track_id == app_state.selected_ball_track_id),
+                None,
+            )
+            if selected_ball is not None:
+                selected_start = field_metric_cm_to_schematic((selected_ball.cm_x, selected_ball.cm_y))
+            else:
+                selected_start = field_cm_to_schematic(app_state.selected_start_cm)
         cv2.circle(schematic, selected_start, 8, (0, 255, 255), 2, cv2.LINE_AA)
+
+    if app_state.robot_pose is not None:
+        robot_center = field_metric_cm_to_schematic((app_state.robot_pose.x_cm, app_state.robot_pose.y_cm))
+        heading_len = 34
+        heading_end = (
+            int(round(robot_center[0] + math.cos(app_state.robot_pose.heading_rad) * heading_len)),
+            int(round(robot_center[1] - math.sin(app_state.robot_pose.heading_rad) * heading_len)),
+        )
+        cv2.circle(schematic, robot_center, 13, (255, 90, 30), -1, cv2.LINE_AA)
+        cv2.circle(schematic, robot_center, 13, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.arrowedLine(schematic, robot_center, heading_end, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.28)
+        robot_label = f"Robot X:{app_state.robot_pose.x_cm:.1f} Y:{app_state.robot_pose.y_cm:.1f}"
+        cv2.putText(
+            schematic,
+            robot_label,
+            (max(10, min(robot_center[0] + 16, SCHEMATIC_WIDTH_PX - 230)), max(25, robot_center[1] - 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
     camera_center_schematic = map_point_between_frames(
         (int(round(camera_center_pixels[0])), int(round(camera_center_pixels[1]))),
@@ -1530,6 +1907,95 @@ def draw_schematic(
         cv2.LINE_AA,
     )
     return schematic
+
+
+def draw_robot_marker_debug(
+    frame: np.ndarray,
+    observations: dict[int, RobotMarkerObservation],
+    calibration: dict[str, Any] | None,
+    robot_origin_px: tuple[float, float] | None,
+    robot_pose: RobotPose | None,
+    runtime: RobotCalibrationRuntime | None = None,
+) -> None:
+    """Draw robot marker, parallax projection, offset line, and footprint on top-down view."""
+    if runtime is not None:
+        colors = [(0, 180, 255), (255, 180, 0)]
+        for index, marker_id in enumerate(ROBOT_MARKER_IDS):
+            points = runtime.collected_points.get(marker_id, [])
+            if len(points) >= 2:
+                pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(frame, [pts], False, colors[index % len(colors)], 2, cv2.LINE_AA)
+            if marker_id in runtime.fitted_centers:
+                center = runtime.fitted_centers[marker_id]
+                cv2.drawMarker(
+                    frame,
+                    (int(round(center[0])), int(round(center[1]))),
+                    (0, 165, 255),
+                    cv2.MARKER_TILTED_CROSS,
+                    24,
+                    2,
+                    cv2.LINE_AA,
+                )
+
+    for observation in observations.values():
+        raw_pts = observation.corners.astype(np.int32).reshape(-1, 1, 2)
+        ground_pts = observation.ground_corners.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [raw_pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.polylines(frame, [ground_pts], True, (255, 255, 0), 1, cv2.LINE_AA)
+
+        raw_center = tuple(int(round(v)) for v in observation.center)
+        ground_center = tuple(int(round(v)) for v in observation.ground_center)
+        cv2.circle(frame, raw_center, 4, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.drawMarker(frame, ground_center, (255, 255, 0), cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+        cv2.line(frame, raw_center, ground_center, (255, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            f"Robot ID {observation.marker_id}",
+            (raw_center[0] + 8, raw_center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    if robot_origin_px is None:
+        return
+
+    origin = np.array(robot_origin_px, dtype=np.float32)
+    origin_i = (int(round(origin[0])), int(round(origin[1])))
+    cv2.circle(frame, origin_i, 8, (255, 90, 30), -1, cv2.LINE_AA)
+    cv2.circle(frame, origin_i, 15, (255, 255, 255), 2, cv2.LINE_AA)
+
+    for observation in observations.values():
+        if calibration is None or str(observation.marker_id) not in calibration.get("markers", {}):
+            continue
+        ground_center = tuple(int(round(v)) for v in observation.ground_center)
+        cv2.line(frame, ground_center, origin_i, (255, 90, 30), 2, cv2.LINE_AA)
+
+    if robot_pose is None:
+        return
+
+    source_height, source_width = frame.shape[:2]
+    px_per_cm_x = (source_width - 1) / FIELD_WIDTH_CM
+    px_per_cm_y = (source_height - 1) / FIELD_HEIGHT_CM
+    half_len = ROBOT_FOOTPRINT_LENGTH_CM * px_per_cm_y * 0.5
+    half_width = ROBOT_FOOTPRINT_WIDTH_CM * px_per_cm_x * 0.5
+    image_heading = normalize_angle(math.atan2(math.cos(robot_pose.heading_rad), -math.sin(robot_pose.heading_rad)))
+    forward = np.array([math.sin(image_heading), math.cos(image_heading)], dtype=np.float32)
+    right = np.array([math.cos(image_heading), -math.sin(image_heading)], dtype=np.float32)
+    footprint = np.array(
+        [
+            origin + forward * half_len + right * half_width,
+            origin + forward * half_len - right * half_width,
+            origin - forward * half_len - right * half_width,
+            origin - forward * half_len + right * half_width,
+        ],
+        dtype=np.int32,
+    ).reshape(-1, 1, 2)
+    cv2.polylines(frame, [footprint], True, (255, 90, 30), 2, cv2.LINE_AA)
+    heading_end = tuple(int(round(v)) for v in (origin + forward * (half_len + 20.0)))
+    cv2.arrowedLine(frame, origin_i, heading_end, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.25)
 
 
 def annotate_camera_frame(
@@ -1727,10 +2193,109 @@ def reset_detection_state(app_state: AppState) -> None:
     app_state.latest_white_balls = None
     app_state.latest_orange_balls = None
     app_state.latest_smoothed_ball_coordinates = []
+    app_state.robot_pose = None
+    app_state.robot_topdown_px = None
     app_state.selected_ball_track_id = None
     app_state.selected_start_cm = None
     app_state.route_points_cm = None
     app_state.coordinate_smoother.reset()
+
+
+def update_robot_calibration_collection(
+    runtime: RobotCalibrationRuntime,
+    observations: dict[int, RobotMarkerObservation],
+) -> None:
+    """Collect parallax-corrected marker ground centers while the robot spins."""
+    if runtime.phase != RobotCalibrationPhase.STATE_CALIBRATING_SPIN:
+        return
+    for marker_id, observation in observations.items():
+        runtime.collected_points.setdefault(marker_id, []).append(
+            (float(observation.ground_center[0]), float(observation.ground_center[1]))
+        )
+
+
+def handle_robot_calibration_key(
+    key: int,
+    runtime: RobotCalibrationRuntime,
+    observations: dict[int, RobotMarkerObservation],
+    parallax_config: ParallaxConfig,
+    topdown_size: tuple[int, int],
+) -> None:
+    """Advance robot calibration from keyboard input without blocking the frame loop."""
+    if key == ord("c"):
+        runtime.phase = RobotCalibrationPhase.STATE_CALIBRATING_SPIN
+        runtime.calibration = None
+        runtime.warning = ""
+        runtime.collected_points = {marker_id: [] for marker_id in ROBOT_MARKER_IDS}
+        runtime.fitted_centers.clear()
+        runtime.ellipse_ratios.clear()
+        return
+
+    if key == ord("s") and runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_SPIN:
+        if compute_robot_spin_centers(runtime):
+            runtime.phase = RobotCalibrationPhase.STATE_CALIBRATING_FORWARD
+        return
+
+    if key in (10, 13) and runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_FORWARD:
+        missing = [marker_id for marker_id in ROBOT_MARKER_IDS if marker_id not in observations]
+        if missing:
+            runtime.warning = f"Waiting for forward-facing marker(s): {missing}"
+            return
+        runtime.calibration = save_robot_calibration(
+            ROBOT_CALIBRATION_FILE,
+            runtime,
+            observations,
+            parallax_config,
+            topdown_size,
+        )
+        runtime.phase = RobotCalibrationPhase.STATE_NORMAL
+        runtime.warning = f"Saved robot calibration to {ROBOT_CALIBRATION_FILE}"
+
+
+def draw_robot_calibration_status(
+    frame: np.ndarray,
+    runtime: RobotCalibrationRuntime,
+    robot_pose: RobotPose | None,
+) -> None:
+    """Draw compact robot calibration and live pose status on the combined detector view."""
+    counts = ", ".join(
+        f"ID {marker_id}: {len(runtime.collected_points.get(marker_id, []))}"
+        for marker_id in ROBOT_MARKER_IDS
+    )
+    if runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_SPIN:
+        mode = "ROBOT CAL: SPIN"
+        action = "Spin robot, press s to fit"
+    elif runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_FORWARD:
+        mode = "ROBOT CAL: FORWARD"
+        action = "Face robot forward, press Enter"
+    else:
+        mode = "ROBOT TRACKING"
+        action = "c: calibrate spin"
+
+    lines = [mode, action, f"Spin points: {counts}"]
+    if robot_pose is not None:
+        lines.append(
+            f"Robot: X={robot_pose.x_cm:.1f}cm Y={robot_pose.y_cm:.1f}cm H={math.degrees(robot_pose.heading_rad):.1f}deg"
+        )
+    elif runtime.calibration is None:
+        lines.append("No robot_calibration.json loaded")
+    else:
+        lines.append("Robot marker not detected")
+    if runtime.warning:
+        lines.append(runtime.warning)
+
+    y0 = 62
+    for index, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (20, y0 + index * 23),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
 
 def prepare_live_topdown_frame(
@@ -1801,12 +2366,34 @@ def process_frame(
     params: dict[str, object],
     fps: float,
     app_state: AppState,
+    robot_runtime: RobotCalibrationRuntime | None = None,
+    aruco_dictionary_obj: object | None = None,
+    aruco_detector_obj: object | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run the full detection pass and build both output panels."""
     camera_center_pixels = (
         float(params["camera_center_x"]),
         float(params["camera_center_y"]),
     )
+    robot_observations: dict[int, RobotMarkerObservation] = {}
+    if robot_runtime is not None:
+        parallax_config = robot_parallax_config(params, robot_runtime.calibration)
+        robot_observations = extract_robot_marker_observations(
+            frame_bgr,
+            aruco_dictionary_obj,
+            aruco_detector_obj,
+            ROBOT_MARKER_IDS,
+            parallax_config,
+        )
+        robot_runtime.latest_observations = robot_observations
+        robot_runtime.latest_parallax_config = parallax_config
+        update_robot_calibration_collection(robot_runtime, robot_observations)
+        app_state.robot_pose, app_state.robot_topdown_px = estimate_robot_pose(
+            robot_observations,
+            robot_runtime.calibration,
+            frame_bgr.shape,
+        )
+
     red_zones, red_mask = detect_red_zones(frame_bgr, params, camera_center_pixels)
     white_balls, orange_balls, ball_masks = detect_balls(frame_bgr, params, camera_center_pixels)
     smoothed_ball_coordinates = app_state.coordinate_smoother.update(
@@ -1828,6 +2415,16 @@ def process_frame(
         orange_balls=orange_balls,
         fps=fps,
     )
+    if robot_runtime is not None:
+        draw_robot_marker_debug(
+            annotated,
+            robot_observations,
+            robot_runtime.calibration,
+            app_state.robot_topdown_px,
+            app_state.robot_pose,
+            robot_runtime,
+        )
+        draw_robot_calibration_status(annotated, robot_runtime, app_state.robot_pose)
     schematic = draw_schematic(
         frame_shape=frame_bgr.shape,
         red_zones=red_zones,
@@ -1918,6 +2515,9 @@ def run_raw_stream_mode(
 
     app_state = AppState()
     aruco_dictionary, aruco_detector = build_aruco_detector()
+    robot_runtime = RobotCalibrationRuntime(
+        calibration=load_robot_calibration(ROBOT_CALIBRATION_FILE, ROBOT_MARKER_IDS, TOPDOWN_WARP_SIZE)
+    )
     selection_state = TopdownSelectionState(
         points=[],
         cursor=(0, 0),
@@ -1927,7 +2527,7 @@ def run_raw_stream_mode(
         aruco_detector=aruco_detector,
         aruco_available=aruco_dictionary is not None and aruco_detector is not None,
     )
-    create_hsv_trackbars(TOPDOWN_WARP_SIZE)
+    create_hsv_trackbars(TOPDOWN_WARP_SIZE, robot_runtime.calibration)
     cv2.namedWindow(SCHEMATIC_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.namedWindow(MANUAL_SELECTOR_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(MANUAL_SELECTOR_WINDOW_NAME, on_manual_topdown_mouse, selection_state)
@@ -2014,6 +2614,9 @@ def run_raw_stream_mode(
                 params,
                 fps=fps,
                 app_state=app_state,
+                robot_runtime=robot_runtime,
+                aruco_dictionary_obj=aruco_dictionary,
+                aruco_detector_obj=aruco_detector,
             )
         processing_ms = (time.perf_counter() - start) * 1000.0
 
@@ -2045,6 +2648,18 @@ def run_raw_stream_mode(
         if key == ord("m"):
             selection_state.start_manual_calibration()
             reset_detection_state(app_state)
+        if selection_state.transform_matrix is not None:
+            parallax_config = robot_runtime.latest_parallax_config or robot_parallax_config(
+                params,
+                robot_runtime.calibration,
+            )
+            handle_robot_calibration_key(
+                key,
+                robot_runtime,
+                robot_runtime.latest_observations,
+                parallax_config,
+                TOPDOWN_WARP_SIZE,
+            )
 
     return 0
 

@@ -148,8 +148,16 @@ SCHEMATIC_WINDOW_NAME = "2D Schematic"
 ROBOT_RADIUS_CM = 15
 ROBOT_MARKER_IDS = (4,5)
 ROBOT_MARKER_HEIGHT_CM = 9.0
-ROBOT_FOOTPRINT_LENGTH_CM = 30.0
-ROBOT_FOOTPRINT_WIDTH_CM = 24.0
+ROBOT_AXLE_DISTANCE_CM = 13.0
+ROBOT_TRACK_WIDTH_CM = 20.0
+ROBOT_FRONT_EDGE_FROM_FRONT_AXLE_CM = 6.5
+ROBOT_TUBE_FROM_FRONT_AXLE_CM = 10.5
+ROBOT_FRONT_AXLE_FROM_ORIGIN_CM = ROBOT_AXLE_DISTANCE_CM * 0.5
+ROBOT_FRONT_EDGE_FROM_ORIGIN_CM = ROBOT_FRONT_AXLE_FROM_ORIGIN_CM + ROBOT_FRONT_EDGE_FROM_FRONT_AXLE_CM
+ROBOT_REAR_AXLE_FROM_ORIGIN_CM = ROBOT_AXLE_DISTANCE_CM * 0.5
+ROBOT_TUBE_OFFSET_CM = ROBOT_FRONT_AXLE_FROM_ORIGIN_CM + ROBOT_TUBE_FROM_FRONT_AXLE_CM
+ROBOT_FOOTPRINT_LENGTH_CM = ROBOT_FRONT_EDGE_FROM_ORIGIN_CM + ROBOT_REAR_AXLE_FROM_ORIGIN_CM
+ROBOT_FOOTPRINT_WIDTH_CM = ROBOT_TRACK_WIDTH_CM
 MIN_ROBOT_SPIN_POINTS = 20
 ELLIPSE_WARNING_RATIO = 1.12
 
@@ -173,11 +181,13 @@ class CalibrationState(Enum):
 
 @dataclass(frozen=True)
 class RobotPose:
-    """Robot center pose in field coordinates with bottom-left cm origin."""
+    """Robot origin and pickup tube pose in field coordinates with bottom-left cm origin."""
 
     x_cm: float
     y_cm: float
     heading_rad: float
+    tube_x_cm: float
+    tube_y_cm: float
 
 
 @dataclass(frozen=True)
@@ -1652,8 +1662,16 @@ def estimate_robot_pose(
         sum(math.cos(angle) for angle in field_headings),
     )
     heading_rad = normalize_angle(heading_rad + float(params.get("heading_tuning_rad", 0.0)))
+    tube_x_cm = x_cm + math.cos(heading_rad) * ROBOT_TUBE_OFFSET_CM
+    tube_y_cm = y_cm + math.sin(heading_rad) * ROBOT_TUBE_OFFSET_CM
     return (
-        RobotPose(x_cm=x_cm, y_cm=y_cm, heading_rad=heading_rad),
+        RobotPose(
+            x_cm=x_cm,
+            y_cm=y_cm,
+            heading_rad=heading_rad,
+            tube_x_cm=tube_x_cm,
+            tube_y_cm=tube_y_cm,
+        ),
         (float(origin[0]), float(origin[1])),
         observations,
         parallax_config,
@@ -1981,22 +1999,49 @@ def draw_schematic(
         cv2.circle(schematic, selected_start, 8, (0, 255, 255), 2, cv2.LINE_AA)
 
     if app_state.robot_pose is not None:
-        robot_center = field_metric_cm_to_schematic((app_state.robot_pose.x_cm, app_state.robot_pose.y_cm))
-        heading_len = 34
-        heading_end = (
-            int(round(robot_center[0] + math.cos(app_state.robot_pose.heading_rad) * heading_len)),
-            int(round(robot_center[1] - math.sin(app_state.robot_pose.heading_rad) * heading_len)),
+        pose = app_state.robot_pose
+        robot_center = field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
+        forward = (math.cos(pose.heading_rad), math.sin(pose.heading_rad))
+        right = (math.sin(pose.heading_rad), -math.cos(pose.heading_rad))
+        front_center = (
+            pose.x_cm + forward[0] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
+            pose.y_cm + forward[1] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
         )
-        cv2.circle(schematic, robot_center, 13, (255, 90, 30), -1, cv2.LINE_AA)
-        cv2.circle(schematic, robot_center, 13, (255, 255, 255), 2, cv2.LINE_AA)
+        rear_center = (
+            pose.x_cm - forward[0] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
+            pose.y_cm - forward[1] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
+        )
+        half_width_cm = ROBOT_FOOTPRINT_WIDTH_CM * 0.5
+        footprint_cm = [
+            (front_center[0] + right[0] * half_width_cm, front_center[1] + right[1] * half_width_cm),
+            (front_center[0] - right[0] * half_width_cm, front_center[1] - right[1] * half_width_cm),
+            (rear_center[0] - right[0] * half_width_cm, rear_center[1] - right[1] * half_width_cm),
+            (rear_center[0] + right[0] * half_width_cm, rear_center[1] + right[1] * half_width_cm),
+        ]
+        footprint_px = np.array(
+            [field_metric_cm_to_schematic(point) for point in footprint_cm],
+            dtype=np.int32,
+        ).reshape(-1, 1, 2)
+        tube_center = field_metric_cm_to_schematic((pose.tube_x_cm, pose.tube_y_cm))
+        heading_end = field_metric_cm_to_schematic(
+            (
+                pose.x_cm + forward[0] * ROBOT_TUBE_OFFSET_CM,
+                pose.y_cm + forward[1] * ROBOT_TUBE_OFFSET_CM,
+            )
+        )
+        cv2.polylines(schematic, [footprint_px], True, (255, 90, 30), 2, cv2.LINE_AA)
+        cv2.circle(schematic, robot_center, 7, (255, 90, 30), -1, cv2.LINE_AA)
+        cv2.circle(schematic, robot_center, 11, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.arrowedLine(schematic, robot_center, heading_end, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.28)
-        robot_label = f"Robot X:{app_state.robot_pose.x_cm:.1f} Y:{app_state.robot_pose.y_cm:.1f}"
+        cv2.circle(schematic, tube_center, 10, (0, 255, 255), 3, cv2.LINE_AA)
+        cv2.circle(schematic, tube_center, 3, (0, 255, 255), -1, cv2.LINE_AA)
+        robot_label = f"Robot X:{pose.x_cm:.1f} Y:{pose.y_cm:.1f} Tube:{pose.tube_x_cm:.1f},{pose.tube_y_cm:.1f}"
         cv2.putText(
             schematic,
             robot_label,
-            (max(10, min(robot_center[0] + 16, SCHEMATIC_WIDTH_PX - 230)), max(25, robot_center[1] - 16)),
+            (max(10, min(robot_center[0] + 16, SCHEMATIC_WIDTH_PX - 360)), max(25, robot_center[1] - 16)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.5,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
@@ -2119,23 +2164,41 @@ def draw_robot_marker_debug(
     source_height, source_width = frame.shape[:2]
     px_per_cm_x = (source_width - 1) / FIELD_WIDTH_CM
     px_per_cm_y = (source_height - 1) / FIELD_HEIGHT_CM
-    half_len = ROBOT_FOOTPRINT_LENGTH_CM * px_per_cm_y * 0.5
-    half_width = ROBOT_FOOTPRINT_WIDTH_CM * px_per_cm_x * 0.5
-    image_heading = normalize_angle(math.atan2(math.cos(robot_pose.heading_rad), -math.sin(robot_pose.heading_rad)))
-    forward = np.array([math.sin(image_heading), math.cos(image_heading)], dtype=np.float32)
-    right = np.array([math.cos(image_heading), -math.sin(image_heading)], dtype=np.float32)
+
+    def field_delta_to_px(dx_cm: float, dy_cm: float) -> np.ndarray:
+        return np.array([dx_cm * px_per_cm_x, -dy_cm * px_per_cm_y], dtype=np.float32)
+
+    forward = (math.cos(robot_pose.heading_rad), math.sin(robot_pose.heading_rad))
+    right = (math.sin(robot_pose.heading_rad), -math.cos(robot_pose.heading_rad))
+    half_width_cm = ROBOT_FOOTPRINT_WIDTH_CM * 0.5
+    front_center = origin + field_delta_to_px(
+        forward[0] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
+        forward[1] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
+    )
+    rear_center = origin + field_delta_to_px(
+        -forward[0] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
+        -forward[1] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
+    )
+    right_px = field_delta_to_px(right[0] * half_width_cm, right[1] * half_width_cm)
     footprint = np.array(
         [
-            origin + forward * half_len + right * half_width,
-            origin + forward * half_len - right * half_width,
-            origin - forward * half_len - right * half_width,
-            origin - forward * half_len + right * half_width,
+            front_center + right_px,
+            front_center - right_px,
+            rear_center - right_px,
+            rear_center + right_px,
         ],
         dtype=np.int32,
     ).reshape(-1, 1, 2)
     cv2.polylines(frame, [footprint], True, (255, 90, 30), 2, cv2.LINE_AA)
-    heading_end = tuple(int(round(v)) for v in (origin + forward * (half_len + 20.0)))
+    tube_px = origin + field_delta_to_px(
+        forward[0] * ROBOT_TUBE_OFFSET_CM,
+        forward[1] * ROBOT_TUBE_OFFSET_CM,
+    )
+    tube_i = tuple(int(round(v)) for v in tube_px)
+    heading_end = tube_i
     cv2.arrowedLine(frame, origin_i, heading_end, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.25)
+    cv2.circle(frame, tube_i, 10, (0, 255, 255), 3, cv2.LINE_AA)
+    cv2.circle(frame, tube_i, 3, (0, 255, 255), -1, cv2.LINE_AA)
 
 
 def annotate_camera_frame(

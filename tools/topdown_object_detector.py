@@ -89,6 +89,11 @@ TRACKBAR_NAMES = {
     "cam_center_x": "Cam C X",
     "cam_center_y": "Cam C Y",
     "heading_tuning": "Heading Tuning",
+    "robot_width_cmx10": "Robot W x10",
+    "robot_front_cmx10": "Body F x10",
+    "robot_rear_cmx10": "Body R x10",
+    "tube_forward_cmx10": "Tube F x10",
+    "tube_right_cmx10": "Tube R+50 x10",
 }
 TRACKBAR_WINDOWS = {
     "red1_h_min": CONTROL_COLOR_WINDOW_NAME,
@@ -120,6 +125,11 @@ TRACKBAR_WINDOWS = {
     "cam_center_x": CONTROL_GEOMETRY_WINDOW_NAME,
     "cam_center_y": CONTROL_GEOMETRY_WINDOW_NAME,
     "heading_tuning": CONTROL_GEOMETRY_WINDOW_NAME,
+    "robot_width_cmx10": CONTROL_GEOMETRY_WINDOW_NAME,
+    "robot_front_cmx10": CONTROL_GEOMETRY_WINDOW_NAME,
+    "robot_rear_cmx10": CONTROL_GEOMETRY_WINDOW_NAME,
+    "tube_forward_cmx10": CONTROL_GEOMETRY_WINDOW_NAME,
+    "tube_right_cmx10": CONTROL_GEOMETRY_WINDOW_NAME,
 }
 
 # Still-image mode is the safest default for deterministic tuning.
@@ -156,8 +166,17 @@ ROBOT_FRONT_AXLE_FROM_ORIGIN_CM = ROBOT_AXLE_DISTANCE_CM * 0.5
 ROBOT_FRONT_EDGE_FROM_ORIGIN_CM = ROBOT_FRONT_AXLE_FROM_ORIGIN_CM + ROBOT_FRONT_EDGE_FROM_FRONT_AXLE_CM
 ROBOT_REAR_AXLE_FROM_ORIGIN_CM = ROBOT_AXLE_DISTANCE_CM * 0.5
 ROBOT_TUBE_OFFSET_CM = ROBOT_FRONT_AXLE_FROM_ORIGIN_CM + ROBOT_TUBE_FROM_FRONT_AXLE_CM
-ROBOT_FOOTPRINT_LENGTH_CM = ROBOT_FRONT_EDGE_FROM_ORIGIN_CM + ROBOT_REAR_AXLE_FROM_ORIGIN_CM
+ROBOT_FOOTPRINT_FRONT_FROM_ORIGIN_CM = ROBOT_FRONT_AXLE_FROM_ORIGIN_CM
+ROBOT_FOOTPRINT_REAR_FROM_ORIGIN_CM = ROBOT_REAR_AXLE_FROM_ORIGIN_CM
+ROBOT_FOOTPRINT_LENGTH_CM = ROBOT_FOOTPRINT_FRONT_FROM_ORIGIN_CM + ROBOT_FOOTPRINT_REAR_FROM_ORIGIN_CM
 ROBOT_FOOTPRINT_WIDTH_CM = ROBOT_TRACK_WIDTH_CM
+ROBOT_FORWARD_HEADING_OFFSET_RAD = math.pi
+ROBOT_TUBE_RIGHT_OFFSET_CM = 0.0
+ROBOT_TUNED_FOOTPRINT_WIDTH_CM = 20.0
+ROBOT_TUNED_FOOTPRINT_FRONT_FROM_ORIGIN_CM = 8.3
+ROBOT_TUNED_FOOTPRINT_REAR_FROM_ORIGIN_CM = 10.1
+ROBOT_TUNED_TUBE_OFFSET_CM = 17.1
+ROBOT_TUNED_TUBE_RIGHT_OFFSET_CM = 0.0
 MIN_ROBOT_SPIN_POINTS = 20
 ELLIPSE_WARNING_RATIO = 1.12
 
@@ -188,6 +207,17 @@ class RobotPose:
     heading_rad: float
     tube_x_cm: float
     tube_y_cm: float
+
+
+@dataclass(frozen=True)
+class RobotGeometry:
+    """Live-tunable robot drawing and pickup geometry in centimeters."""
+
+    width_cm: float
+    front_cm: float
+    rear_cm: float
+    tube_forward_cm: float
+    tube_right_cm: float
 
 
 @dataclass(frozen=True)
@@ -521,6 +551,18 @@ class TopdownSelectionState:
 def noop(_value: int) -> None:
     """Trackbar callback placeholder."""
     return None
+
+
+def robot_geometry_from_params(params: dict[str, object] | None) -> RobotGeometry:
+    """Read live robot geometry, falling back to the measured defaults."""
+    params = params or {}
+    return RobotGeometry(
+        width_cm=float(params.get("robot_width_cm", ROBOT_TUNED_FOOTPRINT_WIDTH_CM)),
+        front_cm=float(params.get("robot_front_cm", ROBOT_TUNED_FOOTPRINT_FRONT_FROM_ORIGIN_CM)),
+        rear_cm=float(params.get("robot_rear_cm", ROBOT_TUNED_FOOTPRINT_REAR_FROM_ORIGIN_CM)),
+        tube_forward_cm=float(params.get("tube_forward_cm", ROBOT_TUNED_TUBE_OFFSET_CM)),
+        tube_right_cm=float(params.get("tube_right_cm", ROBOT_TUNED_TUBE_RIGHT_OFFSET_CM)),
+    )
 
 
 def order_points(points: Any) -> np.ndarray:
@@ -1103,6 +1145,11 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         "cam_center_x": frame_width // 2,
         "cam_center_y": frame_height // 2,
         "heading_tuning": 180,
+        "robot_width_cmx10": int(round(ROBOT_TUNED_FOOTPRINT_WIDTH_CM * 10.0)),
+        "robot_front_cmx10": int(round(ROBOT_TUNED_FOOTPRINT_FRONT_FROM_ORIGIN_CM * 10.0)),
+        "robot_rear_cmx10": int(round(ROBOT_TUNED_FOOTPRINT_REAR_FROM_ORIGIN_CM * 10.0)),
+        "tube_forward_cmx10": int(round(ROBOT_TUNED_TUBE_OFFSET_CM * 10.0)),
+        "tube_right_cmx10": int(round((ROBOT_TUNED_TUBE_RIGHT_OFFSET_CM + 50.0) * 10.0)),
     }
     for key, value in defaults.items():
         name = TRACKBAR_NAMES[key]
@@ -1124,6 +1171,15 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
             max_value = max(1, frame_height)
         if key == "heading_tuning":
             max_value = 360
+        if key in {
+            "robot_width_cmx10",
+            "robot_front_cmx10",
+            "robot_rear_cmx10",
+            "tube_forward_cmx10",
+        }:
+            max_value = 500
+        if key == "tube_right_cmx10":
+            max_value = 1000
         cv2.createTrackbar(name, window_name, value, max_value, noop)
 
 
@@ -1221,6 +1277,11 @@ def read_hsv_ranges() -> dict[str, object]:
         "camera_center_x": float(get_trackbar_value("cam_center_x")),
         "camera_center_y": float(get_trackbar_value("cam_center_y")),
         "heading_tuning_rad": math.radians(float(get_trackbar_value("heading_tuning")) - 180.0),
+        "robot_width_cm": float(get_trackbar_value("robot_width_cmx10")) / 10.0,
+        "robot_front_cm": float(get_trackbar_value("robot_front_cmx10")) / 10.0,
+        "robot_rear_cm": float(get_trackbar_value("robot_rear_cmx10")) / 10.0,
+        "tube_forward_cm": float(get_trackbar_value("tube_forward_cmx10")) / 10.0,
+        "tube_right_cm": float(get_trackbar_value("tube_right_cmx10")) / 10.0 - 50.0,
     }
 
 
@@ -1661,9 +1722,16 @@ def estimate_robot_pose(
         sum(math.sin(angle) for angle in field_headings),
         sum(math.cos(angle) for angle in field_headings),
     )
-    heading_rad = normalize_angle(heading_rad + float(params.get("heading_tuning_rad", 0.0)))
-    tube_x_cm = x_cm + math.cos(heading_rad) * ROBOT_TUBE_OFFSET_CM
-    tube_y_cm = y_cm + math.sin(heading_rad) * ROBOT_TUBE_OFFSET_CM
+    heading_rad = normalize_angle(
+        heading_rad
+        + ROBOT_FORWARD_HEADING_OFFSET_RAD
+        + float(params.get("heading_tuning_rad", 0.0))
+    )
+    geometry = robot_geometry_from_params(params)
+    forward = (math.cos(heading_rad), math.sin(heading_rad))
+    right = (math.sin(heading_rad), -math.cos(heading_rad))
+    tube_x_cm = x_cm + forward[0] * geometry.tube_forward_cm + right[0] * geometry.tube_right_cm
+    tube_y_cm = y_cm + forward[1] * geometry.tube_forward_cm + right[1] * geometry.tube_right_cm
     return (
         RobotPose(
             x_cm=x_cm,
@@ -1916,6 +1984,7 @@ def draw_schematic(
     smoothed_ball_coordinates: list[SmoothedBallCoordinate],
     camera_center_pixels: tuple[float, float],
     app_state: AppState,
+    params: dict[str, object] | None = None,
 ) -> np.ndarray:
     """Draw a clean synthetic field view containing only the detected objects."""
     source_height, source_width = frame_shape[:2]
@@ -2000,18 +2069,19 @@ def draw_schematic(
 
     if app_state.robot_pose is not None:
         pose = app_state.robot_pose
+        geometry = robot_geometry_from_params(params)
         robot_center = field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
         forward = (math.cos(pose.heading_rad), math.sin(pose.heading_rad))
         right = (math.sin(pose.heading_rad), -math.cos(pose.heading_rad))
         front_center = (
-            pose.x_cm + forward[0] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
-            pose.y_cm + forward[1] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
+            pose.x_cm + forward[0] * geometry.front_cm,
+            pose.y_cm + forward[1] * geometry.front_cm,
         )
         rear_center = (
-            pose.x_cm - forward[0] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
-            pose.y_cm - forward[1] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
+            pose.x_cm - forward[0] * geometry.rear_cm,
+            pose.y_cm - forward[1] * geometry.rear_cm,
         )
-        half_width_cm = ROBOT_FOOTPRINT_WIDTH_CM * 0.5
+        half_width_cm = geometry.width_cm * 0.5
         footprint_cm = [
             (front_center[0] + right[0] * half_width_cm, front_center[1] + right[1] * half_width_cm),
             (front_center[0] - right[0] * half_width_cm, front_center[1] - right[1] * half_width_cm),
@@ -2023,16 +2093,10 @@ def draw_schematic(
             dtype=np.int32,
         ).reshape(-1, 1, 2)
         tube_center = field_metric_cm_to_schematic((pose.tube_x_cm, pose.tube_y_cm))
-        heading_end = field_metric_cm_to_schematic(
-            (
-                pose.x_cm + forward[0] * ROBOT_TUBE_OFFSET_CM,
-                pose.y_cm + forward[1] * ROBOT_TUBE_OFFSET_CM,
-            )
-        )
         cv2.polylines(schematic, [footprint_px], True, (255, 90, 30), 2, cv2.LINE_AA)
         cv2.circle(schematic, robot_center, 7, (255, 90, 30), -1, cv2.LINE_AA)
         cv2.circle(schematic, robot_center, 11, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.arrowedLine(schematic, robot_center, heading_end, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.28)
+        cv2.arrowedLine(schematic, robot_center, tube_center, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.28)
         cv2.circle(schematic, tube_center, 10, (0, 255, 255), 3, cv2.LINE_AA)
         cv2.circle(schematic, tube_center, 3, (0, 255, 255), -1, cv2.LINE_AA)
         robot_label = f"Robot X:{pose.x_cm:.1f} Y:{pose.y_cm:.1f} Tube:{pose.tube_x_cm:.1f},{pose.tube_y_cm:.1f}"
@@ -2100,6 +2164,7 @@ def draw_robot_marker_debug(
     calibration: dict[str, Any] | None,
     robot_origin_px: tuple[float, float] | None,
     robot_pose: RobotPose | None,
+    params: dict[str, object] | None = None,
     runtime: RobotCalibrationRuntime | None = None,
 ) -> None:
     """Draw robot marker, parallax projection, offset line, and footprint on top-down view."""
@@ -2170,14 +2235,15 @@ def draw_robot_marker_debug(
 
     forward = (math.cos(robot_pose.heading_rad), math.sin(robot_pose.heading_rad))
     right = (math.sin(robot_pose.heading_rad), -math.cos(robot_pose.heading_rad))
-    half_width_cm = ROBOT_FOOTPRINT_WIDTH_CM * 0.5
+    geometry = robot_geometry_from_params(params)
+    half_width_cm = geometry.width_cm * 0.5
     front_center = origin + field_delta_to_px(
-        forward[0] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
-        forward[1] * ROBOT_FRONT_EDGE_FROM_ORIGIN_CM,
+        forward[0] * geometry.front_cm,
+        forward[1] * geometry.front_cm,
     )
     rear_center = origin + field_delta_to_px(
-        -forward[0] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
-        -forward[1] * ROBOT_REAR_AXLE_FROM_ORIGIN_CM,
+        -forward[0] * geometry.rear_cm,
+        -forward[1] * geometry.rear_cm,
     )
     right_px = field_delta_to_px(right[0] * half_width_cm, right[1] * half_width_cm)
     footprint = np.array(
@@ -2191,8 +2257,8 @@ def draw_robot_marker_debug(
     ).reshape(-1, 1, 2)
     cv2.polylines(frame, [footprint], True, (255, 90, 30), 2, cv2.LINE_AA)
     tube_px = origin + field_delta_to_px(
-        forward[0] * ROBOT_TUBE_OFFSET_CM,
-        forward[1] * ROBOT_TUBE_OFFSET_CM,
+        forward[0] * geometry.tube_forward_cm + right[0] * geometry.tube_right_cm,
+        forward[1] * geometry.tube_forward_cm + right[1] * geometry.tube_right_cm,
     )
     tube_i = tuple(int(round(v)) for v in tube_px)
     heading_end = tube_i
@@ -2501,6 +2567,7 @@ def draw_robot_calibration_status(
     frame: np.ndarray,
     runtime: RobotCalibrationRuntime,
     robot_pose: RobotPose | None,
+    params: dict[str, object] | None = None,
 ) -> None:
     """Draw compact robot calibration and live pose status on the combined detector view."""
     counts = ", ".join(
@@ -2518,6 +2585,11 @@ def draw_robot_calibration_status(
         action = "c: calibrate spin | w: save heading"
 
     lines = [mode, action, f"Spin points: {counts}"]
+    geometry = robot_geometry_from_params(params)
+    lines.append(
+        f"Geom W:{geometry.width_cm:.1f} F/R:{geometry.front_cm:.1f}/{geometry.rear_cm:.1f} "
+        f"Tube:{geometry.tube_forward_cm:.1f},{geometry.tube_right_cm:.1f}"
+    )
     if robot_pose is not None:
         lines.append(
             f"Robot: X={robot_pose.x_cm:.1f}cm Y={robot_pose.y_cm:.1f}cm H={math.degrees(robot_pose.heading_rad):.1f}deg"
@@ -2671,15 +2743,17 @@ def process_frame(
             robot_runtime.calibration,
             app_state.robot_topdown_px,
             app_state.robot_pose,
+            params,
             robot_runtime,
         )
-        draw_robot_calibration_status(annotated, robot_runtime, app_state.robot_pose)
+        draw_robot_calibration_status(annotated, robot_runtime, app_state.robot_pose, params)
     schematic = draw_schematic(
         frame_shape=frame_bgr.shape,
         red_zones=red_zones,
         smoothed_ball_coordinates=smoothed_ball_coordinates,
         camera_center_pixels=camera_center_pixels,
         app_state=app_state,
+        params=params,
     )
     masks = build_mask_preview(red_mask, ball_masks["white"], ball_masks["orange"])
     combined = np.hstack(resize_to_match_height(annotated, schematic))
@@ -2841,6 +2915,7 @@ def run_raw_stream_mode(
                     float(params["camera_center_y"]),
                 ),
                 app_state=app_state,
+                params=params,
             )
             combined = np.hstack(resize_to_match_height(topdown_frame, schematic))
             cv2.putText(

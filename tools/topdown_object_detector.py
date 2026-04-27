@@ -130,6 +130,13 @@ LOUPE_CROP_SIZE = 40
 LOUPE_SCALE = 5
 LOUPE_PADDING = 12
 POINT_RADIUS = 6
+LK_FB_MAX_ERROR_PX = 2.0
+LK_EMA_ALPHA = 0.2
+LK_PARAMS = {
+    "winSize": (31, 31),
+    "maxLevel": 3,
+    "criteria": (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+}
 REQUIRED_ARUCO_IDS = (0, 1, 2, 3)
 WALL_THICKNESS_CM = 1.6
 MARKER_OUTER_OFFSET_CM = 8.0
@@ -139,7 +146,7 @@ SCHEMATIC_WIDTH_PX = 900
 SCHEMATIC_HEIGHT_PX = 600
 SCHEMATIC_WINDOW_NAME = "2D Schematic"
 ROBOT_RADIUS_CM = 15
-ROBOT_MARKER_IDS = (4,)
+ROBOT_MARKER_IDS = (4,5)
 ROBOT_MARKER_HEIGHT_CM = 9.0
 ROBOT_FOOTPRINT_LENGTH_CM = 30.0
 ROBOT_FOOTPRINT_WIDTH_CM = 24.0
@@ -462,11 +469,18 @@ class TopdownSelectionState:
     aruco_detector: object | None = None
     latest_aruco_centers: dict[int, np.ndarray] = field(default_factory=dict)
     aruco_available: bool = False
+    latest_gray_frame: np.ndarray | None = None
+    anchor_gray_frame: np.ndarray | None = None
+    anchor_points: np.ndarray | None = None
+    current_tracked_points: np.ndarray | None = None
+    tracked_point_valid: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=bool))
+    tracked_point_errors: np.ndarray = field(default_factory=lambda: np.full(4, np.inf, dtype=np.float32))
 
     def clear_points(self) -> None:
         self.points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.reset_manual_tracking()
         if self.calibration_state in (CalibrationState.CALIBRATING_MANUAL, CalibrationState.CALIBRATED_MANUAL):
             self.calibration_state = CalibrationState.CALIBRATING_MANUAL
         else:
@@ -476,13 +490,22 @@ class TopdownSelectionState:
         self.points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.reset_manual_tracking()
         self.calibration_state = CalibrationState.CALIBRATING_MANUAL
 
     def start_auto_calibration(self) -> None:
         self.points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.reset_manual_tracking()
         self.calibration_state = CalibrationState.NEEDS_CALIBRATION
+
+    def reset_manual_tracking(self) -> None:
+        self.anchor_gray_frame = None
+        self.anchor_points = None
+        self.current_tracked_points = None
+        self.tracked_point_valid = np.zeros(4, dtype=bool)
+        self.tracked_point_errors = np.full(4, np.inf, dtype=np.float32)
 
 
 def noop(_value: int) -> None:
@@ -490,9 +513,9 @@ def noop(_value: int) -> None:
     return None
 
 
-def order_points(points: list[tuple[int, int]]) -> np.ndarray:
+def order_points(points: Any) -> np.ndarray:
     """Order 4 selected corners as top-left, top-right, bottom-right, bottom-left."""
-    corners = np.array(points, dtype=np.float32)
+    corners = np.array(points, dtype=np.float32).reshape(4, 2)
     sums = corners.sum(axis=1)
     diffs = np.diff(corners, axis=1).reshape(4)
 
@@ -517,9 +540,81 @@ def destination_corners(size: tuple[int, int]) -> np.ndarray:
     )
 
 
-def build_manual_topdown_transform(points: list[tuple[int, int]]) -> np.ndarray:
+def build_manual_topdown_transform(points: Any) -> np.ndarray:
     """Compute the manual perspective transform from the 4 selected corners."""
     return cv2.getPerspectiveTransform(order_points(points), destination_corners(TOPDOWN_WARP_SIZE))
+
+
+def initialize_manual_anchor_tracking(state: TopdownSelectionState) -> bool:
+    """Anchor the manual corner tracker to the current undistorted grayscale frame."""
+    if len(state.points) != 4 or state.latest_gray_frame is None:
+        return False
+
+    anchor_points = np.array(state.points, dtype=np.float32).reshape(4, 2)
+    state.anchor_gray_frame = state.latest_gray_frame.copy()
+    state.anchor_points = anchor_points
+    state.current_tracked_points = anchor_points.copy()
+    state.tracked_point_valid = np.ones(4, dtype=bool)
+    state.tracked_point_errors = np.zeros(4, dtype=np.float32)
+    state.transform_matrix = build_manual_topdown_transform(state.current_tracked_points)
+    state.calibration_state = CalibrationState.CALIBRATED_MANUAL
+    return True
+
+
+def update_manual_anchor_tracking(state: TopdownSelectionState, live_gray: np.ndarray) -> None:
+    """Track manual corners from the immutable anchor frame with FB validation."""
+    if (
+        state.calibration_state != CalibrationState.CALIBRATED_MANUAL
+        or state.anchor_gray_frame is None
+        or state.anchor_points is None
+        or state.current_tracked_points is None
+    ):
+        return
+
+    forward_pts, forward_status, _forward_err = cv2.calcOpticalFlowPyrLK(
+        state.anchor_gray_frame,
+        live_gray,
+        state.anchor_points.reshape(-1, 1, 2),
+        None,
+        **LK_PARAMS,
+    )
+    if forward_pts is None or forward_status is None:
+        state.tracked_point_valid = np.zeros(4, dtype=bool)
+        state.tracked_point_errors = np.full(4, np.inf, dtype=np.float32)
+        return
+
+    recovered_pts, backward_status, _backward_err = cv2.calcOpticalFlowPyrLK(
+        live_gray,
+        state.anchor_gray_frame,
+        forward_pts,
+        None,
+        **LK_PARAMS,
+    )
+    if recovered_pts is None or backward_status is None:
+        state.tracked_point_valid = np.zeros(4, dtype=bool)
+        state.tracked_point_errors = np.full(4, np.inf, dtype=np.float32)
+        return
+
+    recovered_flat = recovered_pts.reshape(4, 2)
+    forward_flat = forward_pts.reshape(4, 2)
+    anchor_flat = state.anchor_points.reshape(4, 2)
+    fb_errors = np.linalg.norm(anchor_flat - recovered_flat, axis=1).astype(np.float32)
+    valid = (
+        (forward_status.reshape(4) == 1)
+        & (backward_status.reshape(4) == 1)
+        & (fb_errors < LK_FB_MAX_ERROR_PX)
+        & np.isfinite(fb_errors)
+        & np.all(np.isfinite(forward_flat), axis=1)
+    )
+
+    if np.any(valid):
+        current = state.current_tracked_points.reshape(4, 2)
+        current[valid] = (1.0 - LK_EMA_ALPHA) * current[valid] + LK_EMA_ALPHA * forward_flat[valid]
+        state.current_tracked_points = current.astype(np.float32)
+        state.transform_matrix = build_manual_topdown_transform(state.current_tracked_points)
+
+    state.tracked_point_valid = valid
+    state.tracked_point_errors = fb_errors
 
 
 def build_aruco_detector() -> tuple[object | None, object | None]:
@@ -773,13 +868,22 @@ def draw_manual_selection_overlay(frame: np.ndarray, state: TopdownSelectionStat
     """Render the manual top-down selection view with points, lines, and status."""
     overlay = draw_loupe(frame, state)
 
-    for index, point in enumerate(state.points, start=1):
-        cv2.circle(overlay, point, POINT_RADIUS, (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.circle(overlay, point, POINT_RADIUS + 4, (255, 255, 255), 1, cv2.LINE_AA)
+    display_points = state.current_tracked_points if state.current_tracked_points is not None else state.points
+    display_points_array = np.array(display_points, dtype=np.float32).reshape(-1, 2)
+    tracking_active = state.current_tracked_points is not None and len(display_points_array) == 4
+    for index, point in enumerate(display_points_array, start=1):
+        point_xy = (int(round(float(point[0]))), int(round(float(point[1]))))
+        if tracking_active:
+            is_valid = bool(state.tracked_point_valid[index - 1])
+            color = (0, 255, 0) if is_valid else (0, 0, 255)
+        else:
+            color = (0, 0, 255)
+        cv2.circle(overlay, point_xy, POINT_RADIUS, color, -1, cv2.LINE_AA)
+        cv2.circle(overlay, point_xy, POINT_RADIUS + 4, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(
             overlay,
             str(index),
-            (point[0] + 10, point[1] - 10),
+            (point_xy[0] + 10, point_xy[1] - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (255, 255, 255),
@@ -787,16 +891,20 @@ def draw_manual_selection_overlay(frame: np.ndarray, state: TopdownSelectionStat
             cv2.LINE_AA,
         )
 
-    if len(state.points) >= 2:
-        polyline = np.array(state.points, dtype=np.int32).reshape(-1, 1, 2)
+    if len(display_points_array) >= 2:
+        polyline = np.round(display_points_array).astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(overlay, [polyline], False, (0, 255, 0), 2, cv2.LINE_AA)
 
-    if len(state.points) == 4:
-        ordered = order_points(state.points).astype(np.int32).reshape(-1, 1, 2)
+    if len(display_points_array) == 4:
+        ordered = order_points(display_points_array).astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(overlay, [ordered], True, (255, 200, 0), 2, cv2.LINE_AA)
 
+    tracking_text = ""
+    if tracking_active:
+        valid_count = int(np.count_nonzero(state.tracked_point_valid))
+        tracking_text = f" | LK valid: {valid_count}/4"
     help_lines = [
-        f"Points: {len(state.points)}/4",
+        f"Points: {len(state.points)}/4{tracking_text}",
         f"Mode: {state.calibration_state.value}",
         "Left click: add point",
         "Right click or r: reset",
@@ -869,8 +977,9 @@ def on_manual_topdown_mouse(
 
     param.points.append(param.cursor)
     if len(param.points) == 4:
-        param.transform_matrix = build_manual_topdown_transform(param.points)
-        param.calibration_state = CalibrationState.CALIBRATED_MANUAL
+        if not initialize_manual_anchor_tracking(param):
+            param.transform_matrix = build_manual_topdown_transform(param.points)
+            param.calibration_state = CalibrationState.CALIBRATED_MANUAL
 
 
 def parse_args() -> argparse.Namespace:
@@ -2379,6 +2488,8 @@ def prepare_live_topdown_frame(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Undistort the live frame and apply automatic or manual top-down calibration."""
     undistorted = undistort_with_calibration(frame_bgr, str(calibration_file), balance=balance)
+    live_gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
+    selection_state.latest_gray_frame = live_gray
     selection_state.frame_size = (int(undistorted.shape[1]), int(undistorted.shape[0]))
     if selection_state.cursor == (0, 0):
         selection_state.cursor = (
@@ -2391,6 +2502,9 @@ def prepare_live_topdown_frame(
         CalibrationState.CALIBRATING_MANUAL,
         CalibrationState.CALIBRATED_MANUAL,
     )
+    if manual_mode_active:
+        update_manual_anchor_tracking(selection_state, live_gray)
+
     if selection_state.aruco_available and not manual_mode_active:
         corners, ids = detect_aruco_markers(
             undistorted,

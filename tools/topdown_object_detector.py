@@ -3,7 +3,7 @@
 
 This tool supports three input modes:
 1. Still image input for repeatable offline tuning.
-2. Live camera input for on-table tuning with HSV trackbars.
+2. Live camera input for on-table tuning with red-zone HSV and geometry trackbars.
 3. Recorded video input for replaying real camera runs through the live pipeline.
 
 The output is shown as:
@@ -11,10 +11,8 @@ The output is shown as:
 - Right: synthetic 2D schematic of the measured field
 
 The script intentionally keeps the detection pipeline simple and deterministic:
-- HSV thresholding
-- Morphology cleanup
-- Contour extraction
-- Circularity filtering for ball-like objects
+- HSV thresholding for red zones
+- YOLOv8 inference for ball-like objects
 """
 
 from __future__ import annotations
@@ -33,6 +31,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+from ultralytics import YOLO
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -68,22 +67,8 @@ TRACKBAR_NAMES = {
     "red_s_max": "R S max",
     "red_v_min": "R V min",
     "red_v_max": "R V max",
-    "white_h_min": "W H min",
-    "white_h_max": "W H max",
-    "white_s_min": "W S min",
-    "white_s_max": "W S max",
-    "white_v_min": "W V min",
-    "white_v_max": "W V max",
-    "orange_h_min": "O H min",
-    "orange_h_max": "O H max",
-    "orange_s_min": "O S min",
-    "orange_s_max": "O S max",
-    "orange_v_min": "O V min",
-    "orange_v_max": "O V max",
     "red_min_area": "R min area",
-    "ball_min_area": "B min area",
-    "ball_max_area": "B max area",
-    "ball_min_circ": "B min circ",
+    "yolo_conf_pct": "YOLO conf %",
     "cam_height_cm": "Cam h cm",
     "calib_z_cm": "Border h cm",
     "cam_center_x": "Cam C X",
@@ -104,22 +89,8 @@ TRACKBAR_WINDOWS = {
     "red_s_max": CONTROL_COLOR_WINDOW_NAME,
     "red_v_min": CONTROL_COLOR_WINDOW_NAME,
     "red_v_max": CONTROL_COLOR_WINDOW_NAME,
-    "white_h_min": CONTROL_COLOR_WINDOW_NAME,
-    "white_h_max": CONTROL_COLOR_WINDOW_NAME,
-    "white_s_min": CONTROL_COLOR_WINDOW_NAME,
-    "white_s_max": CONTROL_COLOR_WINDOW_NAME,
-    "white_v_min": CONTROL_COLOR_WINDOW_NAME,
-    "white_v_max": CONTROL_COLOR_WINDOW_NAME,
-    "orange_h_min": CONTROL_FILTER_WINDOW_NAME,
-    "orange_h_max": CONTROL_FILTER_WINDOW_NAME,
-    "orange_s_min": CONTROL_FILTER_WINDOW_NAME,
-    "orange_s_max": CONTROL_FILTER_WINDOW_NAME,
-    "orange_v_min": CONTROL_FILTER_WINDOW_NAME,
-    "orange_v_max": CONTROL_FILTER_WINDOW_NAME,
     "red_min_area": CONTROL_FILTER_WINDOW_NAME,
-    "ball_min_area": CONTROL_FILTER_WINDOW_NAME,
-    "ball_max_area": CONTROL_FILTER_WINDOW_NAME,
-    "ball_min_circ": CONTROL_FILTER_WINDOW_NAME,
+    "yolo_conf_pct": CONTROL_FILTER_WINDOW_NAME,
     "cam_height_cm": CONTROL_GEOMETRY_WINDOW_NAME,
     "calib_z_cm": CONTROL_GEOMETRY_WINDOW_NAME,
     "cam_center_x": CONTROL_GEOMETRY_WINDOW_NAME,
@@ -179,6 +150,10 @@ ROBOT_TUNED_TUBE_OFFSET_CM = 17.1
 ROBOT_TUNED_TUBE_RIGHT_OFFSET_CM = 0.0
 MIN_ROBOT_SPIN_POINTS = 20
 ELLIPSE_WARNING_RATIO = 1.12
+YOLO_MODEL_PATH = Path("best.pt")
+if not YOLO_MODEL_PATH.exists():
+    YOLO_MODEL_PATH = Path(__file__).resolve().with_name("best.pt")
+YOLO_MODEL = YOLO(str(YOLO_MODEL_PATH))
 
 
 class RobotCalibrationPhase(Enum):
@@ -1102,7 +1077,7 @@ def load_calibration_image_size(calibration_file: Path) -> tuple[int, int]:
 
 
 def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
-    """Create trackbars for the three color classes.
+    """Create trackbars for red zones, camera geometry, and robot geometry.
 
     Red uses two hue intervals because red wraps across the HSV hue boundary.
     """
@@ -1124,22 +1099,8 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         "red_s_max": 255,
         "red_v_min": 60,
         "red_v_max": 255,
-        "white_h_min": 0,
-        "white_h_max": 179,
-        "white_s_min": 0,
-        "white_s_max": 70,
-        "white_v_min": 170,
-        "white_v_max": 255,
-        "orange_h_min": 15,
-        "orange_h_max": 28,
-        "orange_s_min": 120,
-        "orange_s_max": 255,
-        "orange_v_min": 120,
-        "orange_v_max": 255,
         "red_min_area": 400,
-        "ball_min_area": 157,
-        "ball_max_area": 1000,
-        "ball_min_circ": 70,
+        "yolo_conf_pct": 50,
         "cam_height_cm": 179,
         "calib_z_cm": 7,
         "cam_center_x": frame_width // 2,
@@ -1157,9 +1118,7 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         max_value = 179 if "_h_" in key else 255
         if key.endswith("min_area"):
             max_value = 20000
-        if key == "ball_max_area":
-            max_value = 20000
-        if key == "ball_min_circ":
+        if key == "yolo_conf_pct":
             max_value = 100
         if key == "cam_height_cm":
             max_value = 300
@@ -1189,7 +1148,7 @@ def get_trackbar_value(key: str) -> int:
 
 
 def read_hsv_ranges() -> dict[str, object]:
-    """Read current threshold parameters from the trackbars."""
+    """Read current red-zone threshold and geometry parameters from the trackbars."""
     red_1 = HSVRange(
         lower=np.array(
             [
@@ -1226,52 +1185,11 @@ def read_hsv_ranges() -> dict[str, object]:
             dtype=np.uint8,
         ),
     )
-    white = HSVRange(
-        lower=np.array(
-            [
-                get_trackbar_value("white_h_min"),
-                get_trackbar_value("white_s_min"),
-                get_trackbar_value("white_v_min"),
-            ],
-            dtype=np.uint8,
-        ),
-        upper=np.array(
-            [
-                get_trackbar_value("white_h_max"),
-                get_trackbar_value("white_s_max"),
-                get_trackbar_value("white_v_max"),
-            ],
-            dtype=np.uint8,
-        ),
-    )
-    orange = HSVRange(
-        lower=np.array(
-            [
-                get_trackbar_value("orange_h_min"),
-                get_trackbar_value("orange_s_min"),
-                get_trackbar_value("orange_v_min"),
-            ],
-            dtype=np.uint8,
-        ),
-        upper=np.array(
-            [
-                get_trackbar_value("orange_h_max"),
-                get_trackbar_value("orange_s_max"),
-                get_trackbar_value("orange_v_max"),
-            ],
-            dtype=np.uint8,
-        ),
-    )
-
     return {
         "red_1": red_1,
         "red_2": red_2,
-        "white": white,
-        "orange": orange,
         "red_min_area": float(get_trackbar_value("red_min_area")),
-        "ball_min_area": float(get_trackbar_value("ball_min_area")),
-        "ball_max_area": float(get_trackbar_value("ball_max_area")),
-        "ball_min_circularity": get_trackbar_value("ball_min_circ") / 100.0,
+        "yolo_confidence": float(get_trackbar_value("yolo_conf_pct")) / 100.0,
         "h_cam_cm": float(get_trackbar_value("cam_height_cm")),
         "z_calib_cm": float(get_trackbar_value("calib_z_cm")),
         "camera_center_x": float(get_trackbar_value("cam_center_x")),
@@ -1394,109 +1312,80 @@ def detect_red_zones(
     return detections, combined
 
 
-def contour_circularity(contour: np.ndarray) -> float:
-    """Calculate circularity in the range [0, 1] for roughly ball-shaped contours."""
-    perimeter = float(cv2.arcLength(contour, True))
-    area = float(cv2.contourArea(contour))
-    if perimeter <= 0.0 or area <= 0.0:
-        return 0.0
-    return (4.0 * np.pi * area) / (perimeter * perimeter)
-
-
-def detect_ball_candidates(
-    frame_bgr: np.ndarray,
-    hsv_range: HSVRange,
-    label: str,
-    min_area: float,
-    max_area: float,
-    min_circularity: float,
-    z_object_cm: float,
-    h_cam_cm: float,
-    z_calib_cm: float,
-    camera_center_pixels: tuple[float, float],
-) -> tuple[list[BallDetection], np.ndarray]:
-    """Detect circular objects for one HSV color class."""
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, hsv_range.lower, hsv_range.upper)
-    mask = cleanup_mask(mask, kernel_size=3)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    detections: list[BallDetection] = []
-
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < min_area or area > max_area:
-            continue
-
-        circularity = contour_circularity(contour)
-        if circularity < min_circularity:
-            continue
-
-        (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
-        if radius <= 0.0:
-            continue
-
-        x, y, width, height = cv2.boundingRect(contour)
-        aspect_ratio = width / float(height) if height > 0 else 0.0
-        if abs(1.0 - aspect_ratio) > 0.35:
-            continue
-
-        detections.append(
-            BallDetection(
-                label=label,
-                center=(int(center_x), int(center_y)),
-                corrected_center=correct_parallax(
-                    pixel_coord=(int(center_x), int(center_y)),
-                    z_object_cm=z_object_cm,
-                    h_cam_cm=h_cam_cm,
-                    z_calib_cm=z_calib_cm,
-                    camera_center_pixels=camera_center_pixels,
-                ),
-                radius_px=max(2, int(radius)),
-                contour=contour,
-                area=area,
-                circularity=circularity,
-            )
-        )
-
-    return detections, mask
-
-
 def detect_balls(
     frame_bgr: np.ndarray,
     params: dict[str, object],
     camera_center_pixels: tuple[float, float],
 ) -> tuple[list[BallDetection], list[BallDetection], dict[str, np.ndarray]]:
-    """Detect white balls and orange balls using the same contour filters and parallax correction."""
-    white_detections, white_mask = detect_ball_candidates(
-        frame_bgr=frame_bgr,
-        hsv_range=params["white"],
-        label="white",
-        min_area=float(params["ball_min_area"]),
-        max_area=float(params["ball_max_area"]),
-        min_circularity=float(params["ball_min_circularity"]),
-        z_object_cm=Z_BALL_CM,
-        h_cam_cm=float(params["h_cam_cm"]),
-        z_calib_cm=float(params["z_calib_cm"]),
-        camera_center_pixels=camera_center_pixels,
-    )
-    orange_detections, orange_mask = detect_ball_candidates(
-        frame_bgr=frame_bgr,
-        hsv_range=params["orange"],
-        label="orange",
-        min_area=float(params["ball_min_area"]),
-        max_area=float(params["ball_max_area"]),
-        min_circularity=float(params["ball_min_circularity"]),
-        z_object_cm=Z_BALL_CM,
-        h_cam_cm=float(params["h_cam_cm"]),
-        z_calib_cm=float(params["z_calib_cm"]),
-        camera_center_pixels=camera_center_pixels,
-    )
-
-    masks = {
-        "white": white_mask,
-        "orange": orange_mask,
+    """Detect white and orange balls with YOLO while preserving the old output shape."""
+    white_detections: list[BallDetection] = []
+    orange_detections: list[BallDetection] = []
+    white_mask = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
+    orange_mask = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
+    label_by_class_name = {
+        "branca": "white",
+        "laranja": "orange",
     }
+    confidence_threshold = float(params["yolo_confidence"])
+
+    results = YOLO_MODEL(frame_bgr, verbose=False)[0]
+    if results.boxes is not None:
+        for box in results.boxes:
+            confidence = float(box.conf[0].cpu())
+            if confidence < confidence_threshold:
+                continue
+
+            class_index = int(box.cls[0].cpu())
+            class_name = str(results.names[class_index]).strip().lower()
+            label = label_by_class_name.get(class_name)
+            if label is None:
+                continue
+
+            x1, y1, x2, y2 = (float(value) for value in box.xyxy[0].cpu().tolist())
+            x1_i = int(round(np.clip(x1, 0, frame_bgr.shape[1] - 1)))
+            y1_i = int(round(np.clip(y1, 0, frame_bgr.shape[0] - 1)))
+            x2_i = int(round(np.clip(x2, 0, frame_bgr.shape[1] - 1)))
+            y2_i = int(round(np.clip(y2, 0, frame_bgr.shape[0] - 1)))
+            if x2_i <= x1_i or y2_i <= y1_i:
+                continue
+
+            center = ((x1_i + x2_i) // 2, (y1_i + y2_i) // 2)
+            radius_px = max(2, int(round(max(x2_i - x1_i, y2_i - y1_i) * 0.5)))
+            contour = np.array(
+                [
+                    [[x1_i, y1_i]],
+                    [[x2_i, y1_i]],
+                    [[x2_i, y2_i]],
+                    [[x1_i, y2_i]],
+                ],
+                dtype=np.int32,
+            )
+            detection = BallDetection(
+                label=label,
+                center=center,
+                corrected_center=correct_parallax(
+                    pixel_coord=center,
+                    z_object_cm=Z_BALL_CM,
+                    h_cam_cm=float(params["h_cam_cm"]),
+                    z_calib_cm=float(params["z_calib_cm"]),
+                    camera_center_pixels=camera_center_pixels,
+                ),
+                radius_px=radius_px,
+                contour=contour,
+                area=float((x2_i - x1_i) * (y2_i - y1_i)),
+                circularity=confidence,
+            )
+
+            if label == "white":
+                white_detections.append(detection)
+                cv2.circle(white_mask, center, radius_px, 255, -1, cv2.LINE_AA)
+            else:
+                orange_detections.append(detection)
+                cv2.circle(orange_mask, center, radius_px, 255, -1, cv2.LINE_AA)
+
+    white_detections.sort(key=lambda ball: (ball.center[1], ball.center[0]))
+    orange_detections.sort(key=lambda ball: (ball.center[1], ball.center[0]))
+    masks = {"white": white_mask, "orange": orange_mask}
     return white_detections, orange_detections, masks
 
 
@@ -2340,8 +2229,8 @@ def build_mask_preview(red_mask: np.ndarray, white_mask: np.ndarray, orange_mask
     orange_bgr = cv2.cvtColor(orange_mask, cv2.COLOR_GRAY2BGR)
 
     cv2.putText(red_bgr, "Red", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-    cv2.putText(white_bgr, "White", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(orange_bgr, "Orange", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2, cv2.LINE_AA)
+    cv2.putText(white_bgr, "White YOLO", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(orange_bgr, "Orange YOLO", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2, cv2.LINE_AA)
     return np.hstack((red_bgr, white_bgr, orange_bgr))
 
 
@@ -2784,7 +2673,7 @@ def resize_frame_to_size(frame_bgr: np.ndarray, target_size: tuple[int, int]) ->
 
 
 def run_image_mode(image_path: Path) -> int:
-    """Run repeated processing on one still image so HSV sliders remain interactive."""
+    """Run repeated processing on one still image so tuning sliders remain interactive."""
     frame = load_image_frame(image_path)
     app_state = AppState()
     create_hsv_trackbars((int(frame.shape[1]), int(frame.shape[0])))

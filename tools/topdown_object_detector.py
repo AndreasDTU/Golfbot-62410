@@ -69,6 +69,8 @@ TRACKBAR_NAMES = {
     "red_v_max": "R V max",
     "red_min_area": "R min area",
     "yolo_conf_pct": "YOLO conf %",
+    "yolo_min_area": "min area",
+    "yolo_max_area": "max area",
     "cam_height_cm": "Cam h cm",
     "calib_z_cm": "Border h cm",
     "cam_center_x": "Cam C X",
@@ -91,6 +93,8 @@ TRACKBAR_WINDOWS = {
     "red_v_max": CONTROL_COLOR_WINDOW_NAME,
     "red_min_area": CONTROL_FILTER_WINDOW_NAME,
     "yolo_conf_pct": CONTROL_FILTER_WINDOW_NAME,
+    "yolo_min_area": CONTROL_FILTER_WINDOW_NAME,
+    "yolo_max_area": CONTROL_FILTER_WINDOW_NAME,
     "cam_height_cm": CONTROL_GEOMETRY_WINDOW_NAME,
     "calib_z_cm": CONTROL_GEOMETRY_WINDOW_NAME,
     "cam_center_x": CONTROL_GEOMETRY_WINDOW_NAME,
@@ -1101,6 +1105,8 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         "red_v_max": 255,
         "red_min_area": 400,
         "yolo_conf_pct": 50,
+        "yolo_min_area": 157,
+        "yolo_max_area": 1580,
         "cam_height_cm": 179,
         "calib_z_cm": 7,
         "cam_center_x": frame_width // 2,
@@ -1117,6 +1123,8 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         window_name = TRACKBAR_WINDOWS[key]
         max_value = 179 if "_h_" in key else 255
         if key.endswith("min_area"):
+            max_value = 20000
+        if key == "yolo_max_area":
             max_value = 20000
         if key == "yolo_conf_pct":
             max_value = 100
@@ -1190,6 +1198,8 @@ def read_hsv_ranges() -> dict[str, object]:
         "red_2": red_2,
         "red_min_area": float(get_trackbar_value("red_min_area")),
         "yolo_confidence": float(get_trackbar_value("yolo_conf_pct")) / 100.0,
+        "yolo_min_area": float(get_trackbar_value("yolo_min_area")),
+        "yolo_max_area": float(get_trackbar_value("yolo_max_area")),
         "h_cam_cm": float(get_trackbar_value("cam_height_cm")),
         "z_calib_cm": float(get_trackbar_value("calib_z_cm")),
         "camera_center_x": float(get_trackbar_value("cam_center_x")),
@@ -1327,6 +1337,8 @@ def detect_balls(
         "laranja": "orange",
     }
     confidence_threshold = float(params["yolo_confidence"])
+    min_area = float(params["yolo_min_area"])
+    max_area = max(min_area, float(params["yolo_max_area"]))
 
     results = YOLO_MODEL(frame_bgr, verbose=False)[0]
     if results.boxes is not None:
@@ -1347,6 +1359,10 @@ def detect_balls(
             x2_i = int(round(np.clip(x2, 0, frame_bgr.shape[1] - 1)))
             y2_i = int(round(np.clip(y2, 0, frame_bgr.shape[0] - 1)))
             if x2_i <= x1_i or y2_i <= y1_i:
+                continue
+
+            area = float((x2_i - x1_i) * (y2_i - y1_i))
+            if area < min_area or area > max_area:
                 continue
 
             center = ((x1_i + x2_i) // 2, (y1_i + y2_i) // 2)
@@ -1372,7 +1388,7 @@ def detect_balls(
                 ),
                 radius_px=radius_px,
                 contour=contour,
-                area=float((x2_i - x1_i) * (y2_i - y1_i)),
+                area=area,
                 circularity=confidence,
             )
 

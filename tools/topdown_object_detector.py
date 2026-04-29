@@ -2608,6 +2608,28 @@ def save_heading_tuning_to_robot_calibration(
     return True
 
 
+def handle_topdown_selection_key(
+    key: int,
+    selection_state: TopdownSelectionState,
+    app_state: AppState,
+) -> bool:
+    """Handle top-down selector keys and return True when the stream should quit."""
+    if key in (255, -1):
+        return False
+    if key in (27, ord("q")):
+        return True
+    if key == ord("r"):
+        selection_state.clear_points()
+        reset_detection_state(app_state)
+    elif key == ord("a"):
+        selection_state.start_auto_calibration()
+        reset_detection_state(app_state)
+    elif key == ord("m"):
+        selection_state.start_manual_calibration()
+        reset_detection_state(app_state)
+    return False
+
+
 def draw_robot_calibration_status(
     frame: np.ndarray,
     runtime: RobotCalibrationRuntime,
@@ -2943,6 +2965,19 @@ def run_raw_stream_mode(
             selection_state,
             undistorted_camera_matrix,
         )
+
+        manual_selection_pending = (
+            selection_state.calibration_state == CalibrationState.CALIBRATING_MANUAL
+            and selection_state.transform_matrix is None
+        )
+        if manual_selection_pending:
+            cv2.imshow(MANUAL_SELECTOR_WINDOW_NAME, selector_view)
+            early_key = cv2.waitKey(1) & 0xFF
+            if handle_topdown_selection_key(early_key, selection_state, app_state):
+                break
+            if selection_state.transform_matrix is not None:
+                continue
+
         sync_camera_ground_trackbars(selection_state.camera_ground_projection)
         params = apply_automated_camera_ground_projection(
             read_hsv_ranges(),
@@ -3015,17 +3050,8 @@ def run_raw_stream_mode(
         cv2.imshow(MASK_WINDOW_NAME, masks)
         wait_ms = max(1, frame_delay_ms - int(round(processing_ms)))
         key = cv2.waitKey(wait_ms) & 0xFF
-        if key in (27, ord("q")):
+        if handle_topdown_selection_key(key, selection_state, app_state):
             break
-        if key == ord("r"):
-            selection_state.clear_points()
-            reset_detection_state(app_state)
-        if key == ord("a"):
-            selection_state.start_auto_calibration()
-            reset_detection_state(app_state)
-        if key == ord("m"):
-            selection_state.start_manual_calibration()
-            reset_detection_state(app_state)
         if key == ord("w") and selection_state.transform_matrix is not None:
             save_heading_tuning_to_robot_calibration(
                 robot_runtime,

@@ -13,7 +13,7 @@ def send(sock, cmd):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 calibrate.py <EV3_IP>")
+        print("Usage: python3 pc.py <EV3_IP>")
         sys.exit(1)
 
     host = sys.argv[1]

@@ -73,8 +73,8 @@ TRACKBAR_NAMES = {
     "yolo_max_area": "max area",
     "cam_height_cm": "Cam h cm",
     "calib_z_cm": "Border h cm",
-    "cam_center_x": "Cam C X",
-    "cam_center_y": "Cam C Y",
+    "cam_center_x": "Cam X cm",
+    "cam_center_y": "Cam Y cm",
     "heading_tuning": "Heading Tuning",
     "robot_width_cmx10": "Robot W x10",
     "robot_front_cmx10": "Body F x10",
@@ -207,6 +207,14 @@ class ParallaxConfig:
     camera_height_cm: float
     calibration_plane_height_cm: float
     camera_center: np.ndarray
+
+
+@dataclass(frozen=True)
+class CameraGroundProjection:
+    """Camera ground projection in the warped top-down pixel plane."""
+
+    principal_point_px: np.ndarray
+    camera_center_px: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -494,11 +502,15 @@ class TopdownSelectionState:
     current_tracked_points: np.ndarray | None = None
     tracked_point_valid: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=bool))
     tracked_point_errors: np.ndarray = field(default_factory=lambda: np.full(4, np.inf, dtype=np.float32))
+    camera_ground_projection: CameraGroundProjection | None = None
+    camera_ground_warning: str = ""
 
     def clear_points(self) -> None:
         self.points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.camera_ground_projection = None
+        self.camera_ground_warning = ""
         self.reset_manual_tracking()
         if self.calibration_state in (CalibrationState.CALIBRATING_MANUAL, CalibrationState.CALIBRATED_MANUAL):
             self.calibration_state = CalibrationState.CALIBRATING_MANUAL
@@ -509,6 +521,8 @@ class TopdownSelectionState:
         self.points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.camera_ground_projection = None
+        self.camera_ground_warning = ""
         self.reset_manual_tracking()
         self.calibration_state = CalibrationState.CALIBRATING_MANUAL
 
@@ -516,6 +530,8 @@ class TopdownSelectionState:
         self.points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.camera_ground_projection = None
+        self.camera_ground_warning = ""
         self.reset_manual_tracking()
         self.calibration_state = CalibrationState.NEEDS_CALIBRATION
 
@@ -574,6 +590,98 @@ def destination_corners(size: tuple[int, int]) -> np.ndarray:
 def build_manual_topdown_transform(points: Any) -> np.ndarray:
     """Compute the manual perspective transform from the 4 selected corners."""
     return cv2.getPerspectiveTransform(order_points(points), destination_corners(TOPDOWN_WARP_SIZE))
+
+
+def topdown_px_to_field_cm(point_px: np.ndarray | tuple[float, float]) -> tuple[float, float]:
+    """Convert top-down pixels to bottom-left-origin field centimeters."""
+    width, height = TOPDOWN_WARP_SIZE
+    x_cm = float(point_px[0]) * FIELD_WIDTH_CM / max(1, width - 1)
+    y_cm = FIELD_HEIGHT_CM - (float(point_px[1]) * FIELD_HEIGHT_CM / max(1, height - 1))
+    return float(x_cm), float(y_cm)
+
+
+def field_cm_to_topdown_pixel(point_cm: tuple[float, float]) -> tuple[float, float]:
+    """Convert bottom-left-origin field centimeters to top-down pixels."""
+    width, height = TOPDOWN_WARP_SIZE
+    x_px = float(point_cm[0]) * (width - 1) / FIELD_WIDTH_CM
+    y_px = (FIELD_HEIGHT_CM - float(point_cm[1])) * (height - 1) / FIELD_HEIGHT_CM
+    return float(x_px), float(y_px)
+
+
+def project_principal_point_to_topdown(
+    camera_matrix: np.ndarray,
+    homography: np.ndarray | None,
+) -> CameraGroundProjection | None:
+    """Map the undistorted camera principal point through the active homography."""
+    if camera_matrix.shape != (3, 3):
+        return None
+    if homography is None or homography.shape != (3, 3):
+        return None
+
+    principal_point = np.array(
+        [[[float(camera_matrix[0, 2]), float(camera_matrix[1, 2])]]],
+        dtype=np.float32,
+    )
+    projected = cv2.perspectiveTransform(principal_point, homography.astype(np.float64)).reshape(2)
+    if not np.all(np.isfinite(projected)):
+        return None
+
+    return CameraGroundProjection(
+        principal_point_px=principal_point.reshape(2).astype(np.float32),
+        camera_center_px=projected.astype(np.float32),
+    )
+
+
+def update_camera_ground_projection(
+    state: TopdownSelectionState,
+    camera_matrix: np.ndarray,
+) -> None:
+    """Refresh the camera ground projection from the active top-down homography."""
+    if state.transform_matrix is None:
+        state.camera_ground_projection = None
+        state.camera_ground_warning = ""
+        return
+
+    projection = project_principal_point_to_topdown(camera_matrix, state.transform_matrix)
+    if projection is None:
+        state.camera_ground_projection = None
+        state.camera_ground_warning = "Principal point projection unavailable"
+        return
+
+    state.camera_ground_projection = projection
+    state.camera_ground_warning = ""
+
+
+def apply_automated_camera_ground_projection(
+    params: dict[str, object],
+    projection: CameraGroundProjection | None,
+) -> dict[str, object]:
+    """Override manual camera-center controls while preserving manual camera height."""
+    if projection is None:
+        return params
+
+    automated = dict(params)
+    automated["camera_center_x"] = float(projection.camera_center_px[0])
+    automated["camera_center_y"] = float(projection.camera_center_px[1])
+    return automated
+
+
+def set_trackbar_if_changed(key: str, value: int) -> None:
+    """Move one UI trackbar only when the displayed value needs updating."""
+    name = TRACKBAR_NAMES[key]
+    window_name = TRACKBAR_WINDOWS[key]
+    if cv2.getTrackbarPos(name, window_name) != value:
+        cv2.setTrackbarPos(name, window_name, value)
+
+
+def sync_camera_ground_trackbars(projection: CameraGroundProjection | None) -> None:
+    """Keep camera-center sliders aligned with the homography-projected principal point."""
+    if projection is None:
+        return
+
+    x_cm, y_cm = topdown_px_to_field_cm(projection.camera_center_px)
+    set_trackbar_if_changed("cam_center_x", int(np.clip(round(x_cm), 0, FIELD_GRID_WIDTH_CM)))
+    set_trackbar_if_changed("cam_center_y", int(np.clip(round(y_cm), 0, FIELD_GRID_HEIGHT_CM)))
 
 
 def initialize_manual_anchor_tracking(state: TopdownSelectionState) -> bool:
@@ -943,6 +1051,13 @@ def draw_manual_selection_overlay(frame: np.ndarray, state: TopdownSelectionStat
         "m: manual calibration",
         "q: quit",
     ]
+    if state.camera_ground_projection is not None:
+        projection = state.camera_ground_projection
+        help_lines.append(
+            f"Principal point C X:{projection.camera_center_px[0]:.1f} Y:{projection.camera_center_px[1]:.1f}px"
+        )
+    elif state.camera_ground_warning:
+        help_lines.append(state.camera_ground_warning)
     for line_index, text in enumerate(help_lines):
         cv2.putText(
             overlay,
@@ -1080,6 +1195,22 @@ def load_calibration_image_size(calibration_file: Path) -> tuple[int, int]:
     return image_size
 
 
+def load_undistorted_camera_matrix(calibration_file: Path, balance: float) -> tuple[np.ndarray, tuple[int, int]]:
+    """Return the intrinsic matrix used by points in the undistorted frame."""
+    data = np.load(str(calibration_file))
+    camera_matrix = data["K"].astype(np.float64)
+    dist_coeffs = data["D"].astype(np.float64)
+    image_size = tuple(int(value) for value in data["image_size"])
+    undistorted_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+        camera_matrix,
+        dist_coeffs,
+        image_size,
+        np.eye(3, dtype=np.float64),
+        balance=balance,
+    )
+    return undistorted_camera_matrix.astype(np.float64), image_size
+
+
 def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
     """Create trackbars for red zones, camera geometry, and robot geometry.
 
@@ -1109,8 +1240,8 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         "yolo_max_area": 1580,
         "cam_height_cm": 179,
         "calib_z_cm": 7,
-        "cam_center_x": frame_width // 2,
-        "cam_center_y": frame_height // 2,
+        "cam_center_x": int(round(FIELD_WIDTH_CM * 0.5)),
+        "cam_center_y": int(round(FIELD_HEIGHT_CM * 0.5)),
         "heading_tuning": 180,
         "robot_width_cmx10": int(round(ROBOT_TUNED_FOOTPRINT_WIDTH_CM * 10.0)),
         "robot_front_cmx10": int(round(ROBOT_TUNED_FOOTPRINT_FRONT_FROM_ORIGIN_CM * 10.0)),
@@ -1133,9 +1264,9 @@ def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
         if key == "calib_z_cm":
             max_value = 30
         if key == "cam_center_x":
-            max_value = max(1, frame_width)
+            max_value = FIELD_GRID_WIDTH_CM
         if key == "cam_center_y":
-            max_value = max(1, frame_height)
+            max_value = FIELD_GRID_HEIGHT_CM
         if key == "heading_tuning":
             max_value = 360
         if key in {
@@ -1193,6 +1324,12 @@ def read_hsv_ranges() -> dict[str, object]:
             dtype=np.uint8,
         ),
     )
+    camera_center_px = field_cm_to_topdown_pixel(
+        (
+            float(get_trackbar_value("cam_center_x")),
+            float(get_trackbar_value("cam_center_y")),
+        )
+    )
     return {
         "red_1": red_1,
         "red_2": red_2,
@@ -1202,8 +1339,10 @@ def read_hsv_ranges() -> dict[str, object]:
         "yolo_max_area": float(get_trackbar_value("yolo_max_area")),
         "h_cam_cm": float(get_trackbar_value("cam_height_cm")),
         "z_calib_cm": float(get_trackbar_value("calib_z_cm")),
-        "camera_center_x": float(get_trackbar_value("cam_center_x")),
-        "camera_center_y": float(get_trackbar_value("cam_center_y")),
+        "camera_center_x": float(camera_center_px[0]),
+        "camera_center_y": float(camera_center_px[1]),
+        "camera_center_x_cm": float(get_trackbar_value("cam_center_x")),
+        "camera_center_y_cm": float(get_trackbar_value("cam_center_y")),
         "heading_tuning_rad": math.radians(float(get_trackbar_value("heading_tuning")) - 180.0),
         "robot_width_cm": float(get_trackbar_value("robot_width_cmx10")) / 10.0,
         "robot_front_cm": float(get_trackbar_value("robot_front_cmx10")) / 10.0,
@@ -2023,20 +2162,21 @@ def draw_schematic(
     )
     cv2.line(
         schematic,
-        (camera_center_schematic[0] - 4, camera_center_schematic[1]),
-        (camera_center_schematic[0] + 4, camera_center_schematic[1]),
+        (camera_center_schematic[0] - 12, camera_center_schematic[1]),
+        (camera_center_schematic[0] + 12, camera_center_schematic[1]),
         (255, 80, 80),
-        1,
+        3,
         cv2.LINE_AA,
     )
     cv2.line(
         schematic,
-        (camera_center_schematic[0], camera_center_schematic[1] - 4),
-        (camera_center_schematic[0], camera_center_schematic[1] + 4),
+        (camera_center_schematic[0], camera_center_schematic[1] - 12),
+        (camera_center_schematic[0], camera_center_schematic[1] + 12),
         (255, 80, 80),
-        1,
+        3,
         cv2.LINE_AA,
     )
+    cv2.circle(schematic, camera_center_schematic, 7, (255, 255, 255), 2, cv2.LINE_AA)
 
     cv2.putText(
         schematic,
@@ -2525,6 +2665,7 @@ def prepare_live_topdown_frame(
     calibration_file: Path,
     balance: float,
     selection_state: TopdownSelectionState,
+    undistorted_camera_matrix: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Undistort the live frame and apply automatic or manual top-down calibration."""
     undistorted = undistort_with_calibration(frame_bgr, str(calibration_file), balance=balance)
@@ -2567,6 +2708,8 @@ def prepare_live_topdown_frame(
             and selection_state.calibration_state == CalibrationState.CALIBRATED_AUTO
         ):
             debug_view = draw_projected_aruco_debug(debug_view, selection_state.transform_matrix)
+
+    update_camera_ground_projection(selection_state, undistorted_camera_matrix)
 
     selector_view = draw_manual_selection_overlay(debug_view, selection_state)
     if selection_state.transform_matrix is None:
@@ -2735,6 +2878,7 @@ def run_raw_stream_mode(
     if not CALIBRATION_FILE.exists():
         print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
         return 1
+    undistorted_camera_matrix, _calibration_size = load_undistorted_camera_matrix(CALIBRATION_FILE, balance)
 
     ok, initial_frame = cap.read()
     if not ok or initial_frame is None:
@@ -2797,8 +2941,13 @@ def run_raw_stream_mode(
             CALIBRATION_FILE,
             balance,
             selection_state,
+            undistorted_camera_matrix,
         )
-        params = read_hsv_ranges()
+        sync_camera_ground_trackbars(selection_state.camera_ground_projection)
+        params = apply_automated_camera_ground_projection(
+            read_hsv_ranges(),
+            selection_state.camera_ground_projection,
+        )
 
         now = time.perf_counter()
         fps = 1.0 / max(1e-6, now - last_tick)

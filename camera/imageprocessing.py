@@ -101,14 +101,3 @@ def undistort_with_calibration(img, calibration_file, balance=0.0):
         )
 
     return undistorted
-
-
-
-<<<<<<< HEAD
-=======
-#Make picture fit altså fix lens distortion https://docs.opencv.org/4.x/dc/dbb/tutorial_py_calibration.html
-
-
-
-#Pitcture from hls to 5 colors(Wall, Ball, Orange Ball, Robot, Floor)
->>>>>>> image-calibration-implementation

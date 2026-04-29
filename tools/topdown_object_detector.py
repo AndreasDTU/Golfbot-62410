@@ -39,6 +39,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from camera.imageprocessing import undistort_with_calibration
+from robot.controller import RobotController
 
 
 FIELD_WIDTH_CM = 167.0
@@ -58,6 +59,15 @@ CONTROL_FILTER_WINDOW_NAME = "HSV Controls - Filters"
 CONTROL_GEOMETRY_WINDOW_NAME = "HSV Controls - Geometry"
 MANUAL_SELECTOR_WINDOW_NAME = "Manual Top-Down Selector"
 CONTROL_WINDOW_SIZE = (420, 520)
+ROBOT_IP = "192.168.0.42"
+MANUAL_MOVE_UNITS = 5
+MANUAL_MOVE_SPEED = 40
+MANUAL_TURN_DEGREES = 15
+MANUAL_TURN_SPEED = 30
+KEY_LEFT_ARROW = {2424832, 65361, 63234, 81}
+KEY_UP_ARROW = {2490368, 65362, 63232, 82}
+KEY_RIGHT_ARROW = {2555904, 65363, 63235, 83}
+KEY_DOWN_ARROW = {2621440, 65364, 63233, 84}
 TRACKBAR_NAMES = {
     "red1_h_min": "R1 H min",
     "red1_h_max": "R1 H max",
@@ -2630,6 +2640,55 @@ def handle_topdown_selection_key(
     return False
 
 
+def display_key_code(key: int) -> int:
+    """Return the ASCII-compatible key code from waitKeyEx output."""
+    return key & 0xFF
+
+
+def connect_robot_controller(robot_ip: str) -> RobotController | None:
+    """Connect to the EV3 without making vision startup depend on robot availability."""
+    try:
+        robot = RobotController(robot_ip)
+    except OSError as exc:
+        print(f"Robot unavailable at {robot_ip}: {exc}", file=sys.stderr)
+        return None
+    except Exception as exc:
+        print(f"Robot controller initialization failed at {robot_ip}: {exc}", file=sys.stderr)
+        return None
+    print(f"Robot controller connected at {robot_ip}")
+    return robot
+
+
+def send_robot_command(robot: RobotController | None, command_name: str, *args: object) -> None:
+    """Run one robot command if the controller is connected."""
+    if robot is None:
+        return
+    try:
+        getattr(robot, command_name)(*args)
+    except Exception as exc:
+        print(f"Robot command failed ({command_name}): {exc}", file=sys.stderr)
+
+
+def handle_manual_robot_key(key: int, robot: RobotController | None) -> None:
+    """Map keyboard controls to small non-blocking robot increments."""
+    if key in KEY_UP_ARROW:
+        send_robot_command(robot, "move", MANUAL_MOVE_UNITS, MANUAL_MOVE_SPEED)
+    elif key in KEY_DOWN_ARROW:
+        send_robot_command(robot, "move", -MANUAL_MOVE_UNITS, MANUAL_MOVE_SPEED)
+    elif key in KEY_LEFT_ARROW:
+        send_robot_command(robot, "turn", -MANUAL_TURN_DEGREES, MANUAL_TURN_SPEED)
+    elif key in KEY_RIGHT_ARROW:
+        send_robot_command(robot, "turn", MANUAL_TURN_DEGREES, MANUAL_TURN_SPEED)
+    else:
+        ascii_key = display_key_code(key)
+        if ascii_key == ord(" "):
+            send_robot_command(robot, "stop")
+        elif ascii_key == ord("p"):
+            send_robot_command(robot, "pickup")
+        elif ascii_key == ord("d"):
+            send_robot_command(robot, "dropoff")
+
+
 def draw_robot_calibration_status(
     frame: np.ndarray,
     runtime: RobotCalibrationRuntime,
@@ -2907,6 +2966,7 @@ def run_raw_stream_mode(
         print(f"Could not read first frame from {source_name}", file=sys.stderr)
         return 1
 
+    robot = connect_robot_controller(ROBOT_IP)
     app_state = AppState()
     aruco_dictionary, aruco_detector = build_aruco_detector()
     robot_runtime = RobotCalibrationRuntime(
@@ -2972,8 +3032,8 @@ def run_raw_stream_mode(
         )
         if manual_selection_pending:
             cv2.imshow(MANUAL_SELECTOR_WINDOW_NAME, selector_view)
-            early_key = cv2.waitKey(1) & 0xFF
-            if handle_topdown_selection_key(early_key, selection_state, app_state):
+            early_key = cv2.waitKeyEx(1)
+            if handle_topdown_selection_key(display_key_code(early_key), selection_state, app_state):
                 break
             if selection_state.transform_matrix is not None:
                 continue
@@ -3049,10 +3109,12 @@ def run_raw_stream_mode(
         cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
         cv2.imshow(MASK_WINDOW_NAME, masks)
         wait_ms = max(1, frame_delay_ms - int(round(processing_ms)))
-        key = cv2.waitKey(wait_ms) & 0xFF
-        if handle_topdown_selection_key(key, selection_state, app_state):
+        key = cv2.waitKeyEx(wait_ms)
+        ascii_key = display_key_code(key)
+        if handle_topdown_selection_key(ascii_key, selection_state, app_state):
             break
-        if key == ord("w") and selection_state.transform_matrix is not None:
+        handle_manual_robot_key(key, robot)
+        if ascii_key == ord("w") and selection_state.transform_matrix is not None:
             save_heading_tuning_to_robot_calibration(
                 robot_runtime,
                 float(params.get("heading_tuning_rad", 0.0)),
@@ -3070,6 +3132,7 @@ def run_raw_stream_mode(
                 TOPDOWN_WARP_SIZE,
             )
 
+    send_robot_command(robot, "stop")
     return 0
 
 

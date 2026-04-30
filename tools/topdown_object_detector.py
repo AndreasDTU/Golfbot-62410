@@ -2953,6 +2953,7 @@ def run_raw_stream_mode(
     balance: float,
     mode_label: str,
     frame_delay_ms: int,
+    connect_robot: bool,
     resize_to_size: tuple[int, int] | None = None,
 ) -> int:
     """Run live-style detection from any raw frame stream."""
@@ -2966,7 +2967,7 @@ def run_raw_stream_mode(
         print(f"Could not read first frame from {source_name}", file=sys.stderr)
         return 1
 
-    robot = connect_robot_controller(ROBOT_IP)
+    robot = connect_robot_controller(ROBOT_IP) if connect_robot else None
     app_state = AppState()
     aruco_dictionary, aruco_detector = build_aruco_detector()
     robot_runtime = RobotCalibrationRuntime(
@@ -3154,7 +3155,14 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
         height if height > 0 else calibration_height,
     )
     try:
-        return run_raw_stream_mode(cap, f"camera {camera_index}", balance, "Live", 1)
+        return run_raw_stream_mode(
+            cap,
+            f"camera {camera_index}",
+            balance,
+            "Live",
+            1,
+            connect_robot=True,
+        )
     finally:
         cap.release()
 
@@ -3187,6 +3195,7 @@ def run_video_mode(video_path: Path, balance: float, resize_to_calibration: bool
             balance,
             "Video",
             frame_delay_ms,
+            connect_robot=False,
             resize_to_size=resize_to_size,
         )
     finally:

@@ -38,7 +38,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from camera.imageprocessing import undistort_with_calibration
 from robot.controller import RobotController
 
 
@@ -1122,7 +1121,10 @@ def on_manual_topdown_mouse(
     if width > 0 and height > 0:
         clamped_x = int(np.clip(x, 0, width - 1))
         clamped_y = int(np.clip(y, 0, height - 1))
-        param.cursor = (clamped_x, clamped_y)
+        click_point = (clamped_x, clamped_y)
+    else:
+        click_point = (int(x), int(y))
+    param.cursor = click_point
 
     if event == cv2.EVENT_RBUTTONDOWN:
         param.clear_points()
@@ -1131,7 +1133,7 @@ def on_manual_topdown_mouse(
     if event != cv2.EVENT_LBUTTONDOWN or len(param.points) >= 4:
         return
 
-    param.points.append(param.cursor)
+    param.points.append(click_point)
     if len(param.points) == 4:
         if not initialize_manual_anchor_tracking(param):
             param.transform_matrix = build_manual_topdown_transform(param.points)
@@ -1173,7 +1175,7 @@ def parse_args() -> argparse.Namespace:
         "--balance",
         type=float,
         default=0.0,
-        help="Fisheye undistortion balance passed to undistort_with_calibration().",
+        help="Fisheye undistortion balance used for live/video camera frames.",
     )
     parser.add_argument(
         "--width",
@@ -1205,8 +1207,11 @@ def load_calibration_image_size(calibration_file: Path) -> tuple[int, int]:
     return image_size
 
 
-def load_undistorted_camera_matrix(calibration_file: Path, balance: float) -> tuple[np.ndarray, tuple[int, int]]:
-    """Return the intrinsic matrix used by points in the undistorted frame."""
+def load_undistortion_maps(
+    calibration_file: Path,
+    balance: float,
+) -> tuple[np.ndarray, tuple[int, int], np.ndarray, np.ndarray]:
+    """Precompute fisheye undistortion state once for a stream."""
     data = np.load(str(calibration_file))
     camera_matrix = data["K"].astype(np.float64)
     dist_coeffs = data["D"].astype(np.float64)
@@ -1218,7 +1223,15 @@ def load_undistorted_camera_matrix(calibration_file: Path, balance: float) -> tu
         np.eye(3, dtype=np.float64),
         balance=balance,
     )
-    return undistorted_camera_matrix.astype(np.float64), image_size
+    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+        camera_matrix,
+        dist_coeffs,
+        np.eye(3, dtype=np.float64),
+        undistorted_camera_matrix,
+        image_size,
+        cv2.CV_32FC1,
+    )
+    return undistorted_camera_matrix.astype(np.float64), image_size, map1, map2
 
 
 def create_hsv_trackbars(frame_size: tuple[int, int]) -> None:
@@ -2743,13 +2756,31 @@ def draw_robot_calibration_status(
 
 def prepare_live_topdown_frame(
     frame_bgr: np.ndarray,
-    calibration_file: Path,
-    balance: float,
+    calibration_image_size: tuple[int, int],
+    undistort_map1: np.ndarray,
+    undistort_map2: np.ndarray,
     selection_state: TopdownSelectionState,
     undistorted_camera_matrix: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Undistort the live frame and apply automatic or manual top-down calibration."""
-    undistorted = undistort_with_calibration(frame_bgr, str(calibration_file), balance=balance)
+    frame_size = (int(frame_bgr.shape[1]), int(frame_bgr.shape[0]))
+    if frame_size != calibration_image_size:
+        raise ValueError(
+            f"Billedstoerrelse {frame_size} matcher ikke kalibreringsstoerrelsen "
+            f"{calibration_image_size}. Kalibrering og drift skal bruge samme oploesning."
+        )
+    undistorted = cv2.remap(
+        frame_bgr,
+        undistort_map1,
+        undistort_map2,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+    if not np.any(undistorted):
+        raise ValueError(
+            "Undistort gav et helt sort billede. Kalibreringsparametrene er sandsynligvis ustabile "
+            "eller passer ikke til dette billede."
+        )
     live_gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
     selection_state.latest_gray_frame = live_gray
     selection_state.frame_size = (int(undistorted.shape[1]), int(undistorted.shape[0]))
@@ -2960,7 +2991,12 @@ def run_raw_stream_mode(
     if not CALIBRATION_FILE.exists():
         print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
         return 1
-    undistorted_camera_matrix, _calibration_size = load_undistorted_camera_matrix(CALIBRATION_FILE, balance)
+    (
+        undistorted_camera_matrix,
+        calibration_image_size,
+        undistort_map1,
+        undistort_map2,
+    ) = load_undistortion_maps(CALIBRATION_FILE, balance)
 
     ok, initial_frame = cap.read()
     if not ok or initial_frame is None:
@@ -3021,8 +3057,9 @@ def run_raw_stream_mode(
         start = time.perf_counter()
         selector_view, topdown_frame = prepare_live_topdown_frame(
             raw_frame,
-            CALIBRATION_FILE,
-            balance,
+            calibration_image_size,
+            undistort_map1,
+            undistort_map2,
             selection_state,
             undistorted_camera_matrix,
         )

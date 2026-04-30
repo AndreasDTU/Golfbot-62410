@@ -13,6 +13,7 @@ The output is shown as:
 The script intentionally keeps the detection pipeline simple and deterministic:
 - HSV thresholding for red zones
 - YOLOv8 inference for ball-like objects
+- Hybrid A* routing in ``(x, y, theta)`` over the already-built top-down map
 """
 
 from __future__ import annotations
@@ -161,6 +162,24 @@ ROBOT_TUNED_FOOTPRINT_FRONT_FROM_ORIGIN_CM = 8.3
 ROBOT_TUNED_FOOTPRINT_REAR_FROM_ORIGIN_CM = 10.1
 ROBOT_TUNED_TUBE_OFFSET_CM = 17.1
 ROBOT_TUNED_TUBE_RIGHT_OFFSET_CM = 0.0
+ROBOT_TUBE_WIDTH_CM = 6.0
+HYBRID_THETA_BINS = 32
+HYBRID_STEP_CM = 4.0
+HYBRID_GOAL_TOLERANCE_CM = 7.0
+HYBRID_MAX_EXPANSIONS = 30000
+HYBRID_TURN_DELTAS_RAD = (
+    math.radians(-22.5),
+    0.0,
+    math.radians(22.5),
+)
+HYBRID_IN_PLACE_TURNS_RAD = (
+    math.radians(-22.5),
+    math.radians(22.5),
+)
+ROUTE_HEADING_MARKER_INTERVAL = 12
+ROUTE_TARGET_REACHED_CM = HYBRID_GOAL_TOLERANCE_CM
+ROUTE_TARGET_MOVE_INVALIDATE_CM = 5.0
+ROUTE_CROSSTRACK_INVALIDATE_CM = 14.0
 MIN_ROBOT_SPIN_POINTS = 20
 ELLIPSE_WARNING_RATIO = 1.12
 YOLO_MODEL_PATH = Path("best.pt")
@@ -206,6 +225,194 @@ class RobotGeometry:
     rear_cm: float
     tube_forward_cm: float
     tube_right_cm: float
+
+
+@dataclass(frozen=True)
+class HybridPose:
+    """One planner state in bottom-left field coordinates.
+
+    The old planner only searched integer ``(x, y)`` grid cells.  Hybrid A*
+    keeps a continuous centimeter pose and a discretized heading key, so every
+    expansion can evaluate whether the robot can physically arrive at the next
+    pose with its current orientation.  ``theta_rad`` follows the rest of this
+    file: 0 points along +X and positive rotation points toward +Y.
+    """
+
+    x_cm: float
+    y_cm: float
+    theta_rad: float
+
+
+@dataclass(frozen=True)
+class PlannedBallTarget:
+    """Route target with enough metadata for orange-first prioritization."""
+
+    track_id: int
+    label: str
+    x_cm: float
+    y_cm: float
+    node_cm: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class RoutePlan:
+    """Cached route plus the first target that must stay valid.
+
+    The UI only draws ``points``, but cache invalidation needs to know which
+    target the active trajectory is trying to collect.  When that ball
+    disappears, moves, or is reached by the intake, the next frame is allowed to
+    spend CPU on a new Hybrid A* search.  Otherwise the same trajectory is
+    reused, which keeps normal detector frames fast.
+    """
+
+    points: list[HybridPose]
+    active_target: PlannedBallTarget | None
+
+
+@dataclass(frozen=True)
+class HybridPlannerConfig:
+    """Deterministic Hybrid A* tuning values expressed in field centimeters.
+
+    ``step_cm`` controls translation primitive length, ``theta_bins`` controls
+    the heading lattice resolution, and ``goal_tolerance_cm`` models ball
+    collection by allowing the intake/origin trajectory to stop near the ball
+    rather than requiring a single exact grid cell.  The constants are kept
+    small and explicit because routing runs inside an interactive vision tool.
+    """
+
+    step_cm: float = HYBRID_STEP_CM
+    theta_bins: int = HYBRID_THETA_BINS
+    goal_tolerance_cm: float = HYBRID_GOAL_TOLERANCE_CM
+    max_expansions: int = HYBRID_MAX_EXPANSIONS
+    turn_deltas_rad: tuple[float, ...] = HYBRID_TURN_DELTAS_RAD
+    in_place_turns_rad: tuple[float, ...] = HYBRID_IN_PLACE_TURNS_RAD
+
+
+class RobotFootprintCollisionChecker:
+    """Check an oriented multi-circle robot model against raw red occupancy.
+
+    The field grid is still the 1 cm map produced by the vision pipeline.  For
+    speed, the checker converts that map once into a distance transform and each
+    Hybrid A* candidate pose probes a small set of oriented circle centers.  A
+    pose is valid when every safety-critical base circle is inside the field and
+    its distance to the nearest red cell is greater than its radius.
+
+    Intake circles are modeled separately for visualization and future tuning,
+    but red-zone clearance is still enforced on the wide base/wheelbase.  This
+    preserves the contest strategy from the polygon checker: the narrow intake
+    may reach near edge balls while the base stays safe.
+    """
+
+    def __init__(self, raw_red_grid: np.ndarray, geometry: RobotGeometry) -> None:
+        self.raw_red_grid = raw_red_grid
+        self.geometry = geometry
+        self.height = int(raw_red_grid.shape[0])
+        self.width = int(raw_red_grid.shape[1])
+        free_mask = (raw_red_grid == 0).astype(np.uint8)
+        self.distance_to_red = cv2.distanceTransform(free_mask, cv2.DIST_L2, 3)
+        self.base_circles = self._build_base_circle_specs()
+        self.intake_circles = self._build_intake_circle_specs()
+
+    def _build_base_circle_specs(self) -> list[tuple[float, float, float]]:
+        """Approximate the rectangular wheelbase with overlapping circles."""
+        radius = max(1.0, self.geometry.width_cm * 0.5)
+        usable_start = -self.geometry.rear_cm + radius * 0.35
+        usable_end = self.geometry.front_cm - radius * 0.35
+        length = max(0.0, usable_end - usable_start)
+        circle_count = max(2, int(math.ceil(length / max(1.0, radius * 0.9))) + 1)
+        if circle_count == 1:
+            offsets = [0.0]
+        else:
+            offsets = [
+                usable_start + (usable_end - usable_start) * index / (circle_count - 1)
+                for index in range(circle_count)
+            ]
+        return [(offset, 0.0, radius) for offset in offsets]
+
+    def _build_intake_circle_specs(self) -> list[tuple[float, float, float]]:
+        """Approximate the forward intake tube with small overlapping circles."""
+        radius = max(1.0, ROBOT_TUBE_WIDTH_CM * 0.5)
+        start = self.geometry.front_cm + radius
+        end = self.geometry.tube_forward_cm
+        if end <= start:
+            return [(end, self.geometry.tube_right_cm, radius)]
+        circle_count = max(2, int(math.ceil((end - start) / max(1.0, radius * 1.25))) + 1)
+        return [
+            (
+                start + (end - start) * index / (circle_count - 1),
+                self.geometry.tube_right_cm,
+                radius,
+            )
+            for index in range(circle_count)
+        ]
+
+    def oriented_circle_centers(
+        self,
+        pose: HybridPose,
+        circle_specs: list[tuple[float, float, float]],
+    ) -> list[tuple[float, float, float]]:
+        """Project local ``forward/right/radius`` circle specs into grid space."""
+        forward = (math.cos(pose.theta_rad), -math.sin(pose.theta_rad))
+        right = (math.sin(pose.theta_rad), math.cos(pose.theta_rad))
+        center_x = pose.x_cm
+        center_y = FIELD_HEIGHT_CM - pose.y_cm
+        return [
+            (
+                center_x + forward[0] * forward_cm + right[0] * right_cm,
+                center_y + forward[1] * forward_cm + right[1] * right_cm,
+                radius_cm,
+            )
+            for forward_cm, right_cm, radius_cm in circle_specs
+        ]
+
+    def footprint_polygons(self, pose: HybridPose) -> tuple[np.ndarray, np.ndarray]:
+        """Return base and intake polygons for ``pose`` in grid coordinates."""
+        forward = np.array([math.cos(pose.theta_rad), -math.sin(pose.theta_rad)], dtype=np.float32)
+        right = np.array([math.sin(pose.theta_rad), math.cos(pose.theta_rad)], dtype=np.float32)
+        center = np.array([pose.x_cm, FIELD_HEIGHT_CM - pose.y_cm], dtype=np.float32)
+
+        half_width_cm = self.geometry.width_cm * 0.5
+        front_center = center + forward * self.geometry.front_cm
+        rear_center = center - forward * self.geometry.rear_cm
+        base = np.array(
+            [
+                front_center + right * half_width_cm,
+                front_center - right * half_width_cm,
+                rear_center - right * half_width_cm,
+                rear_center + right * half_width_cm,
+            ],
+            dtype=np.float32,
+        )
+
+        tube_half_width = ROBOT_TUBE_WIDTH_CM * 0.5
+        tube_front = center + forward * self.geometry.tube_forward_cm + right * self.geometry.tube_right_cm
+        tube_rear = front_center + right * self.geometry.tube_right_cm
+        tube = np.array(
+            [
+                tube_front + right * tube_half_width,
+                tube_front - right * tube_half_width,
+                tube_rear - right * tube_half_width,
+                tube_rear + right * tube_half_width,
+            ],
+            dtype=np.float32,
+        )
+        return base, tube
+
+    def is_pose_valid(self, pose: HybridPose) -> bool:
+        """Return true when all base circles are inside field bounds and red-free."""
+        for x_grid, y_grid, radius_cm in self.oriented_circle_centers(pose, self.base_circles):
+            if (
+                x_grid - radius_cm < 0.0
+                or x_grid + radius_cm > self.width - 1
+                or y_grid - radius_cm < 0.0
+                or y_grid + radius_cm > self.height - 1
+            ):
+                return False
+            x_index = int(np.clip(round(x_grid), 0, self.width - 1))
+            y_index = int(np.clip(round(y_grid), 0, self.height - 1))
+            if float(self.distance_to_red[y_index, x_index]) <= radius_cm:
+                return False
+        return True
 
 
 @dataclass(frozen=True)
@@ -488,8 +695,20 @@ class AppState:
     robot_topdown_px: tuple[float, float] | None = None
     selected_ball_track_id: int | None = None
     selected_start_cm: tuple[int, int] | None = None
-    route_points_cm: list[tuple[int, int]] | None = None
+    route_points_cm: list[HybridPose] | None = None
+    route_cache_target_id: int | None = None
+    route_cache_target_label: str | None = None
+    route_cache_target_cm: tuple[float, float] | None = None
+    route_cache_ball_signature: tuple[tuple[int, str, int, int], ...] = field(default_factory=tuple)
     coordinate_smoother: BallCoordinateSmoother = field(default_factory=BallCoordinateSmoother)
+
+    def clear_route_cache(self) -> None:
+        """Drop cached routing state so the next update performs Hybrid A*."""
+        self.route_points_cm = None
+        self.route_cache_target_id = None
+        self.route_cache_target_label = None
+        self.route_cache_target_cm = None
+        self.route_cache_ball_signature = ()
 
 
 @dataclass
@@ -1873,8 +2092,21 @@ def contour_to_field_grid(contour: np.ndarray, source_size: tuple[int, int]) -> 
     return np.array(mapped_points, dtype=np.int32).reshape((-1, 1, 2))
 
 
-def build_occupancy_grid(frame_shape: tuple[int, int, int], red_zones: list[RedZoneDetection]) -> np.ndarray:
-    """Build a 1 cm binary occupancy grid with a dilated red-zone safety margin."""
+def build_occupancy_grid(
+    frame_shape: tuple[int, int, int],
+    red_zones: list[RedZoneDetection],
+    dilate_for_legacy: bool = True,
+) -> np.ndarray:
+    """Build a 1 cm binary occupancy grid from detected red zones.
+
+    Legacy 2D A* callers receive the historical circular robot-radius dilation
+    by default.  Hybrid A* callers pass ``dilate_for_legacy=False`` to keep the
+    grid raw and delegate clearance to
+    :class:`RobotFootprintCollisionChecker`, which tests the oriented base
+    polygon at each candidate ``(x, y, theta)`` pose.  This preserves the
+    external vision-to-map behavior while avoiding false blocking in the
+    detector UI's asymmetric robot planner.
+    """
     source_height, source_width = frame_shape[:2]
     grid = np.zeros((FIELD_GRID_HEIGHT_CM, FIELD_GRID_WIDTH_CM), dtype=np.uint8)
 
@@ -1882,14 +2114,183 @@ def build_occupancy_grid(frame_shape: tuple[int, int, int], red_zones: list[RedZ
         grid_contour = contour_to_field_grid(zone.corrected_contour, (source_width, source_height))
         cv2.fillPoly(grid, [grid_contour], 1)
 
+    if not dilate_for_legacy:
+        return (grid > 0).astype(np.uint8)
+
     kernel_size = max(1, int(2 * ROBOT_RADIUS_CM + 1))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     dilated = cv2.dilate(grid, kernel, iterations=1)
     return (dilated > 0).astype(np.uint8)
 
 
+def normalize_planner_angle(theta_rad: float) -> float:
+    """Normalize planner headings to ``[-pi, pi)`` for stable state keys."""
+    return (theta_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def theta_bin(theta_rad: float, theta_bins: int) -> int:
+    """Discretize a continuous heading into a deterministic Hybrid A* bin."""
+    normalized = normalize_planner_angle(theta_rad)
+    return int(round((normalized + math.pi) * theta_bins / (2.0 * math.pi))) % theta_bins
+
+
+def hybrid_state_key(pose: HybridPose, theta_bins: int) -> tuple[int, int, int]:
+    """Return the closed-set key for a continuous Hybrid A* pose."""
+    return (
+        int(round(pose.x_cm)),
+        int(round(FIELD_HEIGHT_CM - pose.y_cm)),
+        theta_bin(pose.theta_rad, theta_bins),
+    )
+
+
+def tube_center_for_pose(pose: HybridPose, geometry: RobotGeometry) -> tuple[float, float]:
+    """Return the field-coordinate center of the intake mouth for ``pose``."""
+    forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
+    right = (math.sin(pose.theta_rad), -math.cos(pose.theta_rad))
+    return (
+        pose.x_cm + forward[0] * geometry.tube_forward_cm + right[0] * geometry.tube_right_cm,
+        pose.y_cm + forward[1] * geometry.tube_forward_cm + right[1] * geometry.tube_right_cm,
+    )
+
+
+def hybrid_goal_distance(pose: HybridPose, goal_node: tuple[int, int], geometry: RobotGeometry) -> float:
+    """Distance from the intake mouth to the target ball grid node."""
+    goal_x = float(goal_node[0])
+    goal_y = FIELD_HEIGHT_CM - float(goal_node[1])
+    tube_x, tube_y = tube_center_for_pose(pose, geometry)
+    return math.hypot(goal_x - tube_x, goal_y - tube_y)
+
+
+def reconstruct_hybrid_path(
+    came_from: dict[tuple[int, int, int], tuple[int, int, int]],
+    pose_by_key: dict[tuple[int, int, int], HybridPose],
+    goal_key: tuple[int, int, int],
+) -> list[HybridPose]:
+    """Rebuild the continuous ``(x, y, theta)`` trajectory from search parents."""
+    key = goal_key
+    path = [pose_by_key[key]]
+    while key in came_from:
+        key = came_from[key]
+        path.append(pose_by_key[key])
+    path.reverse()
+    return path
+
+
+def expand_hybrid_neighbors(pose: HybridPose, config: HybridPlannerConfig) -> list[tuple[HybridPose, float]]:
+    """Generate deterministic forward-arc and in-place-turn motion primitives."""
+    neighbors: list[tuple[HybridPose, float]] = []
+
+    for delta_theta in config.turn_deltas_rad:
+        next_theta = normalize_planner_angle(pose.theta_rad + delta_theta)
+        mid_theta = normalize_planner_angle(pose.theta_rad + delta_theta * 0.5)
+        next_pose = HybridPose(
+            x_cm=pose.x_cm + math.cos(mid_theta) * config.step_cm,
+            y_cm=pose.y_cm + math.sin(mid_theta) * config.step_cm,
+            theta_rad=next_theta,
+        )
+        turn_penalty = abs(delta_theta) * 2.0
+        neighbors.append((next_pose, config.step_cm + turn_penalty))
+
+    for delta_theta in config.in_place_turns_rad:
+        next_pose = HybridPose(
+            x_cm=pose.x_cm,
+            y_cm=pose.y_cm,
+            theta_rad=normalize_planner_angle(pose.theta_rad + delta_theta),
+        )
+        neighbors.append((next_pose, config.step_cm * 0.55 + abs(delta_theta) * 2.0))
+
+    return neighbors
+
+
+def hybrid_a_star_search(
+    raw_red_grid: np.ndarray,
+    start_pose: HybridPose,
+    goal_node: tuple[int, int],
+    geometry: RobotGeometry,
+    config: HybridPlannerConfig | None = None,
+) -> list[HybridPose]:
+    """Search a kinematically valid trajectory in ``x, y, theta``.
+
+    The planner keeps continuous centimeter poses but stores closed-set entries
+    in 1 cm / fixed-heading bins.  Each neighbor is a short motion primitive:
+    straight, shallow left/right arcs, or an in-place turn for tight recovery.
+    A pose is accepted only if the oriented base polygon is collision-free
+    against the raw red-zone grid.  The goal test uses the intake mouth, not the
+    robot origin, so the route can intentionally bring the tube to the ball
+    while leaving the wider base in safe free space.
+    """
+    cfg = config or HybridPlannerConfig()
+    collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry)
+    start_pose = HybridPose(
+        x_cm=float(start_pose.x_cm),
+        y_cm=float(start_pose.y_cm),
+        theta_rad=normalize_planner_angle(start_pose.theta_rad),
+    )
+
+    if not collision_checker.is_pose_valid(start_pose):
+        return []
+
+    start_key = hybrid_state_key(start_pose, cfg.theta_bins)
+    open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+    counter = 0
+    start_h = max(0.0, hybrid_goal_distance(start_pose, goal_node, geometry) - cfg.goal_tolerance_cm)
+    heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+
+    came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
+    g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+    expansions = 0
+
+    while open_heap and expansions < cfg.max_expansions:
+        _f_cost, current_cost, _counter, current_key = heapq.heappop(open_heap)
+        if current_cost > g_score.get(current_key, float("inf")):
+            continue
+
+        current_pose = pose_by_key[current_key]
+        if hybrid_goal_distance(current_pose, goal_node, geometry) <= cfg.goal_tolerance_cm:
+            return reconstruct_hybrid_path(came_from, pose_by_key, current_key)
+
+        expansions += 1
+        for neighbor_pose, primitive_cost in expand_hybrid_neighbors(current_pose, cfg):
+            neighbor_pose = HybridPose(
+                x_cm=float(neighbor_pose.x_cm),
+                y_cm=float(neighbor_pose.y_cm),
+                theta_rad=normalize_planner_angle(neighbor_pose.theta_rad),
+            )
+            if not collision_checker.is_pose_valid(neighbor_pose):
+                continue
+
+            neighbor_key = hybrid_state_key(neighbor_pose, cfg.theta_bins)
+            tentative_g = g_score[current_key] + primitive_cost
+            if tentative_g >= g_score.get(neighbor_key, float("inf")):
+                continue
+
+            came_from[neighbor_key] = current_key
+            pose_by_key[neighbor_key] = neighbor_pose
+            g_score[neighbor_key] = tentative_g
+            heuristic = max(0.0, hybrid_goal_distance(neighbor_pose, goal_node, geometry) - cfg.goal_tolerance_cm)
+            heading_change = abs(normalize_planner_angle(neighbor_pose.theta_rad - current_pose.theta_rad))
+            counter += 1
+            heapq.heappush(
+                open_heap,
+                (
+                    tentative_g + heuristic + heading_change * 0.1,
+                    tentative_g,
+                    counter,
+                    neighbor_key,
+                ),
+            )
+
+    return []
+
+
 def a_star_search(grid: np.ndarray, start_node: tuple[int, int], goal_node: tuple[int, int]) -> list[tuple[int, int]]:
-    """Run 8-connected A* search on a binary occupancy grid."""
+    """Run legacy 8-connected A* search on a binary occupancy grid.
+
+    ``topdown_object_detector.py`` now uses :func:`hybrid_a_star_search` for
+    routing.  This function remains for older imports such as the autonomous
+    navigator, but it is intentionally no longer called by the detector UI.
+    """
     width = int(grid.shape[1])
     height = int(grid.shape[0])
 
@@ -1957,52 +2358,175 @@ def a_star_search(grid: np.ndarray, start_node: tuple[int, int], goal_node: tupl
 
 def build_greedy_route(
     grid: np.ndarray,
-    ball_nodes_cm: list[tuple[int, int]],
-    start_node_cm: tuple[int, int],
-) -> list[tuple[int, int]]:
-    """Greedily connect the robot start node to the nearest reachable balls."""
-    if not ball_nodes_cm:
-        return []
+    ball_targets: list[PlannedBallTarget],
+    start_pose: HybridPose,
+    geometry: RobotGeometry,
+    config: HybridPlannerConfig | None = None,
+) -> RoutePlan:
+    """Build an orange-first Hybrid A* collection route.
 
-    unvisited = list(ball_nodes_cm)
-    current = start_node_cm
-    route: list[tuple[int, int]] = [current]
+    The orange ball has contest bonus value, so the planner first tries to
+    prove that at least one valid ``(x, y, theta)`` trajectory can bring the
+    intake to it.  If that search fails, the orange ball is treated as
+    unreachable for the current frame and removed from consideration; the route
+    then falls back to deterministic nearest-neighbor routing over the remaining
+    balls.  After the orange segment succeeds, the same nearest-reachable logic
+    continues from the final Hybrid A* pose, so route planning remains dynamic
+    and state-aware instead of being a fixed 2D point ordering.
+    """
+    if not ball_targets:
+        return RoutePlan(points=[], active_target=None)
+
+    cfg = config or HybridPlannerConfig()
+    unvisited = list(ball_targets)
+    current_pose = start_pose
+    route: list[HybridPose] = [current_pose]
+    active_target: PlannedBallTarget | None = None
+
+    orange_targets = [target for target in unvisited if target.label == "orange"]
+    if orange_targets:
+        orange_target = min(
+            orange_targets,
+            key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
+        )
+        orange_segment = hybrid_a_star_search(grid, current_pose, orange_target.node_cm, geometry, cfg)
+        if orange_segment:
+            active_target = orange_target
+            route.extend(orange_segment[1:])
+            current_pose = orange_segment[-1]
+        unvisited.remove(orange_target)
 
     while unvisited:
-        candidate = min(unvisited, key=lambda node: math.hypot(node[0] - current[0], node[1] - current[1]))
-        segment = a_star_search(grid, current, candidate)
-        if not segment:
-            unvisited.remove(candidate)
-            continue
+        nearest_candidates = sorted(
+            unvisited,
+            key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
+        )
+        chosen_target: PlannedBallTarget | None = None
+        chosen_segment: list[HybridPose] = []
 
-        route.extend(segment[1:])
-        current = candidate
-        unvisited.remove(candidate)
+        for candidate in nearest_candidates:
+            segment = hybrid_a_star_search(grid, current_pose, candidate.node_cm, geometry, cfg)
+            if segment:
+                chosen_target = candidate
+                chosen_segment = segment
+                break
 
-    return route
+        if chosen_target is None:
+            break
+
+        route.extend(chosen_segment[1:])
+        current_pose = chosen_segment[-1]
+        unvisited.remove(chosen_target)
+        if active_target is None:
+            active_target = chosen_target
+
+    return RoutePlan(points=route, active_target=active_target)
 
 
-def update_route_from_state(app_state: AppState) -> None:
-    """Recompute the path-planning route from the latest detections and selected start point."""
+def nearest_route_distance_cm(pose: HybridPose, route: list[HybridPose]) -> float:
+    """Return robot-to-route cross-track distance using cached route samples."""
+    if not route:
+        return float("inf")
+    return min(math.hypot(pose.x_cm - point.x_cm, pose.y_cm - point.y_cm) for point in route)
+
+
+def ball_cache_signature(
+    smoothed_balls: list[SmoothedBallCoordinate],
+) -> tuple[tuple[int, str, int, int], ...]:
+    """Quantize ball state for cheap cache invalidation.
+
+    Positions are bucketed by the same movement threshold used for the active
+    target.  That makes the signature stable under small smoothing jitter but
+    invalidates when balls appear, disappear, change label, or move far enough
+    that the route should be reconsidered.
+    """
+    bucket = max(1.0, ROUTE_TARGET_MOVE_INVALIDATE_CM)
+    return tuple(
+        sorted(
+            (
+                ball.track_id,
+                ball.label,
+                int(round(ball.cm_x / bucket)),
+                int(round(ball.cm_y / bucket)),
+            )
+            for ball in smoothed_balls
+        )
+    )
+
+
+def cached_route_is_valid(
+    app_state: AppState,
+    current_pose: HybridPose,
+    smoothed_balls: list[SmoothedBallCoordinate],
+    geometry: RobotGeometry,
+) -> bool:
+    """Decide whether the cached route can be reused this frame.
+
+    Hybrid A* is intentionally not rerun every camera frame.  The cache remains
+    valid while the active target still exists near its previous location, the
+    intake has not reached it, and the robot has not drifted far from the
+    trajectory.  These checks are cheap scalar distance tests, so the detector UI
+    spends most frames drawing the cached route instead of expanding thousands
+    of planner states.
+    """
+    if not app_state.route_points_cm or app_state.route_cache_target_id is None:
+        return False
+
+    if app_state.route_cache_ball_signature != ball_cache_signature(smoothed_balls):
+        return False
+
+    if app_state.route_cache_target_id < 0:
+        return nearest_route_distance_cm(current_pose, app_state.route_points_cm) <= ROUTE_CROSSTRACK_INVALIDATE_CM
+
+    target = next(
+        (ball for ball in smoothed_balls if ball.track_id == app_state.route_cache_target_id),
+        None,
+    )
+    if target is None:
+        return False
+
+    cached_target = app_state.route_cache_target_cm
+    if cached_target is None:
+        return False
+    if math.hypot(target.cm_x - cached_target[0], target.cm_y - cached_target[1]) > ROUTE_TARGET_MOVE_INVALIDATE_CM:
+        return False
+
+    tube_x, tube_y = tube_center_for_pose(current_pose, geometry)
+    if math.hypot(target.cm_x - tube_x, target.cm_y - tube_y) <= ROUTE_TARGET_REACHED_CM:
+        return False
+
+    if nearest_route_distance_cm(current_pose, app_state.route_points_cm) > ROUTE_CROSSTRACK_INVALIDATE_CM:
+        return False
+
+    return True
+
+
+def update_route_from_state(app_state: AppState, params: dict[str, object] | None = None) -> None:
+    """Recompute the Hybrid A* route from detections and the latest robot state."""
     if (
         app_state.latest_frame_shape is None
         or app_state.latest_red_zones is None
     ):
-        app_state.route_points_cm = None
+        app_state.clear_route_cache()
         return
 
     smoothed_balls = app_state.latest_smoothed_ball_coordinates
     if not smoothed_balls:
-        app_state.route_points_cm = None
+        app_state.clear_route_cache()
         return
 
     if app_state.robot_pose is not None:
         app_state.selected_start_cm = field_metric_cm_to_grid_node(
             (app_state.robot_pose.x_cm, app_state.robot_pose.y_cm)
         )
+        start_pose = HybridPose(
+            x_cm=app_state.robot_pose.x_cm,
+            y_cm=app_state.robot_pose.y_cm,
+            theta_rad=app_state.robot_pose.heading_rad,
+        )
     else:
         if app_state.selected_ball_track_id is None:
-            app_state.route_points_cm = None
+            app_state.clear_route_cache()
             return
         selected_ball = next(
             (ball for ball in smoothed_balls if ball.track_id == app_state.selected_ball_track_id),
@@ -2010,20 +2534,50 @@ def update_route_from_state(app_state: AppState) -> None:
         )
         if selected_ball is None:
             app_state.selected_start_cm = None
-            app_state.route_points_cm = None
+            app_state.clear_route_cache()
             return
         app_state.selected_start_cm = field_metric_cm_to_grid_node((selected_ball.cm_x, selected_ball.cm_y))
+        start_pose = HybridPose(
+            x_cm=selected_ball.cm_x,
+            y_cm=selected_ball.cm_y,
+            theta_rad=0.0,
+        )
 
-    ball_nodes_cm = [
-        field_metric_cm_to_grid_node((ball.cm_x, ball.cm_y))
+    geometry = robot_geometry_from_params(params)
+    if cached_route_is_valid(app_state, start_pose, smoothed_balls, geometry):
+        return
+
+    ball_targets = [
+        PlannedBallTarget(
+            track_id=ball.track_id,
+            label=ball.label,
+            x_cm=ball.cm_x,
+            y_cm=ball.cm_y,
+            node_cm=field_metric_cm_to_grid_node((ball.cm_x, ball.cm_y)),
+        )
         for ball in smoothed_balls
     ]
-    occupancy_grid = build_occupancy_grid(app_state.latest_frame_shape, app_state.latest_red_zones)
-    app_state.route_points_cm = build_greedy_route(
-        occupancy_grid,
-        ball_nodes_cm,
-        app_state.selected_start_cm,
+    occupancy_grid = build_occupancy_grid(
+        app_state.latest_frame_shape,
+        app_state.latest_red_zones,
+        dilate_for_legacy=False,
     )
+    route_plan = build_greedy_route(
+        occupancy_grid,
+        ball_targets,
+        start_pose,
+        geometry,
+    )
+    app_state.route_points_cm = route_plan.points
+    app_state.route_cache_ball_signature = ball_cache_signature(smoothed_balls)
+    if route_plan.active_target is None:
+        app_state.route_cache_target_id = -1
+        app_state.route_cache_target_label = None
+        app_state.route_cache_target_cm = None
+    else:
+        app_state.route_cache_target_id = route_plan.active_target.track_id
+        app_state.route_cache_target_label = route_plan.active_target.label
+        app_state.route_cache_target_cm = (route_plan.active_target.x_cm, route_plan.active_target.y_cm)
 
 
 def on_schematic_mouse(event: int, x: int, y: int, _flags: int, userdata: AppState) -> None:
@@ -2044,7 +2598,48 @@ def on_schematic_mouse(event: int, x: int, y: int, _flags: int, userdata: AppSta
         key=lambda ball: math.hypot(ball.cm_x - click_cm[0], ball.cm_y - click_cm[1]),
     )
     userdata.selected_ball_track_id = nearest_ball.track_id
+    userdata.clear_route_cache()
     update_route_from_state(userdata)
+
+
+def draw_route_heading_markers(
+    schematic: np.ndarray,
+    route: list[HybridPose],
+    geometry: RobotGeometry,
+    interval: int = ROUTE_HEADING_MARKER_INTERVAL,
+) -> None:
+    """Draw sparse heading markers along a Hybrid A* trajectory.
+
+    The yellow polyline only shows translation.  These markers expose the third
+    Hybrid A* dimension by drawing a small base dot and an arrow from the robot
+    origin toward the intake mouth at regular samples along the cached route.
+    Sparse drawing keeps the UI readable and cheap even when the route contains
+    many motion primitives.
+    """
+    if not route:
+        return
+
+    sample_indices = list(range(0, len(route), max(1, interval)))
+    if sample_indices[-1] != len(route) - 1:
+        sample_indices.append(len(route) - 1)
+
+    for index in sample_indices:
+        pose = route[index]
+        origin_px = field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
+        tube_cm = tube_center_for_pose(pose, geometry)
+        tube_px = field_metric_cm_to_schematic(tube_cm)
+        cv2.circle(schematic, origin_px, 4, (255, 0, 255), -1, cv2.LINE_AA)
+        cv2.arrowedLine(
+            schematic,
+            origin_px,
+            tube_px,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.35,
+        )
+
+
 def draw_schematic(
     frame_shape: tuple[int, int, int],
     red_zones: list[RedZoneDetection],
@@ -2114,11 +2709,16 @@ def draw_schematic(
 
     if app_state.route_points_cm:
         route_points = np.array(
-            [field_cm_to_schematic(point_cm) for point_cm in app_state.route_points_cm],
+            [field_metric_cm_to_schematic((pose.x_cm, pose.y_cm)) for pose in app_state.route_points_cm],
             dtype=np.int32,
         ).reshape((-1, 1, 2))
         if len(route_points) >= 2:
             cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
+            draw_route_heading_markers(
+                schematic,
+                app_state.route_points_cm,
+                robot_geometry_from_params(params),
+            )
 
     if app_state.selected_start_cm is not None:
         if app_state.robot_pose is not None:
@@ -2534,7 +3134,7 @@ def reset_detection_state(app_state: AppState) -> None:
     app_state.robot_topdown_px = None
     app_state.selected_ball_track_id = None
     app_state.selected_start_cm = None
-    app_state.route_points_cm = None
+    app_state.clear_route_cache()
     app_state.coordinate_smoother.reset()
 
 
@@ -2887,7 +3487,7 @@ def process_frame(
     app_state.latest_white_balls = white_balls
     app_state.latest_orange_balls = orange_balls
     app_state.latest_smoothed_ball_coordinates = smoothed_ball_coordinates
-    update_route_from_state(app_state)
+    update_route_from_state(app_state, params)
 
     annotated = annotate_camera_frame(
         frame_bgr=frame_bgr,

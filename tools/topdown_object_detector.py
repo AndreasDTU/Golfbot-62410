@@ -163,20 +163,17 @@ ROBOT_TUNED_FOOTPRINT_REAR_FROM_ORIGIN_CM = 10.1
 ROBOT_TUNED_TUBE_OFFSET_CM = 17.1
 ROBOT_TUNED_TUBE_RIGHT_OFFSET_CM = 0.0
 ROBOT_TUBE_WIDTH_CM = 6.0
-HYBRID_THETA_BINS = 32
+HYBRID_THETA_BINS = 36
 HYBRID_STEP_CM = 4.0
 HYBRID_GOAL_TOLERANCE_CM = 7.0
-HYBRID_MAX_EXPANSIONS = 30000
-HYBRID_TURN_DELTAS_RAD = (
-    math.radians(-22.5),
-    0.0,
-    math.radians(22.5),
+HYBRID_MAX_EXPANSIONS = 12000
+HYBRID_TRANSLATION_DIRECTIONS = (1.0,)
+HYBRID_ROTATION_DELTAS_RAD = (
+    math.radians(-10.0),
+    math.radians(10.0),
 )
-HYBRID_IN_PLACE_TURNS_RAD = (
-    math.radians(-22.5),
-    math.radians(22.5),
-)
-ROUTE_HEADING_MARKER_INTERVAL = 12
+HYBRID_IN_PLACE_ROTATION_COST = 1.1
+ROUTE_FOOTPRINT_MARKER_INTERVAL = 20
 ROUTE_TARGET_REACHED_CM = HYBRID_GOAL_TOLERANCE_CM
 ROUTE_TARGET_MOVE_INVALIDATE_CM = 5.0
 ROUTE_CROSSTRACK_INVALIDATE_CM = 14.0
@@ -276,16 +273,21 @@ class HybridPlannerConfig:
     ``step_cm`` controls translation primitive length, ``theta_bins`` controls
     the heading lattice resolution, and ``goal_tolerance_cm`` models ball
     collection by allowing the intake/origin trajectory to stop near the ball
-    rather than requiring a single exact grid cell.  The constants are kept
-    small and explicit because routing runs inside an interactive vision tool.
+    rather than requiring a single exact grid cell.
+
+    The robot is differential drive, so heading changes are modeled as pure
+    in-place rotations with zero translation.  Rotation is intentionally cheap
+    compared with detouring, because tank steering can reorient in tight spaces
+    without needing Ackermann-style turning arcs.
     """
 
     step_cm: float = HYBRID_STEP_CM
     theta_bins: int = HYBRID_THETA_BINS
     goal_tolerance_cm: float = HYBRID_GOAL_TOLERANCE_CM
     max_expansions: int = HYBRID_MAX_EXPANSIONS
-    turn_deltas_rad: tuple[float, ...] = HYBRID_TURN_DELTAS_RAD
-    in_place_turns_rad: tuple[float, ...] = HYBRID_IN_PLACE_TURNS_RAD
+    translation_directions: tuple[float, ...] = HYBRID_TRANSLATION_DIRECTIONS
+    rotation_deltas_rad: tuple[float, ...] = HYBRID_ROTATION_DELTAS_RAD
+    in_place_rotation_cost: float = HYBRID_IN_PLACE_ROTATION_COST
 
 
 class RobotFootprintCollisionChecker:
@@ -2177,27 +2179,31 @@ def reconstruct_hybrid_path(
 
 
 def expand_hybrid_neighbors(pose: HybridPose, config: HybridPlannerConfig) -> list[tuple[HybridPose, float]]:
-    """Generate deterministic forward-arc and in-place-turn motion primitives."""
+    """Generate deterministic differential-drive motion primitives.
+
+    Translation moves straight along the current heading and keeps ``theta``
+    fixed.  Reorientation is handled by pure rotation states with no
+    translation, matching the tank/skid-steer robot instead of assuming
+    Ackermann steering arcs.
+    """
     neighbors: list[tuple[HybridPose, float]] = []
 
-    for delta_theta in config.turn_deltas_rad:
-        next_theta = normalize_planner_angle(pose.theta_rad + delta_theta)
-        mid_theta = normalize_planner_angle(pose.theta_rad + delta_theta * 0.5)
+    for direction in config.translation_directions:
         next_pose = HybridPose(
-            x_cm=pose.x_cm + math.cos(mid_theta) * config.step_cm,
-            y_cm=pose.y_cm + math.sin(mid_theta) * config.step_cm,
-            theta_rad=next_theta,
+            x_cm=pose.x_cm + math.cos(pose.theta_rad) * config.step_cm * direction,
+            y_cm=pose.y_cm + math.sin(pose.theta_rad) * config.step_cm * direction,
+            theta_rad=pose.theta_rad,
         )
-        turn_penalty = abs(delta_theta) * 2.0
-        neighbors.append((next_pose, config.step_cm + turn_penalty))
+        reverse_penalty = 1.8 if direction < 0.0 else 1.0
+        neighbors.append((next_pose, config.step_cm * reverse_penalty))
 
-    for delta_theta in config.in_place_turns_rad:
+    for delta_theta in config.rotation_deltas_rad:
         next_pose = HybridPose(
             x_cm=pose.x_cm,
             y_cm=pose.y_cm,
             theta_rad=normalize_planner_angle(pose.theta_rad + delta_theta),
         )
-        neighbors.append((next_pose, config.step_cm * 0.55 + abs(delta_theta) * 2.0))
+        neighbors.append((next_pose, config.in_place_rotation_cost + abs(delta_theta) * 0.25))
 
     return neighbors
 
@@ -2213,11 +2219,15 @@ def hybrid_a_star_search(
 
     The planner keeps continuous centimeter poses but stores closed-set entries
     in 1 cm / fixed-heading bins.  Each neighbor is a short motion primitive:
-    straight, shallow left/right arcs, or an in-place turn for tight recovery.
-    A pose is accepted only if the oriented base polygon is collision-free
-    against the raw red-zone grid.  The goal test uses the intake mouth, not the
-    robot origin, so the route can intentionally bring the tube to the ball
-    while leaving the wider base in safe free space.
+    straight differential-drive translation or a pure in-place rotation.  A pose
+    is accepted only if the oriented base footprint is collision-free against
+    the raw red-zone grid.  The goal test uses the intake mouth, not the robot
+    origin, so the route can intentionally bring the tube to the ball while
+    leaving the wider base in safe free space.
+
+    ``max_expansions`` is a hard timeout guard.  If the target is trapped inside
+    red zones or otherwise unreachable, the search aborts and returns an empty
+    path so routing can try the next target without freezing the UI.
     """
     cfg = config or HybridPlannerConfig()
     collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry)
@@ -2365,14 +2375,13 @@ def build_greedy_route(
 ) -> RoutePlan:
     """Build an orange-first Hybrid A* collection route.
 
-    The orange ball has contest bonus value, so the planner first tries to
-    prove that at least one valid ``(x, y, theta)`` trajectory can bring the
-    intake to it.  If that search fails, the orange ball is treated as
-    unreachable for the current frame and removed from consideration; the route
-    then falls back to deterministic nearest-neighbor routing over the remaining
-    balls.  After the orange segment succeeds, the same nearest-reachable logic
-    continues from the final Hybrid A* pose, so route planning remains dynamic
-    and state-aware instead of being a fixed 2D point ordering.
+    Orange balls have contest bonus value.  The official field has one orange
+    ball, but test scenes may contain several, so all orange targets are sorted
+    by Euclidean distance and attempted before white-ball fallback.  If an
+    orange candidate hits the Hybrid A* expansion timeout or is otherwise
+    unreachable, the next closest orange is tried.  Only after all orange
+    options fail does the route fall back to deterministic nearest-reachable
+    greedy routing over the remaining balls.
     """
     if not ball_targets:
         return RoutePlan(points=[], active_target=None)
@@ -2383,18 +2392,19 @@ def build_greedy_route(
     route: list[HybridPose] = [current_pose]
     active_target: PlannedBallTarget | None = None
 
-    orange_targets = [target for target in unvisited if target.label == "orange"]
-    if orange_targets:
-        orange_target = min(
-            orange_targets,
-            key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
-        )
+    orange_targets = sorted(
+        [target for target in unvisited if target.label == "orange"],
+        key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
+    )
+    for orange_target in orange_targets:
         orange_segment = hybrid_a_star_search(grid, current_pose, orange_target.node_cm, geometry, cfg)
-        if orange_segment:
-            active_target = orange_target
-            route.extend(orange_segment[1:])
-            current_pose = orange_segment[-1]
         unvisited.remove(orange_target)
+        if not orange_segment:
+            continue
+        active_target = orange_target
+        route.extend(orange_segment[1:])
+        current_pose = orange_segment[-1]
+        break
 
     while unvisited:
         nearest_candidates = sorted(
@@ -2602,42 +2612,110 @@ def on_schematic_mouse(event: int, x: int, y: int, _flags: int, userdata: AppSta
     update_route_from_state(userdata)
 
 
-def draw_route_heading_markers(
+def robot_footprint_metric_polygons(
+    pose: HybridPose,
+    geometry: RobotGeometry,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Return base and intake rectangles in bottom-left field centimeters."""
+    forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
+    right = (math.sin(pose.theta_rad), -math.cos(pose.theta_rad))
+    half_width_cm = geometry.width_cm * 0.5
+    tube_half_width_cm = ROBOT_TUBE_WIDTH_CM * 0.5
+
+    front_center = (
+        pose.x_cm + forward[0] * geometry.front_cm,
+        pose.y_cm + forward[1] * geometry.front_cm,
+    )
+    rear_center = (
+        pose.x_cm - forward[0] * geometry.rear_cm,
+        pose.y_cm - forward[1] * geometry.rear_cm,
+    )
+    tube_front = (
+        pose.x_cm + forward[0] * geometry.tube_forward_cm + right[0] * geometry.tube_right_cm,
+        pose.y_cm + forward[1] * geometry.tube_forward_cm + right[1] * geometry.tube_right_cm,
+    )
+    tube_rear = (
+        front_center[0] + right[0] * geometry.tube_right_cm,
+        front_center[1] + right[1] * geometry.tube_right_cm,
+    )
+
+    base = [
+        (front_center[0] + right[0] * half_width_cm, front_center[1] + right[1] * half_width_cm),
+        (front_center[0] - right[0] * half_width_cm, front_center[1] - right[1] * half_width_cm),
+        (rear_center[0] - right[0] * half_width_cm, rear_center[1] - right[1] * half_width_cm),
+        (rear_center[0] + right[0] * half_width_cm, rear_center[1] + right[1] * half_width_cm),
+    ]
+    intake = [
+        (tube_front[0] + right[0] * tube_half_width_cm, tube_front[1] + right[1] * tube_half_width_cm),
+        (tube_front[0] - right[0] * tube_half_width_cm, tube_front[1] - right[1] * tube_half_width_cm),
+        (tube_rear[0] - right[0] * tube_half_width_cm, tube_rear[1] - right[1] * tube_half_width_cm),
+        (tube_rear[0] + right[0] * tube_half_width_cm, tube_rear[1] + right[1] * tube_half_width_cm),
+    ]
+    return base, intake
+
+
+def draw_robot_footprint_snapshot(
+    schematic: np.ndarray,
+    pose: HybridPose,
+    geometry: RobotGeometry,
+    alpha: float,
+    base_color: tuple[int, int, int],
+    intake_color: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    """Draw one stylized robot footprint snapshot for route orientation QA."""
+    base_cm, intake_cm = robot_footprint_metric_polygons(pose, geometry)
+    base_px = np.array([field_metric_cm_to_schematic(point) for point in base_cm], dtype=np.int32).reshape(-1, 1, 2)
+    intake_px = np.array([field_metric_cm_to_schematic(point) for point in intake_cm], dtype=np.int32).reshape(-1, 1, 2)
+    origin_px = field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
+    tube_px = field_metric_cm_to_schematic(tube_center_for_pose(pose, geometry))
+
+    overlay = schematic.copy()
+    cv2.fillPoly(overlay, [base_px], base_color, cv2.LINE_AA)
+    cv2.fillPoly(overlay, [intake_px], intake_color, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, schematic, 1.0 - alpha, 0.0, schematic)
+    cv2.polylines(schematic, [base_px], True, base_color, thickness, cv2.LINE_AA)
+    cv2.polylines(schematic, [intake_px], True, intake_color, max(1, thickness - 1), cv2.LINE_AA)
+    cv2.arrowedLine(schematic, origin_px, tube_px, intake_color, thickness, cv2.LINE_AA, tipLength=0.35)
+    cv2.circle(schematic, origin_px, max(3, thickness + 2), base_color, -1, cv2.LINE_AA)
+
+
+def draw_route_footprint_snapshots(
     schematic: np.ndarray,
     route: list[HybridPose],
     geometry: RobotGeometry,
-    interval: int = ROUTE_HEADING_MARKER_INTERVAL,
+    interval: int = ROUTE_FOOTPRINT_MARKER_INTERVAL,
 ) -> None:
-    """Draw sparse heading markers along a Hybrid A* trajectory.
+    """Draw light route footprints and a bold final pickup footprint.
 
-    The yellow polyline only shows translation.  These markers expose the third
-    Hybrid A* dimension by drawing a small base dot and an arrow from the robot
-    origin toward the intake mouth at regular samples along the cached route.
-    Sparse drawing keeps the UI readable and cheap even when the route contains
-    many motion primitives.
+    Waypoint snapshots expose both the base footprint and intake orientation
+    along the cached trajectory.  The final pose is drawn with stronger color
+    and thicker outlines so the pickup alignment can be checked visually
+    against the target ball and red-zone geometry.
     """
     if not route:
         return
 
-    sample_indices = list(range(0, len(route), max(1, interval)))
-    if sample_indices[-1] != len(route) - 1:
-        sample_indices.append(len(route) - 1)
-
-    for index in sample_indices:
-        pose = route[index]
-        origin_px = field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
-        tube_cm = tube_center_for_pose(pose, geometry)
-        tube_px = field_metric_cm_to_schematic(tube_cm)
-        cv2.circle(schematic, origin_px, 4, (255, 0, 255), -1, cv2.LINE_AA)
-        cv2.arrowedLine(
+    for index in range(0, max(0, len(route) - 1), max(1, interval)):
+        draw_robot_footprint_snapshot(
             schematic,
-            origin_px,
-            tube_px,
-            (255, 255, 0),
-            2,
-            cv2.LINE_AA,
-            tipLength=0.35,
+            route[index],
+            geometry,
+            alpha=0.18,
+            base_color=(255, 0, 255),
+            intake_color=(255, 255, 0),
+            thickness=1,
         )
+
+    draw_robot_footprint_snapshot(
+        schematic,
+        route[-1],
+        geometry,
+        alpha=0.48,
+        base_color=(255, 0, 255),
+        intake_color=(0, 255, 255),
+        thickness=3,
+    )
 
 
 def draw_schematic(
@@ -2714,7 +2792,7 @@ def draw_schematic(
         ).reshape((-1, 1, 2))
         if len(route_points) >= 2:
             cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
-            draw_route_heading_markers(
+            draw_route_footprint_snapshots(
                 schematic,
                 app_state.route_points_cm,
                 robot_geometry_from_params(params),
@@ -3587,7 +3665,13 @@ def run_raw_stream_mode(
     connect_robot: bool,
     resize_to_size: tuple[int, int] | None = None,
 ) -> int:
-    """Run live-style detection from any raw frame stream."""
+    """Run live-style detection from any raw frame stream.
+
+    Video mode supports pause/resume with Space or ``p``.  While paused, the
+    loop reuses the last rendered detector panels and does not read or process
+    new frames, so pause is useful both for visual inspection and for stopping
+    expensive planner updates on a specific frame.
+    """
     if not CALIBRATION_FILE.exists():
         print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
         return 1
@@ -3625,8 +3709,36 @@ def run_raw_stream_mode(
     cv2.setMouseCallback(SCHEMATIC_WINDOW_NAME, on_schematic_mouse, app_state)
     last_tick = time.perf_counter()
     resize_notice_shown = False
+    video_paused = False
+    paused_views: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
 
     while True:
+        if video_paused and mode_label == "Video" and paused_views is not None:
+            selector_view, combined, schematic, masks = paused_views
+            paused_combined = combined.copy()
+            cv2.putText(
+                paused_combined,
+                "PAUSED - press Space or p to resume",
+                (20, 62),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(MANUAL_SELECTOR_WINDOW_NAME, selector_view)
+            cv2.imshow(WINDOW_NAME, paused_combined)
+            cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
+            cv2.imshow(MASK_WINDOW_NAME, masks)
+            key = cv2.waitKeyEx(50)
+            ascii_key = display_key_code(key)
+            if handle_topdown_selection_key(ascii_key, selection_state, app_state):
+                break
+            if ascii_key in (ord(" "), ord("p")):
+                video_paused = False
+                last_tick = time.perf_counter()
+            continue
+
         raw_frame = initial_frame
         initial_frame = None
         if raw_frame is None:
@@ -3733,7 +3845,10 @@ def run_raw_stream_mode(
 
         cv2.putText(
             combined,
-            f"{mode_label} mode  Proc: {processing_ms:.1f} ms",
+            (
+                f"{mode_label} mode  Proc: {processing_ms:.1f} ms"
+                + ("  Space/p: pause" if mode_label == "Video" else "")
+            ),
             (20, combined.shape[0] - 20),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -3746,11 +3861,16 @@ def run_raw_stream_mode(
         cv2.imshow(WINDOW_NAME, combined)
         cv2.imshow(SCHEMATIC_WINDOW_NAME, schematic)
         cv2.imshow(MASK_WINDOW_NAME, masks)
+        if mode_label == "Video":
+            paused_views = (selector_view.copy(), combined.copy(), schematic.copy(), masks.copy())
         wait_ms = max(1, frame_delay_ms - int(round(processing_ms)))
         key = cv2.waitKeyEx(wait_ms)
         ascii_key = display_key_code(key)
         if handle_topdown_selection_key(ascii_key, selection_state, app_state):
             break
+        if mode_label == "Video" and ascii_key in (ord(" "), ord("p")):
+            video_paused = True
+            continue
         handle_manual_robot_key(key, robot)
         if ascii_key == ord("w") and selection_state.transform_matrix is not None:
             save_heading_tuning_to_robot_calibration(

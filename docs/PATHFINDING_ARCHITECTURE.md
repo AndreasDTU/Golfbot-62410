@@ -27,11 +27,19 @@ The closed set discretizes states to 1 cm cells and a fixed number of heading
 bins. Neighbor expansion uses deterministic short motion primitives:
 
 - forward straight
-- forward left/right arcs
-- in-place left/right turns
+- pure in-place left/right rotations
 
 The returned route is a trajectory of `HybridPose` values, so downstream drive
 logic can follow both position and heading instead of only a polyline.
+
+The robot is differential drive. The planner therefore uses rotate-then-drive
+sequences instead of Ackermann-style steering arcs. In-place rotation has a low
+cost so the planner can reorient in tight spaces without inventing sweeping
+turns the drivetrain does not need.
+
+Search has a hard expansion cap. If the cap is hit, the target is treated as
+unreachable for the current planning pass and routing continues with the next
+candidate.
 
 ## Collision Model
 
@@ -73,20 +81,22 @@ expensive failure case on every video frame.
 
 ## Heading Visualization
 
-The schematic draws the route polyline plus sparse heading markers. Each marker
-shows a base dot and an arrow toward the intake mouth, making the `theta_rad`
-component of the Hybrid A* trajectory visible without overcrowding the view.
+The schematic draws the route polyline plus footprint snapshots. Light snapshots
+show the base and intake at regular waypoints, and the final pickup pose is
+highlighted strongly so intake alignment and base clearance can be checked
+against the target ball and red zones.
 
 ## Orange Ball Priority
 
 `build_greedy_route()` is state-aware:
 
-1. If an orange target exists, Hybrid A* tries to route to it first.
-2. If no valid orange trajectory exists in the current map, the orange target is
-   treated as unreachable for that planning pass.
-3. Routing then falls back to nearest-reachable greedy collection for the
+1. If orange targets exist, they are sorted by distance from the robot.
+2. Hybrid A* tries each orange target in nearest-first order.
+3. If no valid orange trajectory exists in the current map, those orange targets
+   are treated as unreachable for that planning pass.
+4. Routing then falls back to nearest-reachable greedy collection for the
    remaining balls.
-4. After the orange ball is reached, the same nearest-reachable logic continues
+5. After an orange ball is reached, the same nearest-reachable logic continues
    from the final `HybridPose`.
 
 The fallback never fabricates a route. Unreachable targets are skipped, and the

@@ -165,7 +165,7 @@ ROBOT_TUNED_TUBE_RIGHT_OFFSET_CM = 0.0
 ROBOT_TUBE_WIDTH_CM = 6.0
 HYBRID_THETA_BINS = 36
 HYBRID_STEP_CM = 4.0
-HYBRID_GOAL_TOLERANCE_CM = 7.0
+HYBRID_GOAL_TOLERANCE_CM = 4.0
 HYBRID_MAX_EXPANSIONS = 12000
 HYBRID_TRANSLATION_DIRECTIONS = (1.0,)
 HYBRID_ROTATION_DELTAS_RAD = (
@@ -297,7 +297,9 @@ class RobotFootprintCollisionChecker:
     speed, the checker converts that map once into a distance transform and each
     Hybrid A* candidate pose probes a small set of oriented circle centers.  A
     pose is valid when every safety-critical base circle is inside the field and
-    its distance to the nearest red cell is greater than its radius.
+    its distance to the nearest red cell is at least its radius.  Equality is
+    allowed on purpose: the rules allow gentle grazing/touching, so only true
+    geometric overlap rejects a pose.
 
     Intake circles are modeled separately for visualization and future tuning,
     but red-zone clearance is still enforced on the wide base/wheelbase.  This
@@ -311,7 +313,7 @@ class RobotFootprintCollisionChecker:
         self.height = int(raw_red_grid.shape[0])
         self.width = int(raw_red_grid.shape[1])
         free_mask = (raw_red_grid == 0).astype(np.uint8)
-        self.distance_to_red = cv2.distanceTransform(free_mask, cv2.DIST_L2, 3)
+        self.distance_to_red = cv2.distanceTransform(free_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
         self.base_circles = self._build_base_circle_specs()
         self.intake_circles = self._build_intake_circle_specs()
 
@@ -401,7 +403,7 @@ class RobotFootprintCollisionChecker:
         return base, tube
 
     def is_pose_valid(self, pose: HybridPose) -> bool:
-        """Return true when all base circles are inside field bounds and red-free."""
+        """Return true when base circles have no strict red-zone intersection."""
         for x_grid, y_grid, radius_cm in self.oriented_circle_centers(pose, self.base_circles):
             if (
                 x_grid - radius_cm < 0.0
@@ -412,7 +414,7 @@ class RobotFootprintCollisionChecker:
                 return False
             x_index = int(np.clip(round(x_grid), 0, self.width - 1))
             y_index = int(np.clip(round(y_grid), 0, self.height - 1))
-            if float(self.distance_to_red[y_index, x_index]) <= radius_cm:
+            if float(self.distance_to_red[y_index, x_index]) < radius_cm:
                 return False
         return True
 
@@ -2146,7 +2148,7 @@ def hybrid_state_key(pose: HybridPose, theta_bins: int) -> tuple[int, int, int]:
 
 
 def tube_center_for_pose(pose: HybridPose, geometry: RobotGeometry) -> tuple[float, float]:
-    """Return the field-coordinate center of the intake mouth for ``pose``."""
+    """Return the field-coordinate pickup point at the intake tip for ``pose``."""
     forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
     right = (math.sin(pose.theta_rad), -math.cos(pose.theta_rad))
     return (
@@ -2155,10 +2157,56 @@ def tube_center_for_pose(pose: HybridPose, geometry: RobotGeometry) -> tuple[flo
     )
 
 
-def hybrid_goal_distance(pose: HybridPose, goal_node: tuple[int, int], geometry: RobotGeometry) -> float:
-    """Distance from the intake mouth to the target ball grid node."""
-    goal_x = float(goal_node[0])
-    goal_y = FIELD_HEIGHT_CM - float(goal_node[1])
+def goal_to_field_metric_cm(
+    goal_node: tuple[int, int],
+    goal_point_cm: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    """Return exact target field centimeters, falling back to a grid node."""
+    if goal_point_cm is not None:
+        return float(goal_point_cm[0]), float(goal_point_cm[1])
+    return float(goal_node[0]), FIELD_HEIGHT_CM - float(goal_node[1])
+
+
+def pickup_aligned_pose_for_theta(
+    goal_node: tuple[int, int],
+    theta_rad: float,
+    geometry: RobotGeometry,
+    goal_point_cm: tuple[float, float] | None = None,
+) -> HybridPose:
+    """Return the exact base pose whose intake tip lands on the ball.
+
+    For a centered intake this is exactly:
+
+    ``base_x = ball_x - cos(theta) * intake_length``
+    ``base_y = ball_y - sin(theta) * intake_length``
+
+    where ``intake_length`` is ``geometry.tube_forward_cm``, the tuned physical
+    distance from the robot pivot/origin to the pickup mechanism.  The exact
+    smoothed ball coordinate is used when available, avoiding the half-cell
+    error that would come from snapping the final pickup pose to a 1 cm grid
+    node.  If the live geometry has a non-zero lateral tube offset, that offset
+    is also subtracted so the same visualized pickup point still overlaps the
+    ball.
+    """
+    ball_x, ball_y = goal_to_field_metric_cm(goal_node, goal_point_cm)
+    forward = (math.cos(theta_rad), math.sin(theta_rad))
+    right = (math.sin(theta_rad), -math.cos(theta_rad))
+    intake_length_cm = geometry.tube_forward_cm
+    return HybridPose(
+        x_cm=ball_x - forward[0] * intake_length_cm - right[0] * geometry.tube_right_cm,
+        y_cm=ball_y - forward[1] * intake_length_cm - right[1] * geometry.tube_right_cm,
+        theta_rad=normalize_planner_angle(theta_rad),
+    )
+
+
+def hybrid_goal_distance(
+    pose: HybridPose,
+    goal_node: tuple[int, int],
+    geometry: RobotGeometry,
+    goal_point_cm: tuple[float, float] | None = None,
+) -> float:
+    """Distance from the pickup point at the intake tip to the target ball."""
+    goal_x, goal_y = goal_to_field_metric_cm(goal_node, goal_point_cm)
     tube_x, tube_y = tube_center_for_pose(pose, geometry)
     return math.hypot(goal_x - tube_x, goal_y - tube_y)
 
@@ -2214,6 +2262,7 @@ def hybrid_a_star_search(
     goal_node: tuple[int, int],
     geometry: RobotGeometry,
     config: HybridPlannerConfig | None = None,
+    goal_point_cm: tuple[float, float] | None = None,
 ) -> list[HybridPose]:
     """Search a kinematically valid trajectory in ``x, y, theta``.
 
@@ -2221,9 +2270,12 @@ def hybrid_a_star_search(
     in 1 cm / fixed-heading bins.  Each neighbor is a short motion primitive:
     straight differential-drive translation or a pure in-place rotation.  A pose
     is accepted only if the oriented base footprint is collision-free against
-    the raw red-zone grid.  The goal test uses the intake mouth, not the robot
-    origin, so the route can intentionally bring the tube to the ball while
-    leaving the wider base in safe free space.
+    the raw red-zone grid.  The goal test uses the pickup point at the intake
+    tip, not the robot origin.  Once the search gets within tolerance, the final
+    waypoint is snapped to the exact base pose
+    ``ball - heading * geometry.tube_forward_cm`` (plus any tuned lateral tube
+    offset), so the bold final footprint shows the intake directly over the
+    target ball.
 
     ``max_expansions`` is a hard timeout guard.  If the target is trapped inside
     red zones or otherwise unreachable, the search aborts and returns an empty
@@ -2243,7 +2295,7 @@ def hybrid_a_star_search(
     start_key = hybrid_state_key(start_pose, cfg.theta_bins)
     open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
     counter = 0
-    start_h = max(0.0, hybrid_goal_distance(start_pose, goal_node, geometry) - cfg.goal_tolerance_cm)
+    start_h = max(0.0, hybrid_goal_distance(start_pose, goal_node, geometry, goal_point_cm) - cfg.goal_tolerance_cm)
     heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
 
     came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
@@ -2257,8 +2309,15 @@ def hybrid_a_star_search(
             continue
 
         current_pose = pose_by_key[current_key]
-        if hybrid_goal_distance(current_pose, goal_node, geometry) <= cfg.goal_tolerance_cm:
-            return reconstruct_hybrid_path(came_from, pose_by_key, current_key)
+        if hybrid_goal_distance(current_pose, goal_node, geometry, goal_point_cm) <= cfg.goal_tolerance_cm:
+            path = reconstruct_hybrid_path(came_from, pose_by_key, current_key)
+            final_pose = pickup_aligned_pose_for_theta(goal_node, current_pose.theta_rad, geometry, goal_point_cm)
+            if collision_checker.is_pose_valid(final_pose):
+                if math.hypot(final_pose.x_cm - current_pose.x_cm, final_pose.y_cm - current_pose.y_cm) > 1e-6:
+                    path.append(final_pose)
+                else:
+                    path[-1] = final_pose
+                return path
 
         expansions += 1
         for neighbor_pose, primitive_cost in expand_hybrid_neighbors(current_pose, cfg):
@@ -2278,7 +2337,10 @@ def hybrid_a_star_search(
             came_from[neighbor_key] = current_key
             pose_by_key[neighbor_key] = neighbor_pose
             g_score[neighbor_key] = tentative_g
-            heuristic = max(0.0, hybrid_goal_distance(neighbor_pose, goal_node, geometry) - cfg.goal_tolerance_cm)
+            heuristic = max(
+                0.0,
+                hybrid_goal_distance(neighbor_pose, goal_node, geometry, goal_point_cm) - cfg.goal_tolerance_cm,
+            )
             heading_change = abs(normalize_planner_angle(neighbor_pose.theta_rad - current_pose.theta_rad))
             counter += 1
             heapq.heappush(
@@ -2397,7 +2459,14 @@ def build_greedy_route(
         key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
     )
     for orange_target in orange_targets:
-        orange_segment = hybrid_a_star_search(grid, current_pose, orange_target.node_cm, geometry, cfg)
+        orange_segment = hybrid_a_star_search(
+            grid,
+            current_pose,
+            orange_target.node_cm,
+            geometry,
+            cfg,
+            goal_point_cm=(orange_target.x_cm, orange_target.y_cm),
+        )
         unvisited.remove(orange_target)
         if not orange_segment:
             continue
@@ -2415,7 +2484,14 @@ def build_greedy_route(
         chosen_segment: list[HybridPose] = []
 
         for candidate in nearest_candidates:
-            segment = hybrid_a_star_search(grid, current_pose, candidate.node_cm, geometry, cfg)
+            segment = hybrid_a_star_search(
+                grid,
+                current_pose,
+                candidate.node_cm,
+                geometry,
+                cfg,
+                goal_point_cm=(candidate.x_cm, candidate.y_cm),
+            )
             if segment:
                 chosen_target = candidate
                 chosen_segment = segment

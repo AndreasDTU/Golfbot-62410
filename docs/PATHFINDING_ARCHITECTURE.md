@@ -57,9 +57,27 @@ Each base circle then performs a constant-time lookup against that map. Only the
 base circles are safety-critical for red-zone clearance. This is intentional:
 the intake is allowed to approach red borders so the robot can reach edge balls,
 but the wheelbase must stay inside the field and outside raw red occupancy.
+Touching is allowed. A base circle rejects a pose only when its distance to the
+nearest red cell is strictly less than its radius, so grazing walls or the
+center cross does not create an artificial safety-margin failure.
 
 This keeps clearance deterministic and orientation-aware without adding runtime
 geometry dependencies beyond OpenCV and NumPy.
+
+## Pickup Offset
+
+The route goal is the intake tip, not the robot origin. Once Hybrid A* finds a
+feasible approach heading near a ball, the final waypoint is snapped to the
+exact base-center pose:
+
+```text
+base_target_x = ball_x - cos(theta) * intake_length
+base_target_y = ball_y - sin(theta) * intake_length
+```
+
+`intake_length` is the tuned `tube_forward_cm`, the physical pivot-to-pickup
+distance. If a lateral tube offset is tuned, it is also subtracted so the
+visualized pickup point still lands on the ball.
 
 ## Route Cache
 

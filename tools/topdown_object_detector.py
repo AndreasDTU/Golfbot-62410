@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect red zones, white balls, and one orange ball in a top-down arena view.
+"""Detect objects, track the robot, plan routes, and dispatch wheel commands.
 
 This tool supports three input modes:
 1. Still image input for repeatable offline tuning.
@@ -14,12 +14,15 @@ The script intentionally keeps the detection pipeline simple and deterministic:
 - HSV thresholding for red zones
 - YOLOv8 inference for ball-like objects
 - Hybrid A* routing in ``(x, y, theta)`` over the already-built top-down map
+- Cross-track/heading tracking against the cached route
+- Direct non-blocking wheel-speed dispatch for the physical robot
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import socket
 from collections import deque
 from enum import Enum
 import heapq
@@ -39,9 +42,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from robot.controller import RobotController
-
-
 FIELD_WIDTH_CM = 167.0
 FIELD_HEIGHT_CM = 121.5
 FIELD_GRID_WIDTH_CM = int(round(FIELD_WIDTH_CM))
@@ -59,7 +59,17 @@ CONTROL_FILTER_WINDOW_NAME = "HSV Controls - Filters"
 CONTROL_GEOMETRY_WINDOW_NAME = "HSV Controls - Geometry"
 MANUAL_SELECTOR_WINDOW_NAME = "Manual Top-Down Selector"
 CONTROL_WINDOW_SIZE = (420, 520)
-ROBOT_IP = "192.168.0.42"
+ROBOT_IP = "192.168.1.42"
+ROBOT_UDP_PORT = 5556
+ROBOT_COMMAND_FORMAT = "LR {left:.1f} {right:.1f}"
+MAX_CROSS_TRACK_ERROR_CM = 8.0
+CONTROL_BASE_SPEED_PCT = 38.0
+CONTROL_MAX_SPEED_PCT = 80.0
+CONTROL_HEADING_KP = 38.0
+CONTROL_XTE_KP = 2.2
+CONTROL_MAX_HEADING_FOR_FORWARD_RAD = math.radians(70.0)
+CONTROL_MIN_SEND_INTERVAL_S = 0.02
+CONTROL_COMMAND_DEADBAND_PCT = 1.0
 MANUAL_MOVE_UNITS = 5
 MANUAL_MOVE_SPEED = 40
 MANUAL_TURN_DEGREES = 15
@@ -203,6 +213,18 @@ class CalibrationState(Enum):
     CALIBRATED_MANUAL = "calibrated_manual"
 
 
+class DriveControlState(Enum):
+    """Master-controller dispatch state shown in the detector overlay."""
+
+    DISABLED = "DISABLED"
+    NO_POSE = "NO POSE"
+    NO_ROUTE = "NO ROUTE"
+    TRACKING = "TRACKING"
+    REPLANNING = "REPLANNING -> MOTORS HALTED"
+    STOPPED = "STOPPED"
+    DISPATCH_ERROR = "DISPATCH ERROR"
+
+
 @dataclass(frozen=True)
 class RobotPose:
     """Robot origin and pickup tube pose in field coordinates with bottom-left cm origin."""
@@ -266,6 +288,117 @@ class RoutePlan:
     points: list[HybridPose]
     active_target: PlannedBallTarget | None
     pickup_poses: list[HybridPose]
+
+
+@dataclass(frozen=True)
+class RouteTrackingError:
+    """Closest-segment tracking error between live robot pose and cached route."""
+
+    xte_cm: float
+    signed_xte_cm: float
+    heading_error_rad: float
+    closest_point_cm: tuple[float, float]
+    segment_heading_rad: float
+    segment_index: int
+
+
+@dataclass(frozen=True)
+class WheelCommand:
+    """Bounded differential-drive wheel command in speed percent units."""
+
+    left_pct: float
+    right_pct: float
+
+
+@dataclass
+class DriveRuntime:
+    """Live master-controller state shared by control, dispatch, and overlays."""
+
+    enabled: bool
+    dispatcher: "UdpWheelDispatcher | None" = None
+    state: DriveControlState = DriveControlState.DISABLED
+    last_error: RouteTrackingError | None = None
+    last_command: WheelCommand = field(default_factory=lambda: WheelCommand(0.0, 0.0))
+    last_message: str = ""
+    suppress_dispatch_this_frame: bool = False
+
+    def stop(self, state: DriveControlState, message: str = "") -> None:
+        """Send a deterministic zero-speed command and update overlay state."""
+        previous_command = self.last_command
+        previous_state = self.state
+        self.state = state
+        self.last_message = message
+        self.last_command = WheelCommand(0.0, 0.0)
+        if self.dispatcher is not None:
+            force = (
+                previous_state != state
+                or abs(previous_command.left_pct) > 1e-6
+                or abs(previous_command.right_pct) > 1e-6
+            )
+            self.dispatcher.send_wheel_speeds(0.0, 0.0, force=force)
+
+
+class UdpWheelDispatcher:
+    """Non-blocking UDP wheel-speed dispatcher for the robot microcontroller.
+
+    The OpenCV loop must never wait for network acknowledgements.  UDP sends are
+    therefore best-effort and rate-limited; command validation happens locally
+    before bytes leave this process.  Configure ``ROBOT_IP``/``ROBOT_UDP_PORT``
+    and make the robot firmware accept messages matching
+    ``ROBOT_COMMAND_FORMAT``.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        command_format: str,
+        min_send_interval_s: float = CONTROL_MIN_SEND_INTERVAL_S,
+    ) -> None:
+        self.address = (host, port)
+        self.command_format = command_format
+        self.min_send_interval_s = min_send_interval_s
+        self.last_send_time = 0.0
+        self.last_sent: tuple[float, float] | None = None
+        self.last_error = ""
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+
+    def close(self) -> None:
+        """Close the UDP socket after sending the final stop command."""
+        self.sock.close()
+
+    def send_wheel_speeds(self, left_pct: float, right_pct: float, force: bool = False) -> bool:
+        """Validate and dispatch one left/right wheel command without blocking."""
+        if not (math.isfinite(left_pct) and math.isfinite(right_pct)):
+            self.last_error = "non-finite wheel command rejected"
+            return False
+
+        left = float(np.clip(left_pct, -CONTROL_MAX_SPEED_PCT, CONTROL_MAX_SPEED_PCT))
+        right = float(np.clip(right_pct, -CONTROL_MAX_SPEED_PCT, CONTROL_MAX_SPEED_PCT))
+        now = time.perf_counter()
+        if (
+            not force
+            and self.last_sent is not None
+            and now - self.last_send_time < self.min_send_interval_s
+            and abs(left - self.last_sent[0]) < CONTROL_COMMAND_DEADBAND_PCT
+            and abs(right - self.last_sent[1]) < CONTROL_COMMAND_DEADBAND_PCT
+        ):
+            return True
+
+        payload = self.command_format.format(left=left, right=right).encode("ascii")
+        try:
+            self.sock.sendto(payload, self.address)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError as exc:
+            self.last_error = str(exc)
+            return False
+
+        self.last_send_time = now
+        self.last_sent = (left, right)
+        self.last_error = ""
+        return True
 
 
 @dataclass(frozen=True)
@@ -1425,6 +1558,11 @@ def parse_args() -> argparse.Namespace:
             "before undistortion if the recording resolution differs."
         ),
     )
+    parser.add_argument(
+        "--drive",
+        action="store_true",
+        help="Enable non-blocking UDP dispatch of autonomous left/right wheel speeds.",
+    )
     return parser.parse_args()
 
 
@@ -2524,6 +2662,70 @@ def nearest_route_distance_cm(pose: HybridPose, route: list[HybridPose]) -> floa
     return min(math.hypot(pose.x_cm - point.x_cm, pose.y_cm - point.y_cm) for point in route)
 
 
+def compute_route_tracking_error(robot_pose: RobotPose, route: list[HybridPose]) -> RouteTrackingError | None:
+    """Project the live robot pose onto the closest cached route segment.
+
+    XTE is the shortest perpendicular distance to a segment, not just the
+    nearest sampled Hybrid A* state.  The signed value is positive when the
+    robot is left of the segment direction in field coordinates.
+    """
+    if len(route) < 2:
+        return None
+
+    rx = float(robot_pose.x_cm)
+    ry = float(robot_pose.y_cm)
+    best: RouteTrackingError | None = None
+    best_distance = float("inf")
+
+    for index in range(len(route) - 1):
+        start = route[index]
+        end = route[index + 1]
+        sx, sy = float(start.x_cm), float(start.y_cm)
+        vx = float(end.x_cm - start.x_cm)
+        vy = float(end.y_cm - start.y_cm)
+        segment_len_sq = vx * vx + vy * vy
+        if segment_len_sq <= 1e-9:
+            continue
+
+        projection = ((rx - sx) * vx + (ry - sy) * vy) / segment_len_sq
+        clamped = float(np.clip(projection, 0.0, 1.0))
+        cx = sx + vx * clamped
+        cy = sy + vy * clamped
+        dx = rx - cx
+        dy = ry - cy
+        distance = math.hypot(dx, dy)
+        if distance >= best_distance:
+            continue
+
+        segment_heading = math.atan2(vy, vx)
+        cross = vx * (ry - sy) - vy * (rx - sx)
+        signed_distance = math.copysign(distance, cross) if abs(cross) > 1e-9 else 0.0
+        best_distance = distance
+        best = RouteTrackingError(
+            xte_cm=distance,
+            signed_xte_cm=signed_distance,
+            heading_error_rad=normalize_planner_angle(segment_heading - robot_pose.heading_rad),
+            closest_point_cm=(cx, cy),
+            segment_heading_rad=segment_heading,
+            segment_index=index,
+        )
+
+    return best
+
+
+def compute_wheel_command(error: RouteTrackingError) -> WheelCommand:
+    """Translate route tracking error into bounded differential-drive speeds."""
+    heading_error = float(
+        np.clip(error.heading_error_rad, -CONTROL_MAX_HEADING_FOR_FORWARD_RAD, CONTROL_MAX_HEADING_FOR_FORWARD_RAD)
+    )
+    forward_scale = max(0.0, 1.0 - abs(heading_error) / CONTROL_MAX_HEADING_FOR_FORWARD_RAD)
+    base_speed = CONTROL_BASE_SPEED_PCT * forward_scale
+    turn_speed = CONTROL_HEADING_KP * heading_error - CONTROL_XTE_KP * error.signed_xte_cm
+    left = float(np.clip(base_speed - turn_speed, -CONTROL_MAX_SPEED_PCT, CONTROL_MAX_SPEED_PCT))
+    right = float(np.clip(base_speed + turn_speed, -CONTROL_MAX_SPEED_PCT, CONTROL_MAX_SPEED_PCT))
+    return WheelCommand(left, right)
+
+
 def ball_cache_signature(
     smoothed_balls: list[SmoothedBallCoordinate],
 ) -> tuple[tuple[int, str, int, int], ...]:
@@ -2673,6 +2875,85 @@ def update_route_from_state(app_state: AppState, params: dict[str, object] | Non
         app_state.route_cache_target_id = route_plan.active_target.track_id
         app_state.route_cache_target_label = route_plan.active_target.label
         app_state.route_cache_target_cm = (route_plan.active_target.x_cm, route_plan.active_target.y_cm)
+
+
+def update_integrated_drive_control(
+    app_state: AppState,
+    drive_runtime: DriveRuntime | None,
+    params: dict[str, object] | None,
+) -> None:
+    """Run the master-controller step after perception and route-cache update."""
+    if drive_runtime is None:
+        return
+    if drive_runtime.suppress_dispatch_this_frame:
+        drive_runtime.suppress_dispatch_this_frame = False
+        return
+    if not drive_runtime.enabled:
+        drive_runtime.stop(DriveControlState.DISABLED, "dry run")
+        return
+    if app_state.robot_pose is None:
+        app_state.clear_route_cache()
+        drive_runtime.last_error = None
+        drive_runtime.stop(DriveControlState.NO_POSE, "robot marker missing")
+        return
+    if not app_state.route_points_cm or len(app_state.route_points_cm) < 2:
+        drive_runtime.last_error = None
+        drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for route")
+        return
+
+    tracking_error = compute_route_tracking_error(app_state.robot_pose, app_state.route_points_cm)
+    drive_runtime.last_error = tracking_error
+    if tracking_error is None:
+        drive_runtime.stop(DriveControlState.NO_ROUTE, "route has no usable segment")
+        return
+
+    if tracking_error.xte_cm > MAX_CROSS_TRACK_ERROR_CM:
+        drive_runtime.stop(
+            DriveControlState.REPLANNING,
+            f"XTE {tracking_error.xte_cm:.1f}cm > {MAX_CROSS_TRACK_ERROR_CM:.1f}cm",
+        )
+        app_state.clear_route_cache()
+        update_route_from_state(app_state, params)
+        return
+
+    command = compute_wheel_command(tracking_error)
+    drive_runtime.last_command = command
+    if drive_runtime.dispatcher is None:
+        drive_runtime.state = DriveControlState.DISABLED
+        drive_runtime.last_message = "no dispatcher"
+        return
+
+    dispatched = drive_runtime.dispatcher.send_wheel_speeds(command.left_pct, command.right_pct)
+    if dispatched:
+        drive_runtime.state = DriveControlState.TRACKING
+        drive_runtime.last_message = ""
+    else:
+        drive_runtime.state = DriveControlState.DISPATCH_ERROR
+        drive_runtime.last_message = drive_runtime.dispatcher.last_error
+        drive_runtime.last_command = WheelCommand(0.0, 0.0)
+
+
+def enforce_xte_guard_before_replan(app_state: AppState, drive_runtime: DriveRuntime | None) -> None:
+    """Stop on excessive XTE before the cache has a chance to replan."""
+    if (
+        drive_runtime is None
+        or app_state.robot_pose is None
+        or not app_state.route_points_cm
+        or len(app_state.route_points_cm) < 2
+    ):
+        return
+
+    tracking_error = compute_route_tracking_error(app_state.robot_pose, app_state.route_points_cm)
+    if tracking_error is None or tracking_error.xte_cm <= MAX_CROSS_TRACK_ERROR_CM:
+        return
+
+    drive_runtime.last_error = tracking_error
+    drive_runtime.stop(
+        DriveControlState.REPLANNING,
+        f"XTE {tracking_error.xte_cm:.1f}cm > {MAX_CROSS_TRACK_ERROR_CM:.1f}cm",
+    )
+    drive_runtime.suppress_dispatch_this_frame = True
+    app_state.clear_route_cache()
 
 
 def on_schematic_mouse(event: int, x: int, y: int, _flags: int, userdata: AppState) -> None:
@@ -2848,6 +3129,58 @@ def draw_pickup_footprints(
         )
 
 
+def draw_control_xte_on_schematic(schematic: np.ndarray, app_state: AppState, drive_runtime: DriveRuntime | None) -> None:
+    """Draw the closest-route projection used by the local controller."""
+    if drive_runtime is None or drive_runtime.last_error is None or app_state.robot_pose is None:
+        return
+    robot_px = field_metric_cm_to_schematic((app_state.robot_pose.x_cm, app_state.robot_pose.y_cm))
+    closest_px = field_metric_cm_to_schematic(drive_runtime.last_error.closest_point_cm)
+    cv2.line(schematic, robot_px, closest_px, (0, 165, 255), 3, cv2.LINE_AA)
+    cv2.circle(schematic, closest_px, 6, (0, 165, 255), -1, cv2.LINE_AA)
+
+
+def draw_control_xte_on_topdown(frame: np.ndarray, app_state: AppState, drive_runtime: DriveRuntime | None) -> None:
+    """Draw XTE as a robot-to-route line in the annotated top-down camera view."""
+    if drive_runtime is None or drive_runtime.last_error is None or app_state.robot_pose is None:
+        return
+    robot_px = tuple(int(round(v)) for v in field_cm_to_topdown_pixel((app_state.robot_pose.x_cm, app_state.robot_pose.y_cm)))
+    closest_px = tuple(int(round(v)) for v in field_cm_to_topdown_pixel(drive_runtime.last_error.closest_point_cm))
+    cv2.line(frame, robot_px, closest_px, (0, 165, 255), 3, cv2.LINE_AA)
+    cv2.circle(frame, closest_px, 6, (0, 165, 255), -1, cv2.LINE_AA)
+
+
+def draw_drive_status(frame: np.ndarray, drive_runtime: DriveRuntime | None) -> None:
+    """Draw live XTE, heading error, and wheel dispatch state on the output view."""
+    if drive_runtime is None:
+        return
+
+    command = drive_runtime.last_command
+    lines = [
+        f"State: {drive_runtime.state.value}",
+        f"Motor: L={command.left_pct:.0f} R={command.right_pct:.0f}",
+    ]
+    if drive_runtime.last_error is not None:
+        lines.append(
+            f"XTE: {drive_runtime.last_error.xte_cm:.1f} cm  "
+            f"Head err: {math.degrees(drive_runtime.last_error.heading_error_rad):.1f} deg"
+        )
+    if drive_runtime.last_message:
+        lines.append(drive_runtime.last_message[:70])
+
+    y0 = frame.shape[0] - 112
+    for index, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (20, max(24, y0 + index * 24)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
 def draw_schematic(
     frame_shape: tuple[int, int, int],
     red_zones: list[RedZoneDetection],
@@ -2855,6 +3188,7 @@ def draw_schematic(
     camera_center_pixels: tuple[float, float],
     app_state: AppState,
     params: dict[str, object] | None = None,
+    drive_runtime: DriveRuntime | None = None,
 ) -> np.ndarray:
     """Draw a clean synthetic field view containing only the detected objects."""
     source_height, source_width = frame_shape[:2]
@@ -2997,6 +3331,8 @@ def draw_schematic(
             2,
             cv2.LINE_AA,
         )
+
+    draw_control_xte_on_schematic(schematic, app_state, drive_runtime)
 
     camera_center_schematic = map_point_between_frames(
         (int(round(camera_center_pixels[0])), int(round(camera_center_pixels[1]))),
@@ -3478,48 +3814,22 @@ def display_key_code(key: int) -> int:
     return key & 0xFF
 
 
-def connect_robot_controller(robot_ip: str) -> RobotController | None:
-    """Connect to the EV3 without making vision startup depend on robot availability."""
-    try:
-        robot = RobotController(robot_ip)
-    except OSError as exc:
-        print(f"Robot unavailable at {robot_ip}: {exc}", file=sys.stderr)
-        return None
-    except Exception as exc:
-        print(f"Robot controller initialization failed at {robot_ip}: {exc}", file=sys.stderr)
-        return None
-    print(f"Robot controller connected at {robot_ip}")
-    return robot
-
-
-def send_robot_command(robot: RobotController | None, command_name: str, *args: object) -> None:
-    """Run one robot command if the controller is connected."""
-    if robot is None:
+def handle_manual_robot_key(key: int, drive_runtime: DriveRuntime | None) -> None:
+    """Map keyboard controls to direct non-blocking wheel-speed commands."""
+    if drive_runtime is None or drive_runtime.dispatcher is None:
         return
-    try:
-        getattr(robot, command_name)(*args)
-    except Exception as exc:
-        print(f"Robot command failed ({command_name}): {exc}", file=sys.stderr)
-
-
-def handle_manual_robot_key(key: int, robot: RobotController | None) -> None:
-    """Map keyboard controls to small non-blocking robot increments."""
     if key in KEY_UP_ARROW:
-        send_robot_command(robot, "move", MANUAL_MOVE_UNITS, MANUAL_MOVE_SPEED)
+        drive_runtime.dispatcher.send_wheel_speeds(MANUAL_MOVE_SPEED, MANUAL_MOVE_SPEED, force=True)
     elif key in KEY_DOWN_ARROW:
-        send_robot_command(robot, "move", -MANUAL_MOVE_UNITS, MANUAL_MOVE_SPEED)
+        drive_runtime.dispatcher.send_wheel_speeds(-MANUAL_MOVE_SPEED, -MANUAL_MOVE_SPEED, force=True)
     elif key in KEY_LEFT_ARROW:
-        send_robot_command(robot, "turn", -MANUAL_TURN_DEGREES, MANUAL_TURN_SPEED)
+        drive_runtime.dispatcher.send_wheel_speeds(-MANUAL_TURN_SPEED, MANUAL_TURN_SPEED, force=True)
     elif key in KEY_RIGHT_ARROW:
-        send_robot_command(robot, "turn", MANUAL_TURN_DEGREES, MANUAL_TURN_SPEED)
+        drive_runtime.dispatcher.send_wheel_speeds(MANUAL_TURN_SPEED, -MANUAL_TURN_SPEED, force=True)
     else:
         ascii_key = display_key_code(key)
         if ascii_key == ord(" "):
-            send_robot_command(robot, "stop")
-        elif ascii_key == ord("p"):
-            send_robot_command(robot, "pickup")
-        elif ascii_key == ord("d"):
-            send_robot_command(robot, "dropoff")
+            drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
 
 
 def draw_robot_calibration_status(
@@ -3668,11 +3978,12 @@ def process_frame(
     params: dict[str, object],
     fps: float,
     app_state: AppState,
+    drive_runtime: DriveRuntime | None = None,
     robot_runtime: RobotCalibrationRuntime | None = None,
     aruco_dictionary_obj: object | None = None,
     aruco_detector_obj: object | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run the full detection pass and build both output panels."""
+    """Run perception, route caching, integrated control, and output panels."""
     camera_center_pixels = (
         float(params["camera_center_x"]),
         float(params["camera_center_y"]),
@@ -3707,7 +4018,9 @@ def process_frame(
     app_state.latest_white_balls = white_balls
     app_state.latest_orange_balls = orange_balls
     app_state.latest_smoothed_ball_coordinates = smoothed_ball_coordinates
+    enforce_xte_guard_before_replan(app_state, drive_runtime)
     update_route_from_state(app_state, params)
+    update_integrated_drive_control(app_state, drive_runtime, params)
 
     annotated = annotate_camera_frame(
         frame_bgr=frame_bgr,
@@ -3727,6 +4040,7 @@ def process_frame(
             robot_runtime,
         )
         draw_robot_calibration_status(annotated, robot_runtime, app_state.robot_pose, params)
+    draw_control_xte_on_topdown(annotated, app_state, drive_runtime)
     schematic = draw_schematic(
         frame_shape=frame_bgr.shape,
         red_zones=red_zones,
@@ -3734,9 +4048,11 @@ def process_frame(
         camera_center_pixels=camera_center_pixels,
         app_state=app_state,
         params=params,
+        drive_runtime=drive_runtime,
     )
     masks = build_mask_preview(red_mask, ball_masks["white"], ball_masks["orange"])
     combined = np.hstack(resize_to_match_height(annotated, schematic))
+    draw_drive_status(combined, drive_runtime)
     return combined, masks, schematic
 
 
@@ -3804,10 +4120,10 @@ def run_raw_stream_mode(
     balance: float,
     mode_label: str,
     frame_delay_ms: int,
-    connect_robot: bool,
+    drive_enabled: bool,
     resize_to_size: tuple[int, int] | None = None,
 ) -> int:
-    """Run live-style detection from any raw frame stream.
+    """Run live-style detection and integrated control from any raw frame stream.
 
     Video mode supports pause/resume with Space or ``p``.  While paused, the
     loop reuses the last rendered detector panels and does not read or process
@@ -3829,7 +4145,16 @@ def run_raw_stream_mode(
         print(f"Could not read first frame from {source_name}", file=sys.stderr)
         return 1
 
-    robot = connect_robot_controller(ROBOT_IP) if connect_robot else None
+    dispatcher = (
+        UdpWheelDispatcher(ROBOT_IP, ROBOT_UDP_PORT, ROBOT_COMMAND_FORMAT)
+        if drive_enabled
+        else None
+    )
+    drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+    if drive_enabled:
+        print(f"Integrated drive dispatch enabled: UDP {ROBOT_IP}:{ROBOT_UDP_PORT}")
+    else:
+        print("Integrated drive controller running with dispatch disabled; motors stay halted.")
     app_state = AppState()
     aruco_dictionary, aruco_detector = build_aruco_detector()
     robot_runtime = RobotCalibrationRuntime(
@@ -3957,8 +4282,11 @@ def run_raw_stream_mode(
                 ),
                 app_state=app_state,
                 params=params,
+                drive_runtime=drive_runtime,
             )
             combined = np.hstack(resize_to_match_height(topdown_frame, schematic))
+            drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for top-down calibration")
+            draw_drive_status(combined, drive_runtime)
             cv2.putText(
                 combined,
                 (
@@ -3979,6 +4307,7 @@ def run_raw_stream_mode(
                 params,
                 fps=fps,
                 app_state=app_state,
+                drive_runtime=drive_runtime,
                 robot_runtime=robot_runtime,
                 aruco_dictionary_obj=aruco_dictionary,
                 aruco_detector_obj=aruco_detector,
@@ -4012,8 +4341,9 @@ def run_raw_stream_mode(
             break
         if mode_label == "Video" and ascii_key in (ord(" "), ord("p")):
             video_paused = True
+            drive_runtime.stop(DriveControlState.STOPPED, "video paused")
             continue
-        handle_manual_robot_key(key, robot)
+        handle_manual_robot_key(key, drive_runtime)
         if ascii_key == ord("w") and selection_state.transform_matrix is not None:
             save_heading_tuning_to_robot_calibration(
                 robot_runtime,
@@ -4032,12 +4362,20 @@ def run_raw_stream_mode(
                 TOPDOWN_WARP_SIZE,
             )
 
-    send_robot_command(robot, "stop")
+    drive_runtime.stop(DriveControlState.STOPPED, "shutdown")
+    if dispatcher is not None:
+        dispatcher.close()
     return 0
 
 
-def run_live_mode(camera_index: int, balance: float, width: int, height: int) -> int:
-    """Run live detection from the camera."""
+def run_live_mode(
+    camera_index: int,
+    balance: float,
+    width: int,
+    height: int,
+    drive_enabled: bool,
+) -> int:
+    """Run live detection, route tracking, and optional hardware dispatch."""
     if not CALIBRATION_FILE.exists():
         print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
         return 1
@@ -4060,14 +4398,19 @@ def run_live_mode(camera_index: int, balance: float, width: int, height: int) ->
             balance,
             "Live",
             1,
-            connect_robot=True,
+            drive_enabled=drive_enabled,
         )
     finally:
         cap.release()
 
 
-def run_video_mode(video_path: Path, balance: float, resize_to_calibration: bool) -> int:
-    """Replay a recorded camera video through the live detector pipeline."""
+def run_video_mode(
+    video_path: Path,
+    balance: float,
+    resize_to_calibration: bool,
+    drive_enabled: bool,
+) -> int:
+    """Replay recorded video through perception with hardware dispatch disabled by default."""
     if not video_path.exists():
         print(f"Video file not found: {video_path}", file=sys.stderr)
         return 1
@@ -4094,7 +4437,7 @@ def run_video_mode(video_path: Path, balance: float, resize_to_calibration: bool
             balance,
             "Video",
             frame_delay_ms,
-            connect_robot=False,
+            drive_enabled=drive_enabled,
             resize_to_size=resize_to_size,
         )
     finally:
@@ -4105,12 +4448,24 @@ def main() -> int:
     """Entrypoint used when the script is started from the terminal."""
     cv2.ocl.setUseOpenCL(False)
     args = parse_args()
+    drive_enabled = bool(args.drive)
 
     try:
         if args.live or USE_LIVE_FEED:
-            return run_live_mode(args.camera_index, args.balance, args.width, args.height)
+            return run_live_mode(
+                args.camera_index,
+                args.balance,
+                args.width,
+                args.height,
+                drive_enabled,
+            )
         if args.video is not None:
-            return run_video_mode(args.video, args.balance, args.resize_video_to_calibration)
+            return run_video_mode(
+                args.video,
+                args.balance,
+                args.resize_video_to_calibration,
+                drive_enabled,
+            )
         return run_image_mode(args.image)
     finally:
         cv2.destroyAllWindows()

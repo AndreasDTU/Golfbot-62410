@@ -89,6 +89,37 @@ reuses it while:
 - the intake has not reached the target
 - the robot remains close to the cached trajectory
 
+## Integrated Control
+
+`tools/topdown_object_detector.py` is now the master controller. The deprecated
+external `autonomous_navigator.py` flow is not required for closed-loop driving.
+After the required vision pipeline and Hybrid A* route update, the detector:
+
+- estimates the live robot pose from calibrated ArUco markers
+- projects the robot origin onto the closest cached Hybrid A* route segment
+- computes cross-track error (XTE) as the shortest segment distance
+- computes heading error against that segment heading
+- converts those errors into bounded left/right differential-drive speeds
+- dispatches the wheel-speed command directly to the robot microcontroller
+
+Dispatch uses best-effort non-blocking UDP so the OpenCV frame loop never waits
+for robot acknowledgements. The default command payload is:
+
+```text
+LR <left_speed_pct> <right_speed_pct>
+```
+
+The robot endpoint is configured in `topdown_object_detector.py` with
+`ROBOT_IP`, `ROBOT_UDP_PORT`, and `ROBOT_COMMAND_FORMAT`. The `--drive` flag is
+the only runtime switch for hardware dispatch. Without `--drive`, the controller
+still computes and visualizes XTE and motor commands, but no hardware packets
+are sent.
+
+If XTE exceeds `MAX_CROSS_TRACK_ERROR_CM` (8 cm by default), the detector sends
+a zero-speed STOP command, invalidates the cached route, and immediately runs a
+fresh Hybrid A* search from the deviated robot pose. Motor output resumes only
+after a valid route is cached again.
+
 When any of those checks fails, the cache is cleared and the next frame replans.
 This keeps the UI responsive while still reacting to target collection, target
 motion, and robot drift.

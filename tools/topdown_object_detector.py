@@ -24,7 +24,6 @@ import argparse
 import json
 import socket
 from collections import deque
-from enum import Enum
 import heapq
 import math
 import sys
@@ -36,6 +35,34 @@ from typing import Any
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+from pathfinding.models import (
+    HybridPlannerConfig,
+    HybridPose,
+    PlannedBallTarget,
+    RoutePlan,
+    RouteTrackingError,
+)
+from robot.models import (
+    DriveControlState,
+    DriveRuntime,
+    RobotCalibrationPhase,
+    RobotCalibrationRuntime,
+    RobotGeometry,
+    RobotMarkerObservation,
+    RobotPose,
+    WheelCommand,
+)
+from vision.models import (
+    BallDetection,
+    CalibrationState,
+    CameraGroundProjection,
+    HSVRange,
+    ParallaxConfig,
+    RedZoneDetection,
+    SmoothedBallCoordinate,
+    SmoothedCoordinateTrack,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -196,148 +223,6 @@ if not YOLO_MODEL_PATH.exists():
 YOLO_MODEL = YOLO(str(YOLO_MODEL_PATH))
 
 
-class RobotCalibrationPhase(Enum):
-    """Non-blocking robot origin calibration state."""
-
-    STATE_NORMAL = "normal"
-    STATE_CALIBRATING_SPIN = "calibrating_spin"
-    STATE_CALIBRATING_FORWARD = "calibrating_forward"
-
-
-class CalibrationState(Enum):
-    """Current top-down calibration mode."""
-
-    NEEDS_CALIBRATION = "needs_calibration"
-    CALIBRATED_AUTO = "calibrated_auto"
-    CALIBRATING_MANUAL = "calibrating_manual"
-    CALIBRATED_MANUAL = "calibrated_manual"
-
-
-class DriveControlState(Enum):
-    """Master-controller dispatch state shown in the detector overlay."""
-
-    DISABLED = "DISABLED"
-    NO_POSE = "NO POSE"
-    NO_ROUTE = "NO ROUTE"
-    TRACKING = "TRACKING"
-    REPLANNING = "REPLANNING -> MOTORS HALTED"
-    STOPPED = "STOPPED"
-    DISPATCH_ERROR = "DISPATCH ERROR"
-
-
-@dataclass(frozen=True)
-class RobotPose:
-    """Robot origin and pickup tube pose in field coordinates with bottom-left cm origin."""
-
-    x_cm: float
-    y_cm: float
-    heading_rad: float
-    tube_x_cm: float
-    tube_y_cm: float
-
-
-@dataclass(frozen=True)
-class RobotGeometry:
-    """Live-tunable robot drawing and pickup geometry in centimeters."""
-
-    width_cm: float
-    front_cm: float
-    rear_cm: float
-    tube_forward_cm: float
-    tube_right_cm: float
-
-
-@dataclass(frozen=True)
-class HybridPose:
-    """One planner state in bottom-left field coordinates.
-
-    The old planner only searched integer ``(x, y)`` grid cells.  Hybrid A*
-    keeps a continuous centimeter pose and a discretized heading key, so every
-    expansion can evaluate whether the robot can physically arrive at the next
-    pose with its current orientation.  ``theta_rad`` follows the rest of this
-    file: 0 points along +X and positive rotation points toward +Y.
-    """
-
-    x_cm: float
-    y_cm: float
-    theta_rad: float
-
-
-@dataclass(frozen=True)
-class PlannedBallTarget:
-    """Route target with enough metadata for orange-first prioritization."""
-
-    track_id: int
-    label: str
-    x_cm: float
-    y_cm: float
-    node_cm: tuple[int, int]
-
-
-@dataclass(frozen=True)
-class RoutePlan:
-    """Cached route plus pickup metadata for visualization and invalidation.
-
-    ``points`` is the continuous trajectory.  ``pickup_poses`` contains the
-    exact final base-center poses for every successful target segment in the
-    greedy route; these are the bold magenta footprints shown at ball pickup
-    locations.  Cache invalidation still keys off ``active_target``, the first
-    target the route is trying to collect.
-    """
-
-    points: list[HybridPose]
-    active_target: PlannedBallTarget | None
-    pickup_poses: list[HybridPose]
-
-
-@dataclass(frozen=True)
-class RouteTrackingError:
-    """Closest-segment tracking error between live robot pose and cached route."""
-
-    xte_cm: float
-    signed_xte_cm: float
-    heading_error_rad: float
-    closest_point_cm: tuple[float, float]
-    segment_heading_rad: float
-    segment_index: int
-
-
-@dataclass(frozen=True)
-class WheelCommand:
-    """Bounded differential-drive wheel command in speed percent units."""
-
-    left_pct: float
-    right_pct: float
-
-
-@dataclass
-class DriveRuntime:
-    """Live master-controller state shared by control, dispatch, and overlays."""
-
-    enabled: bool
-    dispatcher: "UdpWheelDispatcher | None" = None
-    state: DriveControlState = DriveControlState.DISABLED
-    last_error: RouteTrackingError | None = None
-    last_command: WheelCommand = field(default_factory=lambda: WheelCommand(0.0, 0.0))
-    last_message: str = ""
-    suppress_dispatch_this_frame: bool = False
-
-    def stop(self, state: DriveControlState, message: str = "") -> None:
-        """Send a deterministic zero-speed command and update overlay state."""
-        previous_command = self.last_command
-        previous_state = self.state
-        self.state = state
-        self.last_message = message
-        self.last_command = WheelCommand(0.0, 0.0)
-        if self.dispatcher is not None:
-            force = (
-                previous_state != state
-                or abs(previous_command.left_pct) > 1e-6
-                or abs(previous_command.right_pct) > 1e-6
-            )
-            self.dispatcher.send_wheel_speeds(0.0, 0.0, force=force)
-
-
 class UdpWheelDispatcher:
     """Non-blocking UDP wheel-speed dispatcher for the robot microcontroller.
 
@@ -399,30 +284,6 @@ class UdpWheelDispatcher:
         self.last_sent = (left, right)
         self.last_error = ""
         return True
-
-
-@dataclass(frozen=True)
-class HybridPlannerConfig:
-    """Deterministic Hybrid A* tuning values expressed in field centimeters.
-
-    ``step_cm`` controls translation primitive length, ``theta_bins`` controls
-    the heading lattice resolution, and ``goal_tolerance_cm`` models ball
-    collection by allowing the intake/origin trajectory to stop near the ball
-    rather than requiring a single exact grid cell.
-
-    The robot is differential drive, so heading changes are modeled as pure
-    in-place rotations with zero translation.  Rotation is intentionally cheap
-    compared with detouring, because tank steering can reorient in tight spaces
-    without needing Ackermann-style turning arcs.
-    """
-
-    step_cm: float = HYBRID_STEP_CM
-    theta_bins: int = HYBRID_THETA_BINS
-    goal_tolerance_cm: float = HYBRID_GOAL_TOLERANCE_CM
-    max_expansions: int = HYBRID_MAX_EXPANSIONS
-    translation_directions: tuple[float, ...] = HYBRID_TRANSLATION_DIRECTIONS
-    rotation_deltas_rad: tuple[float, ...] = HYBRID_ROTATION_DELTAS_RAD
-    in_place_rotation_cost: float = HYBRID_IN_PLACE_ROTATION_COST
 
 
 class RobotFootprintCollisionChecker:
@@ -552,111 +413,6 @@ class RobotFootprintCollisionChecker:
             if float(self.distance_to_red[y_index, x_index]) < radius_cm:
                 return False
         return True
-
-
-@dataclass(frozen=True)
-class ParallaxConfig:
-    """Geometry needed to project elevated points onto the ground plane."""
-
-    marker_height_cm: float
-    camera_height_cm: float
-    calibration_plane_height_cm: float
-    camera_center: np.ndarray
-
-
-@dataclass(frozen=True)
-class CameraGroundProjection:
-    """Camera ground projection in the warped top-down pixel plane."""
-
-    principal_point_px: np.ndarray
-    camera_center_px: np.ndarray
-
-
-@dataclass(frozen=True)
-class RobotMarkerObservation:
-    """Detected robot marker after strict parallax projection to the ground plane."""
-
-    marker_id: int
-    center: np.ndarray
-    ground_center: np.ndarray
-    corners: np.ndarray
-    ground_corners: np.ndarray
-    yaw_rad: float
-
-
-@dataclass
-class RobotCalibrationRuntime:
-    """Mutable robot calibration state used by the live detector loop."""
-
-    phase: RobotCalibrationPhase = RobotCalibrationPhase.STATE_NORMAL
-    calibration: dict[str, Any] | None = None
-    collected_points: dict[int, list[tuple[float, float]]] = field(
-        default_factory=lambda: {marker_id: [] for marker_id in ROBOT_MARKER_IDS}
-    )
-    fitted_centers: dict[int, tuple[float, float]] = field(default_factory=dict)
-    ellipse_ratios: dict[int, float] = field(default_factory=dict)
-    latest_observations: dict[int, RobotMarkerObservation] = field(default_factory=dict)
-    latest_parallax_config: ParallaxConfig | None = None
-    warning: str = ""
-
-
-@dataclass(frozen=True)
-class BallDetection:
-    """Ball-like object found in the frame."""
-
-    label: str
-    center: tuple[int, int]
-    corrected_center: tuple[int, int]
-    radius_px: int
-    contour: np.ndarray
-    area: float
-    circularity: float
-
-
-@dataclass(frozen=True)
-class RedZoneDetection:
-    """Detected red avoidance geometry."""
-
-    contour: np.ndarray
-    corrected_contour: np.ndarray
-    bounding_box: tuple[int, int, int, int]
-    center: tuple[int, int]
-    corrected_center: tuple[int, int]
-    area: float
-
-
-@dataclass(frozen=True)
-class HSVRange:
-    """Single HSV threshold range."""
-
-    lower: np.ndarray
-    upper: np.ndarray
-
-
-@dataclass(frozen=True)
-class SmoothedBallCoordinate:
-    """Smoothed field coordinate paired with the detection that produced it."""
-
-    track_id: int
-    label: str
-    center_px: tuple[int, int]
-    corrected_center_px: tuple[int, int]
-    radius_px: int
-    cm_x: float
-    cm_y: float
-
-
-@dataclass
-class SmoothedCoordinateTrack:
-    """Persistent smoothing state for one detected ball."""
-
-    label: str
-    x_cm: float
-    y_cm: float
-    history_x_cm: deque[float] = field(default_factory=lambda: deque(maxlen=5))
-    history_y_cm: deque[float] = field(default_factory=lambda: deque(maxlen=5))
-    stationary_frames: int = 0
-    missed_frames: int = 0
 
 
 class BallCoordinateSmoother:

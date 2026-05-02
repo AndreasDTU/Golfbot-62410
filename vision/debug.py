@@ -1,0 +1,384 @@
+"""Debug rendering helpers for top-down vision and route planning."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import cv2
+import numpy as np
+
+from pathfinding.models import HybridPose
+from pathfinding.planner import HybridAStarPlanner
+from robot.localization import RobotPoseEstimator
+from robot.models import DriveRuntime, RobotGeometry, RobotPose
+from vision.config import FieldConfig, RobotGeometryConfig, WindowConfig
+from vision.geometry import CoordinateMapper
+from vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinate
+
+
+class DebugRenderer:
+    """Draw camera overlays, masks, schematic panels, and route debug geometry."""
+
+    def __init__(
+        self,
+        field_config: FieldConfig | None = None,
+        window_config: WindowConfig | None = None,
+        robot_config: RobotGeometryConfig | None = None,
+        mapper: CoordinateMapper | None = None,
+    ) -> None:
+        self.field = field_config or FieldConfig()
+        self.window = window_config or WindowConfig()
+        self.robot_config = robot_config or RobotGeometryConfig()
+        self.mapper = mapper or CoordinateMapper(self.field, window_config=self.window)
+
+    def robot_geometry_from_params(self, params: dict[str, object] | None) -> RobotGeometry:
+        """Read live robot geometry, falling back to tuned defaults."""
+        return RobotPoseEstimator(self.field, self.robot_config, self.mapper).robot_geometry_from_params(params)
+
+    def robot_footprint_metric_polygons(
+        self,
+        pose: HybridPose,
+        geometry: RobotGeometry,
+    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Return base and intake rectangles in bottom-left field centimeters."""
+        forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
+        right = (math.sin(pose.theta_rad), -math.cos(pose.theta_rad))
+        half_width_cm = geometry.width_cm * 0.5
+        tube_half_width_cm = self.robot_config.tube_width_cm * 0.5
+
+        front_center = (
+            pose.x_cm + forward[0] * geometry.front_cm,
+            pose.y_cm + forward[1] * geometry.front_cm,
+        )
+        rear_center = (
+            pose.x_cm - forward[0] * geometry.rear_cm,
+            pose.y_cm - forward[1] * geometry.rear_cm,
+        )
+        tube_front = (
+            pose.x_cm + forward[0] * geometry.tube_forward_cm + right[0] * geometry.tube_right_cm,
+            pose.y_cm + forward[1] * geometry.tube_forward_cm + right[1] * geometry.tube_right_cm,
+        )
+        tube_rear = (
+            front_center[0] + right[0] * geometry.tube_right_cm,
+            front_center[1] + right[1] * geometry.tube_right_cm,
+        )
+
+        base = [
+            (front_center[0] + right[0] * half_width_cm, front_center[1] + right[1] * half_width_cm),
+            (front_center[0] - right[0] * half_width_cm, front_center[1] - right[1] * half_width_cm),
+            (rear_center[0] - right[0] * half_width_cm, rear_center[1] - right[1] * half_width_cm),
+            (rear_center[0] + right[0] * half_width_cm, rear_center[1] + right[1] * half_width_cm),
+        ]
+        intake = [
+            (tube_front[0] + right[0] * tube_half_width_cm, tube_front[1] + right[1] * tube_half_width_cm),
+            (tube_front[0] - right[0] * tube_half_width_cm, tube_front[1] - right[1] * tube_half_width_cm),
+            (tube_rear[0] - right[0] * tube_half_width_cm, tube_rear[1] - right[1] * tube_half_width_cm),
+            (tube_rear[0] + right[0] * tube_half_width_cm, tube_rear[1] + right[1] * tube_half_width_cm),
+        ]
+        return base, intake
+
+    def draw_robot_footprint_snapshot(
+        self,
+        schematic: np.ndarray,
+        pose: HybridPose,
+        geometry: RobotGeometry,
+        alpha: float,
+        base_color: tuple[int, int, int],
+        intake_color: tuple[int, int, int],
+        thickness: int,
+    ) -> None:
+        """Draw one stylized robot footprint snapshot for route orientation QA."""
+        base_cm, intake_cm = self.robot_footprint_metric_polygons(pose, geometry)
+        base_px = np.array([self.mapper.field_metric_cm_to_schematic(point) for point in base_cm], dtype=np.int32).reshape(-1, 1, 2)
+        intake_px = np.array([self.mapper.field_metric_cm_to_schematic(point) for point in intake_cm], dtype=np.int32).reshape(-1, 1, 2)
+        origin_px = self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
+        tube_px = self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.tube_center_for_pose(pose, geometry))
+
+        overlay = schematic.copy()
+        cv2.fillPoly(overlay, [base_px], base_color, cv2.LINE_AA)
+        cv2.fillPoly(overlay, [intake_px], intake_color, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, schematic, 1.0 - alpha, 0.0, schematic)
+        cv2.polylines(schematic, [base_px], True, base_color, thickness, cv2.LINE_AA)
+        cv2.polylines(schematic, [intake_px], True, intake_color, max(1, thickness - 1), cv2.LINE_AA)
+        cv2.arrowedLine(schematic, origin_px, tube_px, intake_color, thickness, cv2.LINE_AA, tipLength=0.35)
+        cv2.circle(schematic, origin_px, max(3, thickness + 2), base_color, -1, cv2.LINE_AA)
+
+    def draw_route_heading_indicators(
+        self,
+        schematic: np.ndarray,
+        route: list[HybridPose],
+        geometry: RobotGeometry,
+        interval: int = 20,
+    ) -> None:
+        """Draw cyan arrows showing heading along the trajectory."""
+        if not route:
+            return
+        for index in range(0, len(route), max(1, interval)):
+            pose = route[index]
+            origin_px = self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
+            tube_px = self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.tube_center_for_pose(pose, geometry))
+            cv2.arrowedLine(schematic, origin_px, tube_px, (255, 255, 0), 2, cv2.LINE_AA, tipLength=0.35)
+
+    def draw_pickup_footprints(
+        self,
+        schematic: np.ndarray,
+        pickup_poses: list[HybridPose],
+        geometry: RobotGeometry,
+    ) -> None:
+        """Draw bold footprints at every planned ball pickup pose."""
+        for pickup_pose in pickup_poses:
+            self.draw_robot_footprint_snapshot(
+                schematic,
+                pickup_pose,
+                geometry,
+                alpha=0.48,
+                base_color=(255, 0, 255),
+                intake_color=(0, 255, 255),
+                thickness=3,
+            )
+
+    def draw_control_xte_on_schematic(
+        self,
+        schematic: np.ndarray,
+        robot_pose: RobotPose | None,
+        drive_runtime: DriveRuntime | None,
+    ) -> None:
+        """Draw the closest-route projection used by the local controller."""
+        if drive_runtime is None or drive_runtime.last_error is None or robot_pose is None:
+            return
+        robot_px = self.mapper.field_metric_cm_to_schematic((robot_pose.x_cm, robot_pose.y_cm))
+        closest_px = self.mapper.field_metric_cm_to_schematic(drive_runtime.last_error.closest_point_cm)
+        cv2.line(schematic, robot_px, closest_px, (0, 165, 255), 3, cv2.LINE_AA)
+        cv2.circle(schematic, closest_px, 6, (0, 165, 255), -1, cv2.LINE_AA)
+
+    def draw_control_xte_on_topdown(
+        self,
+        frame: np.ndarray,
+        robot_pose: RobotPose | None,
+        drive_runtime: DriveRuntime | None,
+    ) -> None:
+        """Draw XTE as a robot-to-route line in the annotated top-down camera view."""
+        if drive_runtime is None or drive_runtime.last_error is None or robot_pose is None:
+            return
+        robot_px = tuple(int(round(v)) for v in self.mapper.field_cm_to_topdown_pixel((robot_pose.x_cm, robot_pose.y_cm)))
+        closest_px = tuple(int(round(v)) for v in self.mapper.field_cm_to_topdown_pixel(drive_runtime.last_error.closest_point_cm))
+        cv2.line(frame, robot_px, closest_px, (0, 165, 255), 3, cv2.LINE_AA)
+        cv2.circle(frame, closest_px, 6, (0, 165, 255), -1, cv2.LINE_AA)
+
+    def draw_drive_status(self, frame: np.ndarray, drive_runtime: DriveRuntime | None) -> None:
+        """Draw live XTE, heading error, and wheel dispatch state."""
+        if drive_runtime is None:
+            return
+        command = drive_runtime.last_command
+        lines = [
+            f"State: {drive_runtime.state.value}",
+            f"Motor: L={command.left_pct:.0f} R={command.right_pct:.0f}",
+        ]
+        if drive_runtime.last_error is not None:
+            lines.append(
+                f"XTE: {drive_runtime.last_error.xte_cm:.1f} cm  "
+                f"Head err: {math.degrees(drive_runtime.last_error.heading_error_rad):.1f} deg"
+            )
+        if drive_runtime.last_message:
+            lines.append(drive_runtime.last_message[:70])
+
+        y0 = frame.shape[0] - 112
+        for index, line in enumerate(lines):
+            cv2.putText(
+                frame,
+                line,
+                (20, max(24, y0 + index * 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+    def annotate_camera_frame(
+        self,
+        frame_bgr: np.ndarray,
+        red_zones: list[RedZoneDetection],
+        white_balls: list[BallDetection],
+        orange_balls: list[BallDetection],
+        fps: float,
+    ) -> np.ndarray:
+        """Draw detections and lightweight debug text on the camera image."""
+        annotated = frame_bgr.copy()
+        for zone in red_zones:
+            x, y, width, height = zone.bounding_box
+            cv2.drawContours(annotated, [zone.contour], -1, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.rectangle(annotated, (x, y), (x + width, y + height), (0, 80, 255), 1, cv2.LINE_AA)
+            cv2.putText(
+                annotated,
+                f"red {int(zone.area)}",
+                (x, max(20, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        for ball in white_balls:
+            cv2.circle(annotated, ball.center, ball.radius_px, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(annotated, ball.center, 2, (200, 200, 200), -1, cv2.LINE_AA)
+            cv2.putText(annotated, f"W c={ball.circularity:.2f}", (ball.center[0] + 10, ball.center[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+        for orange_ball in orange_balls:
+            cv2.circle(annotated, orange_ball.center, orange_ball.radius_px, (0, 140, 255), 2, cv2.LINE_AA)
+            cv2.circle(annotated, orange_ball.center, 2, (0, 180, 255), -1, cv2.LINE_AA)
+            cv2.putText(annotated, f"O c={orange_ball.circularity:.2f}", (orange_ball.center[0] + 10, orange_ball.center[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1, cv2.LINE_AA)
+        cv2.putText(annotated, f"FPS: {fps:.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+        return annotated
+
+    def build_mask_preview(self, red_mask: np.ndarray, white_mask: np.ndarray, orange_mask: np.ndarray) -> np.ndarray:
+        """Create a compact debug view for the segmentation stage."""
+        red_bgr = cv2.cvtColor(red_mask, cv2.COLOR_GRAY2BGR)
+        white_bgr = cv2.cvtColor(white_mask, cv2.COLOR_GRAY2BGR)
+        orange_bgr = cv2.cvtColor(orange_mask, cv2.COLOR_GRAY2BGR)
+        cv2.putText(red_bgr, "Red", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(white_bgr, "White YOLO", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(orange_bgr, "Orange YOLO", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2, cv2.LINE_AA)
+        return np.hstack((red_bgr, white_bgr, orange_bgr))
+
+    @staticmethod
+    def resize_to_match_height(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Resize the right panel so both panels can be stacked horizontally."""
+        target_height = left.shape[0]
+        if right.shape[0] == target_height:
+            return left, right
+        new_width = int(right.shape[1] * target_height / max(1, right.shape[0]))
+        resized = cv2.resize(right, (new_width, target_height), interpolation=cv2.INTER_LINEAR)
+        return left, resized
+
+    def make_topdown_placeholder(self, message: str) -> np.ndarray:
+        """Create a deterministic placeholder while the manual warp is not ready."""
+        width, height = self.mapper.camera.topdown_warp_size
+        placeholder = np.zeros((height, width, 3), dtype=np.uint8)
+        cv2.putText(placeholder, message, (30, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+        return placeholder
+
+    def draw_schematic(
+        self,
+        frame_shape: tuple[int, int, int],
+        red_zones: list[RedZoneDetection],
+        smoothed_ball_coordinates: list[SmoothedBallCoordinate],
+        camera_center_pixels: tuple[float, float],
+        route_points_cm: list[HybridPose] | None = None,
+        route_pickup_poses_cm: list[HybridPose] | None = None,
+        selected_start_cm: tuple[int, int] | None = None,
+        selected_ball_track_id: int | None = None,
+        robot_pose: RobotPose | None = None,
+        params: dict[str, object] | None = None,
+        drive_runtime: DriveRuntime | None = None,
+        num_intermediate_snapshots: int = 0,
+    ) -> np.ndarray:
+        """Draw a clean synthetic field view containing detected objects and route state."""
+        source_height, source_width = frame_shape[:2]
+        schematic = np.full(
+            (self.window.schematic_height_px, self.window.schematic_width_px, 3),
+            (40, 100, 40),
+            dtype=np.uint8,
+        )
+        cv2.rectangle(
+            schematic,
+            (0, 0),
+            (self.window.schematic_width_px - 1, self.window.schematic_height_px - 1),
+            (220, 220, 220),
+            2,
+            cv2.LINE_AA,
+        )
+
+        for zone in red_zones:
+            mapped_contour = zone.corrected_contour.astype(np.float32).copy()
+            mapped_contour[:, 0, 0] *= self.window.schematic_width_px / max(1, source_width)
+            mapped_contour[:, 0, 1] *= self.window.schematic_height_px / max(1, source_height)
+            cv2.polylines(schematic, [mapped_contour.astype(np.int32)], True, (0, 0, 255), 3, cv2.LINE_AA)
+
+        for ball in smoothed_ball_coordinates:
+            center = self.mapper.field_metric_cm_to_schematic((ball.cm_x, ball.cm_y))
+            radius = max(4, int(ball.radius_px * self.window.schematic_width_px / max(1, source_width)))
+            fill_color, edge_color = ((245, 245, 245), (120, 120, 120)) if ball.label == "white" else ((0, 140, 255), (0, 80, 180))
+            cv2.circle(schematic, center, radius, fill_color, -1, cv2.LINE_AA)
+            cv2.circle(schematic, center, radius, edge_color, 1, cv2.LINE_AA)
+
+        geometry = self.robot_geometry_from_params(params)
+        if route_points_cm:
+            route_points = np.array(
+                [self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm)) for pose in route_points_cm],
+                dtype=np.int32,
+            ).reshape((-1, 1, 2))
+            if len(route_points) >= 2:
+                cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
+            self.draw_route_heading_indicators(schematic, route_points_cm, geometry)
+            if num_intermediate_snapshots > 0 and len(route_points_cm) > 2:
+                denominator = num_intermediate_snapshots + 1
+                for index in sorted(
+                    {
+                        int(round((len(route_points_cm) - 1) * sample_index / denominator))
+                        for sample_index in range(1, num_intermediate_snapshots + 1)
+                    }
+                ):
+                    self.draw_robot_footprint_snapshot(schematic, route_points_cm[index], geometry, 0.18, (255, 0, 255), (255, 255, 0), 1)
+            self.draw_pickup_footprints(schematic, route_pickup_poses_cm or [], geometry)
+
+        if selected_start_cm is not None:
+            if robot_pose is not None:
+                selected_start = self.mapper.field_metric_cm_to_schematic((robot_pose.x_cm, robot_pose.y_cm))
+            else:
+                selected_ball = next(
+                    (ball for ball in smoothed_ball_coordinates if ball.track_id == selected_ball_track_id),
+                    None,
+                )
+                selected_start = (
+                    self.mapper.field_metric_cm_to_schematic((selected_ball.cm_x, selected_ball.cm_y))
+                    if selected_ball is not None
+                    else self.mapper.field_cm_to_schematic(selected_start_cm)
+                )
+            cv2.circle(schematic, selected_start, 8, (0, 255, 255), 2, cv2.LINE_AA)
+
+        if robot_pose is not None:
+            pose = robot_pose
+            robot_center = self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
+            base_cm, _intake_cm = self.robot_footprint_metric_polygons(HybridPose(pose.x_cm, pose.y_cm, pose.heading_rad), geometry)
+            footprint_px = np.array([self.mapper.field_metric_cm_to_schematic(point) for point in base_cm], dtype=np.int32).reshape(-1, 1, 2)
+            tube_center = self.mapper.field_metric_cm_to_schematic((pose.tube_x_cm, pose.tube_y_cm))
+            cv2.polylines(schematic, [footprint_px], True, (255, 90, 30), 2, cv2.LINE_AA)
+            cv2.circle(schematic, robot_center, 7, (255, 90, 30), -1, cv2.LINE_AA)
+            cv2.circle(schematic, robot_center, 11, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.arrowedLine(schematic, robot_center, tube_center, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.28)
+            cv2.circle(schematic, tube_center, 10, (0, 255, 255), 3, cv2.LINE_AA)
+
+        self.draw_control_xte_on_schematic(schematic, robot_pose, drive_runtime)
+        camera_center_schematic = self.mapper.map_point_between_frames(
+            (int(round(camera_center_pixels[0])), int(round(camera_center_pixels[1]))),
+            (source_width, source_height),
+            self.window.schematic_size_px,
+        )
+        cv2.drawMarker(schematic, camera_center_schematic, (255, 80, 80), cv2.MARKER_CROSS, 24, 3, cv2.LINE_AA)
+        cv2.putText(
+            schematic,
+            f"Field {self.field.width_cm:.1f}x{self.field.height_cm:.1f} cm",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            schematic,
+            "White balls: "
+            f"{sum(ball.label == 'white' for ball in smoothed_ball_coordinates)}  Orange balls: "
+            f"{sum(ball.label == 'orange' for ball in smoothed_ball_coordinates)}",
+            (20, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return schematic
+
+
+SchematicRenderer = DebugRenderer

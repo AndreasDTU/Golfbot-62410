@@ -99,10 +99,14 @@ expensive failure case on every video frame.
 
 ## Heading Visualization
 
-The schematic draws the route polyline plus footprint snapshots. Light snapshots
-show the base and intake at regular waypoints, and the final pickup pose is
-highlighted strongly so intake alignment and base clearance can be checked
-against the target ball and red zones.
+The schematic draws the yellow route polyline and sparse cyan heading arrows by
+default. Intermediate footprint snapshots are controlled by
+`NUM_INTERMEDIATE_SNAPSHOTS`, which defaults to `0` to keep the UI uncluttered.
+
+Every successful planned pickup pose is drawn as a bold magenta footprint, not
+just the final endpoint of the greedy route. These pickup footprints show the
+base-center offset and intake alignment for each orange or white target that
+the route actually connects.
 
 ## Orange Ball Priority
 

@@ -173,7 +173,8 @@ HYBRID_ROTATION_DELTAS_RAD = (
     math.radians(10.0),
 )
 HYBRID_IN_PLACE_ROTATION_COST = 1.1
-ROUTE_FOOTPRINT_MARKER_INTERVAL = 20
+NUM_INTERMEDIATE_SNAPSHOTS = 0
+ROUTE_HEADING_MARKER_INTERVAL = 20
 ROUTE_TARGET_REACHED_CM = HYBRID_GOAL_TOLERANCE_CM
 ROUTE_TARGET_MOVE_INVALIDATE_CM = 5.0
 ROUTE_CROSSTRACK_INVALIDATE_CM = 14.0
@@ -253,17 +254,18 @@ class PlannedBallTarget:
 
 @dataclass(frozen=True)
 class RoutePlan:
-    """Cached route plus the first target that must stay valid.
+    """Cached route plus pickup metadata for visualization and invalidation.
 
-    The UI only draws ``points``, but cache invalidation needs to know which
-    target the active trajectory is trying to collect.  When that ball
-    disappears, moves, or is reached by the intake, the next frame is allowed to
-    spend CPU on a new Hybrid A* search.  Otherwise the same trajectory is
-    reused, which keeps normal detector frames fast.
+    ``points`` is the continuous trajectory.  ``pickup_poses`` contains the
+    exact final base-center poses for every successful target segment in the
+    greedy route; these are the bold magenta footprints shown at ball pickup
+    locations.  Cache invalidation still keys off ``active_target``, the first
+    target the route is trying to collect.
     """
 
     points: list[HybridPose]
     active_target: PlannedBallTarget | None
+    pickup_poses: list[HybridPose]
 
 
 @dataclass(frozen=True)
@@ -700,6 +702,8 @@ class AppState:
     selected_ball_track_id: int | None = None
     selected_start_cm: tuple[int, int] | None = None
     route_points_cm: list[HybridPose] | None = None
+    route_pickup_poses_cm: list[HybridPose] = field(default_factory=list)
+    num_intermediate_snapshots: int = NUM_INTERMEDIATE_SNAPSHOTS
     route_cache_target_id: int | None = None
     route_cache_target_label: str | None = None
     route_cache_target_cm: tuple[float, float] | None = None
@@ -709,6 +713,7 @@ class AppState:
     def clear_route_cache(self) -> None:
         """Drop cached routing state so the next update performs Hybrid A*."""
         self.route_points_cm = None
+        self.route_pickup_poses_cm = []
         self.route_cache_target_id = None
         self.route_cache_target_label = None
         self.route_cache_target_cm = None
@@ -2446,12 +2451,13 @@ def build_greedy_route(
     greedy routing over the remaining balls.
     """
     if not ball_targets:
-        return RoutePlan(points=[], active_target=None)
+        return RoutePlan(points=[], active_target=None, pickup_poses=[])
 
     cfg = config or HybridPlannerConfig()
     unvisited = list(ball_targets)
     current_pose = start_pose
     route: list[HybridPose] = [current_pose]
+    pickup_poses: list[HybridPose] = []
     active_target: PlannedBallTarget | None = None
 
     orange_targets = sorted(
@@ -2473,6 +2479,7 @@ def build_greedy_route(
         active_target = orange_target
         route.extend(orange_segment[1:])
         current_pose = orange_segment[-1]
+        pickup_poses.append(current_pose)
         break
 
     while unvisited:
@@ -2502,11 +2509,12 @@ def build_greedy_route(
 
         route.extend(chosen_segment[1:])
         current_pose = chosen_segment[-1]
+        pickup_poses.append(current_pose)
         unvisited.remove(chosen_target)
         if active_target is None:
             active_target = chosen_target
 
-    return RoutePlan(points=route, active_target=active_target)
+    return RoutePlan(points=route, active_target=active_target, pickup_poses=pickup_poses)
 
 
 def nearest_route_distance_cm(pose: HybridPose, route: list[HybridPose]) -> float:
@@ -2655,6 +2663,7 @@ def update_route_from_state(app_state: AppState, params: dict[str, object] | Non
         geometry,
     )
     app_state.route_points_cm = route_plan.points
+    app_state.route_pickup_poses_cm = route_plan.pickup_poses
     app_state.route_cache_ball_signature = ball_cache_signature(smoothed_balls)
     if route_plan.active_target is None:
         app_state.route_cache_target_id = -1
@@ -2756,23 +2765,55 @@ def draw_robot_footprint_snapshot(
     cv2.circle(schematic, origin_px, max(3, thickness + 2), base_color, -1, cv2.LINE_AA)
 
 
-def draw_route_footprint_snapshots(
+def draw_route_heading_indicators(
     schematic: np.ndarray,
     route: list[HybridPose],
     geometry: RobotGeometry,
-    interval: int = ROUTE_FOOTPRINT_MARKER_INTERVAL,
+    interval: int = ROUTE_HEADING_MARKER_INTERVAL,
 ) -> None:
-    """Draw light route footprints and a bold final pickup footprint.
-
-    Waypoint snapshots expose both the base footprint and intake orientation
-    along the cached trajectory.  The final pose is drawn with stronger color
-    and thicker outlines so the pickup alignment can be checked visually
-    against the target ball and red-zone geometry.
-    """
+    """Draw lightweight cyan arrows showing heading along the trajectory."""
     if not route:
         return
 
-    for index in range(0, max(0, len(route) - 1), max(1, interval)):
+    for index in range(0, len(route), max(1, interval)):
+        pose = route[index]
+        origin_px = field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
+        tube_px = field_metric_cm_to_schematic(tube_center_for_pose(pose, geometry))
+        cv2.arrowedLine(
+            schematic,
+            origin_px,
+            tube_px,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.35,
+        )
+
+
+def draw_intermediate_footprint_snapshots(
+    schematic: np.ndarray,
+    route: list[HybridPose],
+    geometry: RobotGeometry,
+    snapshot_count: int,
+) -> None:
+    """Optionally draw a limited number of light intermediate footprints.
+
+    The default ``NUM_INTERMEDIATE_SNAPSHOTS`` is zero to keep the UI readable.
+    When a positive value is configured, samples are distributed across the
+    active trajectory and drawn lightly; pickup poses are handled separately by
+    :func:`draw_pickup_footprints`.
+    """
+    if snapshot_count <= 0 or len(route) <= 2:
+        return
+
+    denominator = snapshot_count + 1
+    sample_indices = sorted(
+        {
+            int(round((len(route) - 1) * sample_index / denominator))
+            for sample_index in range(1, snapshot_count + 1)
+        }
+    )
+    for index in sample_indices:
         draw_robot_footprint_snapshot(
             schematic,
             route[index],
@@ -2783,15 +2824,28 @@ def draw_route_footprint_snapshots(
             thickness=1,
         )
 
-    draw_robot_footprint_snapshot(
-        schematic,
-        route[-1],
-        geometry,
-        alpha=0.48,
-        base_color=(255, 0, 255),
-        intake_color=(0, 255, 255),
-        thickness=3,
-    )
+
+def draw_pickup_footprints(
+    schematic: np.ndarray,
+    pickup_poses: list[HybridPose],
+    geometry: RobotGeometry,
+) -> None:
+    """Draw bold footprints at every planned ball pickup pose.
+
+    Each pose is the exact base-center offset whose intake tip overlaps a
+    target ball, so these markers show every intended collection orientation
+    along the greedy route instead of only the route's final endpoint.
+    """
+    for pickup_pose in pickup_poses:
+        draw_robot_footprint_snapshot(
+            schematic,
+            pickup_pose,
+            geometry,
+            alpha=0.48,
+            base_color=(255, 0, 255),
+            intake_color=(0, 255, 255),
+            thickness=3,
+        )
 
 
 def draw_schematic(
@@ -2862,17 +2916,29 @@ def draw_schematic(
         )
 
     if app_state.route_points_cm:
+        route_geometry = robot_geometry_from_params(params)
         route_points = np.array(
             [field_metric_cm_to_schematic((pose.x_cm, pose.y_cm)) for pose in app_state.route_points_cm],
             dtype=np.int32,
         ).reshape((-1, 1, 2))
         if len(route_points) >= 2:
             cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
-            draw_route_footprint_snapshots(
-                schematic,
-                app_state.route_points_cm,
-                robot_geometry_from_params(params),
-            )
+        draw_route_heading_indicators(
+            schematic,
+            app_state.route_points_cm,
+            route_geometry,
+        )
+        draw_intermediate_footprint_snapshots(
+            schematic,
+            app_state.route_points_cm,
+            route_geometry,
+            app_state.num_intermediate_snapshots,
+        )
+        draw_pickup_footprints(
+            schematic,
+            app_state.route_pickup_poses_cm,
+            route_geometry,
+        )
 
     if app_state.selected_start_cm is not None:
         if app_state.robot_pose is not None:

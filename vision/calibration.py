@@ -131,6 +131,25 @@ class HomographyCalibrator:
         self.transform_matrix: np.ndarray | None = None
         self.calibration_state = CalibrationState.NEEDS_CALIBRATION
         self.manual_points: list[tuple[int, int]] = []
+        self.cursor: tuple[int, int] = (0, 0)
+        self.frame_size: tuple[int, int] = (0, 0)
+        self.latest_gray_frame: np.ndarray | None = None
+        self.anchor_gray_frame: np.ndarray | None = None
+        self.anchor_points: np.ndarray | None = None
+        self.current_tracked_points: np.ndarray | None = None
+        self.tracked_point_valid: np.ndarray = np.zeros(4, dtype=bool)
+        self.tracked_point_errors: np.ndarray = np.full(4, np.inf, dtype=np.float32)
+        self.lk_fb_max_error_px = 2.0
+        self.lk_ema_alpha = 0.2
+        self.lk_params = {
+            "winSize": self.camera.lk_win_size,
+            "maxLevel": self.camera.lk_max_level,
+            "criteria": (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                self.camera.lk_criteria_count,
+                self.camera.lk_criteria_epsilon,
+            ),
+        }
         self.latest_aruco_centers: dict[int, np.ndarray] = {}
         self.aruco_dictionary, self.aruco_detector = self.build_aruco_detector()
 
@@ -232,6 +251,7 @@ class HomographyCalibrator:
         self.manual_points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.reset_manual_tracking()
         self.calibration_state = CalibrationState.CALIBRATING_MANUAL
 
     def start_auto_calibration(self) -> None:
@@ -239,16 +259,105 @@ class HomographyCalibrator:
         self.manual_points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.reset_manual_tracking()
         self.calibration_state = CalibrationState.NEEDS_CALIBRATION
 
     def clear_manual_points(self) -> None:
         """Clear selected points without forcing auto mode."""
         self.manual_points.clear()
         self.transform_matrix = None
+        self.reset_manual_tracking()
         if self.calibration_state in (CalibrationState.CALIBRATING_MANUAL, CalibrationState.CALIBRATED_MANUAL):
             self.calibration_state = CalibrationState.CALIBRATING_MANUAL
         else:
             self.calibration_state = CalibrationState.NEEDS_CALIBRATION
+
+    def reset_manual_tracking(self) -> None:
+        """Reset Lucas-Kanade anchor/tracked point state."""
+        self.anchor_gray_frame = None
+        self.anchor_points = None
+        self.current_tracked_points = None
+        self.tracked_point_valid = np.zeros(4, dtype=bool)
+        self.tracked_point_errors = np.full(4, np.inf, dtype=np.float32)
+
+    def update_frame_context(self, undistorted_frame: np.ndarray) -> np.ndarray:
+        """Refresh frame size and latest grayscale frame used by manual tracking."""
+        live_gray = cv2.cvtColor(undistorted_frame, cv2.COLOR_BGR2GRAY)
+        self.latest_gray_frame = live_gray
+        self.frame_size = (int(undistorted_frame.shape[1]), int(undistorted_frame.shape[0]))
+        if self.cursor == (0, 0):
+            self.cursor = (self.frame_size[0] // 2, self.frame_size[1] // 2)
+        return live_gray
+
+    def initialize_manual_anchor_tracking(self) -> bool:
+        """Anchor the manual corner tracker to the current undistorted grayscale frame."""
+        if len(self.manual_points) != 4 or self.latest_gray_frame is None:
+            return False
+
+        anchor_points = np.array(self.manual_points, dtype=np.float32).reshape(4, 2)
+        self.anchor_gray_frame = self.latest_gray_frame.copy()
+        self.anchor_points = anchor_points
+        self.current_tracked_points = anchor_points.copy()
+        self.tracked_point_valid = np.ones(4, dtype=bool)
+        self.tracked_point_errors = np.zeros(4, dtype=np.float32)
+        self.transform_matrix = self.build_manual_topdown_transform(self.current_tracked_points)
+        self.calibration_state = CalibrationState.CALIBRATED_MANUAL
+        return True
+
+    def update_manual_anchor_tracking(self, live_gray: np.ndarray) -> None:
+        """Track manual corners from the immutable anchor frame with FB validation."""
+        if (
+            self.calibration_state != CalibrationState.CALIBRATED_MANUAL
+            or self.anchor_gray_frame is None
+            or self.anchor_points is None
+            or self.current_tracked_points is None
+        ):
+            return
+
+        forward_pts, forward_status, _forward_err = cv2.calcOpticalFlowPyrLK(
+            self.anchor_gray_frame,
+            live_gray,
+            self.anchor_points.reshape(-1, 1, 2),
+            None,
+            **self.lk_params,
+        )
+        if forward_pts is None or forward_status is None:
+            self.tracked_point_valid = np.zeros(4, dtype=bool)
+            self.tracked_point_errors = np.full(4, np.inf, dtype=np.float32)
+            return
+
+        recovered_pts, backward_status, _backward_err = cv2.calcOpticalFlowPyrLK(
+            live_gray,
+            self.anchor_gray_frame,
+            forward_pts,
+            None,
+            **self.lk_params,
+        )
+        if recovered_pts is None or backward_status is None:
+            self.tracked_point_valid = np.zeros(4, dtype=bool)
+            self.tracked_point_errors = np.full(4, np.inf, dtype=np.float32)
+            return
+
+        recovered_flat = recovered_pts.reshape(4, 2)
+        forward_flat = forward_pts.reshape(4, 2)
+        anchor_flat = self.anchor_points.reshape(4, 2)
+        fb_errors = np.linalg.norm(anchor_flat - recovered_flat, axis=1).astype(np.float32)
+        valid = (
+            (forward_status.reshape(4) == 1)
+            & (backward_status.reshape(4) == 1)
+            & (fb_errors < self.lk_fb_max_error_px)
+            & np.isfinite(fb_errors)
+            & np.all(np.isfinite(forward_flat), axis=1)
+        )
+
+        if np.any(valid):
+            current = self.current_tracked_points.reshape(4, 2)
+            current[valid] = (1.0 - self.lk_ema_alpha) * current[valid] + self.lk_ema_alpha * forward_flat[valid]
+            self.current_tracked_points = current.astype(np.float32)
+            self.transform_matrix = self.build_manual_topdown_transform(self.current_tracked_points)
+
+        self.tracked_point_valid = valid
+        self.tracked_point_errors = fb_errors
 
     def add_manual_point(self, point: tuple[int, int]) -> np.ndarray | None:
         """Add one manual point and return a transform once four points are available."""
@@ -257,8 +366,9 @@ class HomographyCalibrator:
 
         self.manual_points.append((int(point[0]), int(point[1])))
         if len(self.manual_points) == 4:
-            self.transform_matrix = self.build_manual_topdown_transform(self.manual_points)
-            self.calibration_state = CalibrationState.CALIBRATED_MANUAL
+            if not self.initialize_manual_anchor_tracking():
+                self.transform_matrix = self.build_manual_topdown_transform(self.manual_points)
+                self.calibration_state = CalibrationState.CALIBRATED_MANUAL
         else:
             self.calibration_state = CalibrationState.CALIBRATING_MANUAL
         return self.transform_matrix

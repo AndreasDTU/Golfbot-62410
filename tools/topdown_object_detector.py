@@ -47,12 +47,20 @@ class RuntimeState:
     selected_ball_track_id: int | None = None
     selected_start_cm: tuple[int, int] | None = None
     route_plan: RoutePlan = field(default_factory=lambda: RoutePlan(points=[], active_target=None, pickup_poses=[]))
+    route_cache_target_id: int | None = None
+    route_cache_target_label: str | None = None
+    route_cache_target_cm: tuple[float, float] | None = None
+    route_cache_ball_signature: tuple[tuple[int, str, int, int], ...] = field(default_factory=tuple)
     robot_pose: RobotPose | None = None
     robot_topdown_px: tuple[float, float] | None = None
     latest_smoothed_balls: list[SmoothedBallCoordinate] = field(default_factory=list)
 
     def clear_route(self) -> None:
         self.route_plan = RoutePlan(points=[], active_target=None, pickup_poses=[])
+        self.route_cache_target_id = None
+        self.route_cache_target_label = None
+        self.route_cache_target_cm = None
+        self.route_cache_ball_signature = ()
 
 
 class IdentityPreprocessor:
@@ -257,11 +265,64 @@ class TopdownDetectorApp:
             for ball in balls
         ]
 
+    def ball_cache_signature(
+        self,
+        smoothed_balls: list[SmoothedBallCoordinate],
+    ) -> tuple[tuple[int, str, int, int], ...]:
+        bucket = max(1.0, self.config.planner.route_target_move_invalidate_cm)
+        return tuple(
+            sorted(
+                (
+                    ball.track_id,
+                    ball.label,
+                    int(round(ball.cm_x / bucket)),
+                    int(round(ball.cm_y / bucket)),
+                )
+                for ball in smoothed_balls
+            )
+        )
+
+    def cached_route_is_valid(
+        self,
+        current_pose: HybridPose,
+        smoothed_balls: list[SmoothedBallCoordinate],
+        params: dict[str, object],
+    ) -> bool:
+        if not self.runtime.route_plan.points or self.runtime.route_cache_target_id is None:
+            return False
+        if self.runtime.route_cache_ball_signature != self.ball_cache_signature(smoothed_balls):
+            return False
+        if self.runtime.route_cache_target_id < 0:
+            return (
+                self.route_facade.nearest_route_distance_cm(current_pose, self.runtime.route_plan.points)
+                <= self.config.planner.route_crosstrack_invalidate_cm
+            )
+
+        target = next((ball for ball in smoothed_balls if ball.track_id == self.runtime.route_cache_target_id), None)
+        if target is None or self.runtime.route_cache_target_cm is None:
+            return False
+        if (
+            math.hypot(target.cm_x - self.runtime.route_cache_target_cm[0], target.cm_y - self.runtime.route_cache_target_cm[1])
+            > self.config.planner.route_target_move_invalidate_cm
+        ):
+            return False
+
+        geometry = self.robot_estimator.robot_geometry_from_params(params)
+        tube_x, tube_y = self.route_facade.hybrid_planner.tube_center_for_pose(current_pose, geometry)
+        if math.hypot(target.cm_x - tube_x, target.cm_y - tube_y) <= self.config.planner.route_target_reached_cm:
+            return False
+        if (
+            self.route_facade.nearest_route_distance_cm(current_pose, self.runtime.route_plan.points)
+            > self.config.planner.route_crosstrack_invalidate_cm
+        ):
+            return False
+        return True
+
     def update_route(self, result: VisionFrameResult, params: dict[str, object]) -> None:
         self.runtime.latest_smoothed_balls = result.smoothed_ball_coordinates
-        self.runtime.clear_route()
         if result.occupancy_grid is None or not result.smoothed_ball_coordinates:
             self.runtime.selected_start_cm = None
+            self.runtime.clear_route()
             return
 
         geometry = self.robot_estimator.robot_geometry_from_params(params)
@@ -281,11 +342,16 @@ class TopdownDetectorApp:
             )
             if selected_ball is None:
                 self.runtime.selected_start_cm = None
+                self.runtime.clear_route()
                 return
             start_pose = HybridPose(selected_ball.cm_x, selected_ball.cm_y, 0.0)
             self.runtime.selected_start_cm = self.mapper.field_metric_cm_to_grid_node((selected_ball.cm_x, selected_ball.cm_y))
         else:
             self.runtime.selected_start_cm = None
+            self.runtime.clear_route()
+            return
+
+        if self.cached_route_is_valid(start_pose, result.smoothed_ball_coordinates, params):
             return
 
         self.runtime.route_plan = self.route_facade.plan_route(
@@ -294,6 +360,16 @@ class TopdownDetectorApp:
             start_pose,
             geometry,
         )
+        self.runtime.route_cache_ball_signature = self.ball_cache_signature(result.smoothed_ball_coordinates)
+        if self.runtime.route_plan.active_target is None:
+            self.runtime.route_cache_target_id = -1
+            self.runtime.route_cache_target_label = None
+            self.runtime.route_cache_target_cm = None
+        else:
+            target = self.runtime.route_plan.active_target
+            self.runtime.route_cache_target_id = target.track_id
+            self.runtime.route_cache_target_label = target.label
+            self.runtime.route_cache_target_cm = (target.x_cm, target.y_cm)
 
     def update_robot_pose(self, topdown_frame: np.ndarray | None, params: dict[str, object]) -> None:
         if topdown_frame is None:
@@ -365,19 +441,74 @@ class TopdownDetectorApp:
         self.runtime.clear_route()
 
     def on_manual_topdown_mouse(self, event: int, x: int, y: int, _flags: int, _userdata: Any) -> None:
-        if event != cv2.EVENT_LBUTTONDOWN or self.homography_calibrator is None:
+        if self.homography_calibrator is None:
             return
-        self.homography_calibrator.add_manual_point((x, y))
+        width, height = self.homography_calibrator.frame_size
+        if width > 0 and height > 0:
+            point = (int(np.clip(x, 0, width - 1)), int(np.clip(y, 0, height - 1)))
+        else:
+            point = (int(x), int(y))
+        self.homography_calibrator.cursor = point
+        if event == cv2.EVENT_RBUTTONDOWN:
+            self.homography_calibrator.clear_manual_points()
+            return
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        self.homography_calibrator.add_manual_point(point)
 
     def draw_selector_view(self, frame: np.ndarray) -> np.ndarray:
         view = frame.copy()
         if self.homography_calibrator is None:
             return view
-        for index, point in enumerate(self.homography_calibrator.manual_points, start=1):
-            cv2.circle(view, point, 6, (0, 255, 255), -1, cv2.LINE_AA)
-            cv2.putText(view, str(index), (point[0] + 8, point[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        status = self.homography_calibrator.calibration_state.value
-        cv2.putText(view, f"Top-down: {status} | click 4 corners | a:auto m:manual r:reset", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        points = (
+            self.homography_calibrator.current_tracked_points
+            if self.homography_calibrator.current_tracked_points is not None
+            else self.homography_calibrator.manual_points
+        )
+        points_array = np.array(points, dtype=np.float32).reshape(-1, 2)
+        tracking_active = self.homography_calibrator.current_tracked_points is not None and len(points_array) == 4
+        for index, point in enumerate(points_array, start=1):
+            point_xy = (int(round(float(point[0]))), int(round(float(point[1]))))
+            if tracking_active:
+                color = (0, 255, 0) if bool(self.homography_calibrator.tracked_point_valid[index - 1]) else (0, 0, 255)
+            else:
+                color = (0, 0, 255)
+            cv2.circle(view, point_xy, self.config.camera.point_radius, color, -1, cv2.LINE_AA)
+            cv2.circle(view, point_xy, self.config.camera.point_radius + 4, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(view, str(index), (point_xy[0] + 10, point_xy[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        if len(points_array) >= 2:
+            cv2.polylines(view, [np.round(points_array).astype(np.int32).reshape(-1, 1, 2)], False, (0, 255, 0), 2, cv2.LINE_AA)
+        if len(points_array) == 4:
+            ordered = self.mapper.order_points(points_array).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(view, [ordered], True, (255, 200, 0), 2, cv2.LINE_AA)
+
+        tracking_text = ""
+        if tracking_active:
+            tracking_text = f" | LK valid: {int(np.count_nonzero(self.homography_calibrator.tracked_point_valid))}/4"
+        help_lines = [
+            f"Points: {len(self.homography_calibrator.manual_points)}/4{tracking_text}",
+            f"Mode: {self.homography_calibrator.calibration_state.value}",
+            "Left click: add point",
+            "Right click or r: reset",
+            "a: auto ArUco calibration",
+            "m: manual calibration",
+            "q: quit",
+        ]
+        for index, text in enumerate(help_lines):
+            cv2.putText(view, text, (16, 30 + index * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        if self.homography_calibrator.transform_matrix is not None and self.homography_calibrator.calibration_state == CalibrationState.CALIBRATED_AUTO:
+            status = "Top-down transform active (ArUco auto)"
+            color = (0, 255, 0)
+        elif self.homography_calibrator.transform_matrix is not None:
+            status = "Top-down transform active (manual)"
+            color = (0, 255, 0)
+        elif self.homography_calibrator.calibration_state == CalibrationState.CALIBRATING_MANUAL:
+            status = "Select 4 inner corners for manual top-down warp"
+            color = (0, 165, 255)
+        else:
+            status = "Scanning for ArUco markers 0,1,2,3"
+            color = (0, 165, 255)
+        cv2.putText(view, status, (16, view.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
         return view
 
     def handle_key(self, key: int, drive_runtime: DriveRuntime | None = None) -> bool:

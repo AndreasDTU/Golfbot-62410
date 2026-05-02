@@ -302,6 +302,20 @@ class DebugRenderer:
             cv2.circle(schematic, center, radius, fill_color, -1, cv2.LINE_AA)
             cv2.circle(schematic, center, radius, edge_color, 1, cv2.LINE_AA)
 
+            label = f"X: {ball.cm_x:.1f}, Y: {ball.cm_y:.1f}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.45
+            thickness = 2
+            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            text_x = center[0] + 10
+            if text_x + text_width > self.window.schematic_width_px - 1:
+                text_x = max(0, center[0] - 10 - text_width)
+            text_y = center[1] - 10
+            min_text_y = text_height + baseline
+            if text_y < min_text_y:
+                text_y = min(self.window.schematic_height_px - baseline - 1, center[1] + text_height + 10)
+            cv2.putText(schematic, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
         geometry = self.robot_geometry_from_params(params)
         if route_points_cm:
             route_points = np.array(
@@ -348,6 +362,18 @@ class DebugRenderer:
             cv2.circle(schematic, robot_center, 11, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.arrowedLine(schematic, robot_center, tube_center, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.28)
             cv2.circle(schematic, tube_center, 10, (0, 255, 255), 3, cv2.LINE_AA)
+            cv2.circle(schematic, tube_center, 3, (0, 255, 255), -1, cv2.LINE_AA)
+            robot_label = f"Robot X:{pose.x_cm:.1f} Y:{pose.y_cm:.1f} Tube:{pose.tube_x_cm:.1f},{pose.tube_y_cm:.1f}"
+            cv2.putText(
+                schematic,
+                robot_label,
+                (max(10, min(robot_center[0] + 16, self.window.schematic_width_px - 360)), max(25, robot_center[1] - 16)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
         self.draw_control_xte_on_schematic(schematic, robot_pose, drive_runtime)
         camera_center_schematic = self.mapper.map_point_between_frames(

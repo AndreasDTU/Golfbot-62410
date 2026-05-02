@@ -102,6 +102,12 @@ class FramePreprocessor:
     ) -> PreprocessedFrame:
         """Run the preprocessing pipeline in contract order."""
         undistorted = self.undistort(frame_bgr)
+        live_gray = self.homography_calibrator.update_frame_context(undistorted)
+        if self.homography_calibrator.calibration_state in (
+            CalibrationState.CALIBRATING_MANUAL,
+            CalibrationState.CALIBRATED_MANUAL,
+        ):
+            self.homography_calibrator.update_manual_anchor_tracking(live_gray)
         homography_result = self.update_homography(undistorted, use_aruco=use_aruco)
         topdown = self.warp_topdown(undistorted)
         should_normalize = self.normalize_illumination_enabled if normalize_illumination is None else normalize_illumination

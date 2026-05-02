@@ -10,6 +10,7 @@ dispatch.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
@@ -28,14 +29,14 @@ from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from pathfinding.planner import RoutePlanningFacade
 from robot.control import DriveSafetyGuard
 from robot.io import UdpWheelDispatcher
-from robot.localization import RobotCalibrationCollector, RobotPoseEstimator
+from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
 from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotPose
 from vision.calibration import HomographyCalibrator
 from vision.config import AppConfig
 from vision.debug import DebugRenderer
 from vision.geometry import CoordinateMapper
 from vision.grid_mapping import OccupancyGridBuilder
-from vision.models import CalibrationState, HSVRange, SmoothedBallCoordinate
+from vision.models import CalibrationState, CameraGroundProjection, HSVRange, SmoothedBallCoordinate
 from vision.pipeline import VisionFrameResult, VisionPipeline
 from vision.preprocessing import PreprocessedFrame
 
@@ -102,6 +103,8 @@ class TopdownDetectorApp:
         self.robot_runtime = RobotCalibrationRuntime()
         self.homography_calibrator: HomographyCalibrator | None = None
         self.latest_selector_frame: np.ndarray | None = None
+        self.latest_camera_ground_projection: CameraGroundProjection | None = None
+        self.latest_camera_ground_warning: str = ""
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
@@ -175,6 +178,30 @@ class TopdownDetectorApp:
             self.config.trackbars.names[key],
             self.config.trackbars.windows(self.config.windows)[key],
         )
+
+    def set_trackbar_value_if_changed(self, key: str, value: int) -> None:
+        """Update a trackbar only when needed to avoid needless UI churn."""
+        value = int(np.clip(value, 0, self._trackbar_max_value(key)))
+        if self.get_trackbar_value(key) == value:
+            return
+        cv2.setTrackbarPos(
+            self.config.trackbars.names[key],
+            self.config.trackbars.windows(self.config.windows)[key],
+            value,
+        )
+
+    def sync_camera_ground_trackbars(self, result: VisionFrameResult) -> None:
+        """Mirror the homography-derived camera ground projection into geometry controls."""
+        projection = result.preprocessed.camera_ground_projection
+        if projection is None:
+            self.latest_camera_ground_projection = None
+            self.latest_camera_ground_warning = ""
+            return
+        self.latest_camera_ground_projection = projection
+        self.latest_camera_ground_warning = ""
+        field_x_cm, field_y_cm = self.mapper.topdown_px_to_field_cm(projection.camera_center_px)
+        self.set_trackbar_value_if_changed("cam_center_x", int(round(field_x_cm)))
+        self.set_trackbar_value_if_changed("cam_center_y", int(round(field_y_cm)))
 
     def read_params(self) -> dict[str, object]:
         red_1 = HSVRange(
@@ -406,6 +433,21 @@ class TopdownDetectorApp:
             result.orange_balls,
             fps,
         )
+        self.renderer.draw_robot_marker_debug(
+            annotated,
+            self.robot_runtime.latest_observations,
+            self.robot_runtime.calibration,
+            self.runtime.robot_topdown_px,
+            self.runtime.robot_pose,
+            params,
+            self.robot_runtime,
+        )
+        self.renderer.draw_robot_calibration_status(
+            annotated,
+            self.robot_runtime,
+            self.runtime.robot_pose,
+            params,
+        )
         self.renderer.draw_control_xte_on_topdown(annotated, self.runtime.robot_pose, drive_runtime)
         schematic = self.renderer.draw_schematic(
             frame_shape=frame_for_debug.shape,
@@ -494,6 +536,14 @@ class TopdownDetectorApp:
             "m: manual calibration",
             "q: quit",
         ]
+        if self.latest_camera_ground_projection is not None:
+            projection = self.latest_camera_ground_projection
+            help_lines.append(
+                f"Principal point C X:{projection.camera_center_px[0]:.1f} "
+                f"Y:{projection.camera_center_px[1]:.1f}px"
+            )
+        elif self.latest_camera_ground_warning:
+            help_lines.append(self.latest_camera_ground_warning)
         for index, text in enumerate(help_lines):
             cv2.putText(view, text, (16, 30 + index * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         if self.homography_calibrator.transform_matrix is not None and self.homography_calibrator.calibration_state == CalibrationState.CALIBRATED_AUTO:
@@ -511,6 +561,108 @@ class TopdownDetectorApp:
         cv2.putText(view, status, (16, view.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
         return view
 
+    def handle_robot_calibration_key(self, ascii_key: int) -> None:
+        """Handle the legacy non-blocking robot origin calibration shortcuts."""
+        if ascii_key == ord("c"):
+            self.robot_runtime.phase = RobotCalibrationPhase.STATE_CALIBRATING_SPIN
+            self.robot_runtime.calibration = None
+            self.robot_runtime.warning = ""
+            self.robot_runtime.collected_points = {
+                marker_id: [] for marker_id in self.config.robot.marker_ids
+            }
+            self.robot_runtime.fitted_centers.clear()
+            self.robot_runtime.ellipse_ratios.clear()
+            return
+
+        if ascii_key == ord("s") and self.robot_runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_SPIN:
+            if self.robot_calibration_collector.compute_spin_centers(self.robot_runtime):
+                self.robot_runtime.phase = RobotCalibrationPhase.STATE_CALIBRATING_FORWARD
+            return
+
+        if ascii_key in (10, 13) and self.robot_runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_FORWARD:
+            missing = [
+                marker_id
+                for marker_id in self.config.robot.marker_ids
+                if marker_id not in self.robot_runtime.latest_observations
+            ]
+            if missing:
+                self.robot_runtime.warning = f"Waiting for forward-facing marker(s): {missing}"
+                return
+            if self.robot_runtime.latest_parallax_config is None:
+                self.robot_runtime.warning = "Waiting for parallax geometry before saving."
+                return
+            self.robot_runtime.calibration = self.robot_calibration_collector.save_robot_calibration(
+                self.config.paths.robot_calibration_file,
+                self.robot_runtime,
+                self.robot_runtime.latest_observations,
+                self.robot_runtime.latest_parallax_config,
+                self.config.camera.topdown_warp_size,
+            )
+            self.robot_runtime.phase = RobotCalibrationPhase.STATE_NORMAL
+            self.robot_runtime.warning = f"Saved robot calibration to {self.config.paths.robot_calibration_file}"
+
+    def save_heading_tuning_to_robot_calibration(self, tuning_offset_rad: float) -> bool:
+        """Fold live heading trim into robot calibration, preserving the current pose display."""
+        if self.robot_runtime.calibration is None:
+            self.robot_runtime.warning = "Cannot save heading tuning: no robot calibration loaded."
+            return False
+        if abs(tuning_offset_rad) < 1e-9:
+            self.robot_runtime.warning = "Heading tuning is already zero."
+            return False
+
+        for marker_config in self.robot_runtime.calibration.get("markers", {}).values():
+            old_alpha = float(marker_config["alpha_rad"])
+            old_offset = np.array(
+                [float(marker_config["dx"]), float(marker_config["dy"])],
+                dtype=np.float32,
+            )
+            new_offset = image_yaw_rotation_matrix(-tuning_offset_rad) @ old_offset
+            new_alpha = normalize_angle(old_alpha - tuning_offset_rad)
+            marker_config["dx"] = float(new_offset[0])
+            marker_config["dy"] = float(new_offset[1])
+            marker_config["alpha_rad"] = float(new_alpha)
+            marker_config["alpha_deg"] = float(math.degrees(new_alpha))
+
+        self.robot_runtime.calibration["created_unix"] = time.time()
+        self.config.paths.robot_calibration_file.write_text(
+            json.dumps(self.robot_runtime.calibration, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        self.set_trackbar_value_if_changed("heading_tuning", 180)
+        self.robot_runtime.warning = f"Saved heading baseline to {self.config.paths.robot_calibration_file}"
+        return True
+
+    def handle_manual_robot_key(self, key: int, drive_runtime: DriveRuntime | None) -> None:
+        """Map arrow/space keys to the legacy direct non-blocking wheel commands."""
+        if drive_runtime is None or drive_runtime.dispatcher is None:
+            return
+        if key in self.config.drive.key_up_arrow:
+            drive_runtime.dispatcher.send_wheel_speeds(
+                self.config.drive.manual_move_speed,
+                self.config.drive.manual_move_speed,
+                force=True,
+            )
+        elif key in self.config.drive.key_down_arrow:
+            drive_runtime.dispatcher.send_wheel_speeds(
+                -self.config.drive.manual_move_speed,
+                -self.config.drive.manual_move_speed,
+                force=True,
+            )
+        elif key in self.config.drive.key_left_arrow:
+            drive_runtime.dispatcher.send_wheel_speeds(
+                -self.config.drive.manual_turn_speed,
+                self.config.drive.manual_turn_speed,
+                force=True,
+            )
+        elif key in self.config.drive.key_right_arrow:
+            drive_runtime.dispatcher.send_wheel_speeds(
+                self.config.drive.manual_turn_speed,
+                -self.config.drive.manual_turn_speed,
+                force=True,
+            )
+        elif (key & 0xFF) == ord(" "):
+            drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
+
     def handle_key(self, key: int, drive_runtime: DriveRuntime | None = None) -> bool:
         if key in (255, -1):
             return False
@@ -524,8 +676,10 @@ class TopdownDetectorApp:
                 self.homography_calibrator.start_auto_calibration()
             elif ascii_key == ord("m"):
                 self.homography_calibrator.start_manual_calibration()
-        if drive_runtime is not None and drive_runtime.dispatcher is not None and ascii_key == ord(" "):
-            drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
+        self.handle_robot_calibration_key(ascii_key)
+        if ascii_key == ord("w"):
+            self.save_heading_tuning_to_robot_calibration(float(self.read_params()["heading_tuning_rad"]))
+        self.handle_manual_robot_key(key, drive_runtime)
         return False
 
     @staticmethod
@@ -619,6 +773,8 @@ class TopdownDetectorApp:
                 start = time.perf_counter()
                 params = self.read_params()
                 result = pipeline.process(raw_frame, params=params, use_aruco=True, normalize_illumination=False)
+                self.sync_camera_ground_trackbars(result)
+                params = self.read_params()
                 selector_view = self.draw_selector_view(result.preprocessed.undistorted)
                 self.update_robot_pose(result.frame_for_detection, params)
                 self.update_route(result, params)

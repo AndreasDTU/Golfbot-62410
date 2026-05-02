@@ -11,7 +11,14 @@ import numpy as np
 from pathfinding.models import HybridPose
 from pathfinding.planner import HybridAStarPlanner
 from robot.localization import RobotPoseEstimator
-from robot.models import DriveRuntime, RobotGeometry, RobotPose
+from robot.models import (
+    DriveRuntime,
+    RobotCalibrationPhase,
+    RobotCalibrationRuntime,
+    RobotGeometry,
+    RobotMarkerObservation,
+    RobotPose,
+)
 from vision.config import FieldConfig, RobotGeometryConfig, WindowConfig
 from vision.geometry import CoordinateMapper
 from vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinate
@@ -165,6 +172,172 @@ class DebugRenderer:
         closest_px = tuple(int(round(v)) for v in self.mapper.field_cm_to_topdown_pixel(drive_runtime.last_error.closest_point_cm))
         cv2.line(frame, robot_px, closest_px, (0, 165, 255), 3, cv2.LINE_AA)
         cv2.circle(frame, closest_px, 6, (0, 165, 255), -1, cv2.LINE_AA)
+
+    def draw_robot_marker_debug(
+        self,
+        frame: np.ndarray,
+        observations: dict[int, RobotMarkerObservation],
+        calibration: dict[str, Any] | None,
+        robot_origin_px: tuple[float, float] | None,
+        robot_pose: RobotPose | None,
+        params: dict[str, object] | None = None,
+        runtime: RobotCalibrationRuntime | None = None,
+    ) -> None:
+        """Draw robot ArUco, parallax projection, origin, footprint, and pickup tube."""
+        if runtime is not None:
+            colors = [(0, 180, 255), (255, 180, 0)]
+            for index, marker_id in enumerate(self.robot_config.marker_ids):
+                points = runtime.collected_points.get(marker_id, [])
+                if len(points) >= 2:
+                    pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+                    cv2.polylines(frame, [pts], False, colors[index % len(colors)], 2, cv2.LINE_AA)
+                if marker_id in runtime.fitted_centers:
+                    center = runtime.fitted_centers[marker_id]
+                    cv2.drawMarker(
+                        frame,
+                        (int(round(center[0])), int(round(center[1]))),
+                        (0, 165, 255),
+                        cv2.MARKER_TILTED_CROSS,
+                        24,
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+        for observation in observations.values():
+            raw_pts = observation.corners.astype(np.int32).reshape(-1, 1, 2)
+            ground_pts = observation.ground_corners.astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [raw_pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.polylines(frame, [ground_pts], True, (255, 255, 0), 1, cv2.LINE_AA)
+
+            raw_center = tuple(int(round(v)) for v in observation.center)
+            ground_center = tuple(int(round(v)) for v in observation.ground_center)
+            cv2.circle(frame, raw_center, 4, (0, 255, 0), -1, cv2.LINE_AA)
+            cv2.drawMarker(frame, ground_center, (255, 255, 0), cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+            cv2.line(frame, raw_center, ground_center, (255, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                f"Robot ID {observation.marker_id}",
+                (raw_center[0] + 8, raw_center[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        if robot_origin_px is None:
+            return
+
+        origin = np.array(robot_origin_px, dtype=np.float32)
+        origin_i = (int(round(origin[0])), int(round(origin[1])))
+        cv2.circle(frame, origin_i, 8, (255, 90, 30), -1, cv2.LINE_AA)
+        cv2.circle(frame, origin_i, 15, (255, 255, 255), 2, cv2.LINE_AA)
+
+        for observation in observations.values():
+            if calibration is None or str(observation.marker_id) not in calibration.get("markers", {}):
+                continue
+            ground_center = tuple(int(round(v)) for v in observation.ground_center)
+            cv2.line(frame, ground_center, origin_i, (255, 90, 30), 2, cv2.LINE_AA)
+
+        if robot_pose is None:
+            return
+
+        source_height, source_width = frame.shape[:2]
+        px_per_cm_x = (source_width - 1) / self.field.width_cm
+        px_per_cm_y = (source_height - 1) / self.field.height_cm
+
+        def field_delta_to_px(dx_cm: float, dy_cm: float) -> np.ndarray:
+            return np.array([dx_cm * px_per_cm_x, -dy_cm * px_per_cm_y], dtype=np.float32)
+
+        forward = (math.cos(robot_pose.heading_rad), math.sin(robot_pose.heading_rad))
+        right = (math.sin(robot_pose.heading_rad), -math.cos(robot_pose.heading_rad))
+        geometry = self.robot_geometry_from_params(params)
+        half_width_cm = geometry.width_cm * 0.5
+        front_center = origin + field_delta_to_px(
+            forward[0] * geometry.front_cm,
+            forward[1] * geometry.front_cm,
+        )
+        rear_center = origin + field_delta_to_px(
+            -forward[0] * geometry.rear_cm,
+            -forward[1] * geometry.rear_cm,
+        )
+        right_px = field_delta_to_px(right[0] * half_width_cm, right[1] * half_width_cm)
+        footprint = np.array(
+            [
+                front_center + right_px,
+                front_center - right_px,
+                rear_center - right_px,
+                rear_center + right_px,
+            ],
+            dtype=np.int32,
+        ).reshape(-1, 1, 2)
+        cv2.polylines(frame, [footprint], True, (255, 90, 30), 2, cv2.LINE_AA)
+
+        tube_px = origin + field_delta_to_px(
+            forward[0] * geometry.tube_forward_cm + right[0] * geometry.tube_right_cm,
+            forward[1] * geometry.tube_forward_cm + right[1] * geometry.tube_right_cm,
+        )
+        tube_i = tuple(int(round(v)) for v in tube_px)
+        cv2.arrowedLine(frame, origin_i, tube_i, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.25)
+        cv2.circle(frame, tube_i, 10, (0, 255, 255), 3, cv2.LINE_AA)
+        cv2.circle(frame, tube_i, 3, (0, 255, 255), -1, cv2.LINE_AA)
+
+    def draw_robot_calibration_status(
+        self,
+        frame: np.ndarray,
+        runtime: RobotCalibrationRuntime,
+        robot_pose: RobotPose | None,
+        params: dict[str, object] | None = None,
+    ) -> None:
+        """Draw the legacy yellow robot calibration, shortcut, geometry, and pose text."""
+        counts = ", ".join(
+            f"ID {marker_id}: {len(runtime.collected_points.get(marker_id, []))}"
+            for marker_id in self.robot_config.marker_ids
+        )
+        if runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_SPIN:
+            mode = "ROBOT CAL: SPIN"
+            action = "Spin robot, press s to fit"
+        elif runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_FORWARD:
+            mode = "ROBOT CAL: FORWARD"
+            action = "Face robot forward, press Enter"
+        else:
+            mode = "ROBOT TRACKING"
+            action = "c: calibrate spin | w: save heading"
+
+        geometry = self.robot_geometry_from_params(params)
+        lines = [
+            mode,
+            action,
+            f"Spin points: {counts}",
+            (
+                f"Geom W:{geometry.width_cm:.1f} F/R:{geometry.front_cm:.1f}/{geometry.rear_cm:.1f} "
+                f"Tube:{geometry.tube_forward_cm:.1f},{geometry.tube_right_cm:.1f}"
+            ),
+        ]
+        if robot_pose is not None:
+            lines.append(
+                f"Robot: X={robot_pose.x_cm:.1f}cm Y={robot_pose.y_cm:.1f}cm "
+                f"H={math.degrees(robot_pose.heading_rad):.1f}deg"
+            )
+        elif runtime.calibration is None:
+            lines.append("No robot_calibration.json loaded")
+        else:
+            lines.append("Robot marker not detected")
+        if runtime.warning:
+            lines.append(runtime.warning)
+
+        y0 = 62
+        for index, line in enumerate(lines):
+            cv2.putText(
+                frame,
+                line,
+                (20, y0 + index * 23),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.56,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
     def draw_drive_status(self, frame: np.ndarray, drive_runtime: DriveRuntime | None) -> None:
         """Draw live XTE, heading error, and wheel dispatch state."""

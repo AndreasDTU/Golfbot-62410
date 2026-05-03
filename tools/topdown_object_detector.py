@@ -109,6 +109,9 @@ class TopdownDetectorApp:
         self.latest_selector_frame: np.ndarray | None = None
         self.latest_camera_ground_projection: CameraGroundProjection | None = None
         self.latest_camera_ground_warning: str = ""
+        self.active_pipeline: VisionPipeline | None = None
+        self.latest_result: VisionFrameResult | None = None
+        self.latest_params: dict[str, object] | None = None
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
@@ -240,9 +243,13 @@ class TopdownDetectorApp:
             value,
         )
 
-    def sync_camera_ground_trackbars(self, result: VisionFrameResult) -> None:
+    def sync_camera_ground_trackbars(self, result_or_preprocessed: VisionFrameResult | PreprocessedFrame) -> None:
         """Mirror the homography-derived camera ground projection into geometry controls."""
-        projection = result.preprocessed.camera_ground_projection
+        projection = (
+            result_or_preprocessed.preprocessed.camera_ground_projection
+            if isinstance(result_or_preprocessed, VisionFrameResult)
+            else result_or_preprocessed.camera_ground_projection
+        )
         if projection is None:
             self.latest_camera_ground_projection = None
             self.latest_camera_ground_warning = ""
@@ -299,12 +306,14 @@ class TopdownDetectorApp:
         }
 
     def build_image_pipeline(self) -> VisionPipeline:
-        return VisionPipeline(
+        pipeline = VisionPipeline(
             self.config,
             preprocessor=IdentityPreprocessor(),
             mapper=self.mapper,
             build_legacy_dilated_grid=False,
         )
+        self.active_pipeline = pipeline
+        return pipeline
 
     def build_stream_pipeline(self, balance: float) -> VisionPipeline:
         pipeline = VisionPipeline(self.config, mapper=self.mapper, build_legacy_dilated_grid=False)
@@ -320,6 +329,7 @@ class TopdownDetectorApp:
             self.config.camera,
             normalize_illumination=False,
         )
+        self.active_pipeline = pipeline
         return pipeline
 
     def _make_drive_runtime(self, drive_enabled: bool) -> tuple[DriveRuntime, UdpWheelDispatcher | None]:
@@ -468,6 +478,94 @@ class TopdownDetectorApp:
                     (float(observation.ground_center[0]), float(observation.ground_center[1]))
                 )
 
+    def reset_detection_state(self) -> None:
+        """Clear detection state when calibration is not valid or stream state resets."""
+        self.runtime.latest_smoothed_balls = []
+        self.runtime.robot_pose = None
+        self.runtime.robot_topdown_px = None
+        self.runtime.selected_ball_track_id = None
+        self.runtime.selected_start_cm = None
+        self.runtime.clear_route()
+        self.latest_result = None
+        self.latest_params = None
+        self.latest_camera_ground_projection = None
+        self.latest_camera_ground_warning = ""
+        self.robot_runtime.latest_observations = {}
+        self.robot_runtime.latest_parallax_config = None
+        if self.active_pipeline is not None:
+            self.active_pipeline.ball_smoother.reset()
+
+    def build_missing_transform_result(
+        self,
+        raw_frame: np.ndarray,
+        preprocessed: PreprocessedFrame,
+        params: dict[str, object],
+    ) -> VisionFrameResult:
+        """Build the legacy placeholder-shaped result without running detection."""
+        placeholder = self.renderer.make_topdown_placeholder(self.topdown_placeholder_message())
+        zero_mask = np.zeros(placeholder.shape[:2], dtype=np.uint8)
+        return VisionFrameResult(
+            raw_frame=raw_frame,
+            preprocessed=preprocessed,
+            frame_for_detection=None,
+            red_zones=[],
+            red_mask=zero_mask,
+            white_balls=[],
+            orange_balls=[],
+            ball_masks={"white": zero_mask.copy(), "orange": zero_mask.copy()},
+            smoothed_ball_coordinates=[],
+            occupancy_grid=None,
+            params=params,
+            metadata={"status": "missing_topdown_transform"},
+        )
+
+    def process_preprocessed_topdown(
+        self,
+        pipeline: VisionPipeline,
+        raw_frame: np.ndarray,
+        preprocessed: PreprocessedFrame,
+        params: dict[str, object],
+    ) -> VisionFrameResult:
+        """Run detection/tracking/grid mapping after preprocessing and robot pose update."""
+        if preprocessed.normalized is None:
+            return self.build_missing_transform_result(raw_frame, preprocessed, params)
+
+        frame_for_detection = preprocessed.normalized
+        camera_center_pixels = (
+            float(params["camera_center_x"]),
+            float(params["camera_center_y"]),
+        )
+        red_zones, red_mask = pipeline.red_zone_detector.detect(
+            frame_for_detection,
+            params,
+            camera_center_pixels,
+        )
+        white_balls, orange_balls, ball_masks = pipeline.ball_detector.detect(
+            frame_for_detection,
+            params,
+            camera_center_pixels,
+        )
+        smoothed = pipeline.ball_smoother.update(white_balls + orange_balls, frame_for_detection.shape)
+        occupancy_grid = pipeline.occupancy_grid_builder.build(
+            frame_for_detection.shape,
+            red_zones,
+            dilate_for_legacy=pipeline.build_legacy_dilated_grid,
+        )
+        return VisionFrameResult(
+            raw_frame=raw_frame,
+            preprocessed=preprocessed,
+            frame_for_detection=frame_for_detection,
+            red_zones=red_zones,
+            red_mask=red_mask,
+            white_balls=white_balls,
+            orange_balls=orange_balls,
+            ball_masks=ball_masks,
+            smoothed_ball_coordinates=smoothed,
+            occupancy_grid=occupancy_grid,
+            params=params,
+            metadata={"status": "ok"},
+        )
+
     def render(
         self,
         result: VisionFrameResult,
@@ -588,6 +686,8 @@ class TopdownDetectorApp:
         )
         self.runtime.selected_ball_track_id = nearest_ball.track_id
         self.runtime.clear_route()
+        if self.latest_result is not None and self.latest_params is not None:
+            self.update_route(self.latest_result, self.latest_params)
 
     def on_manual_topdown_mouse(self, event: int, x: int, y: int, _flags: int, _userdata: Any) -> None:
         if self.homography_calibrator is None:
@@ -835,15 +935,24 @@ class TopdownDetectorApp:
         if self.homography_calibrator is not None:
             if ascii_key == ord("r"):
                 self.homography_calibrator.clear_manual_points()
+                self.reset_detection_state()
             elif ascii_key == ord("a"):
                 self.homography_calibrator.start_auto_calibration()
+                self.reset_detection_state()
             elif ascii_key == ord("m"):
                 self.homography_calibrator.start_manual_calibration()
+                self.reset_detection_state()
         self.handle_robot_calibration_key(ascii_key)
         if ascii_key == ord("w"):
             self.save_heading_tuning_to_robot_calibration(float(self.read_params()["heading_tuning_rad"]))
         self.handle_manual_robot_key(key, drive_runtime)
         return False
+
+    @staticmethod
+    def handle_image_key(key: int) -> bool:
+        """Image mode only quits on Esc/q, matching the legacy still-image loop."""
+        ascii_key = key & 0xFF
+        return ascii_key in (27, ord("q"))
 
     @staticmethod
     def load_image_frame(image_path: Path) -> np.ndarray:
@@ -874,6 +983,8 @@ class TopdownDetectorApp:
             result = pipeline.process(frame, params=params, use_aruco=False, normalize_illumination=False)
             self.runtime.robot_pose = None
             self.update_route(result, params)
+            self.latest_result = result
+            self.latest_params = params
             combined, masks, schematic = self.render(result, params, fps=0.0, drive_runtime=None)
             processing_ms = (time.perf_counter() - start) * 1000.0
             cv2.putText(
@@ -889,7 +1000,7 @@ class TopdownDetectorApp:
             cv2.imshow(self.config.windows.main_window_name, combined)
             cv2.imshow(self.config.windows.schematic_window_name, schematic)
             cv2.imshow(self.config.windows.mask_window_name, masks)
-            if self.handle_key(cv2.waitKey(20)):
+            if self.handle_image_key(cv2.waitKey(20)):
                 break
         return 0
 
@@ -933,8 +1044,30 @@ class TopdownDetectorApp:
         last_tick = time.perf_counter()
         raw_frame: np.ndarray | None = first_frame
         resize_notice_shown = False
+        video_paused = False
+        paused_views: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
         try:
             while True:
+                if video_paused and mode_label == "Video" and paused_views is not None:
+                    selector_view, combined, schematic, masks = paused_views
+                    paused_combined = combined.copy()
+                    self.renderer.draw_video_pause_overlay(paused_combined)
+                    cv2.imshow(self.config.windows.manual_selector_window_name, selector_view)
+                    cv2.imshow(self.config.windows.main_window_name, paused_combined)
+                    cv2.imshow(self.config.windows.schematic_window_name, schematic)
+                    cv2.imshow(self.config.windows.mask_window_name, masks)
+                    key = cv2.waitKeyEx(50)
+                    ascii_key = key & 0xFF
+                    if ascii_key in (27, ord("q")):
+                        break
+                    if ascii_key in (ord(" "), ord("p")):
+                        video_paused = False
+                        last_tick = time.perf_counter()
+                        continue
+                    if self.handle_key(key, drive_runtime):
+                        break
+                    continue
+
                 if raw_frame is None:
                     ok, raw_frame = cap.read()
                     if not ok or raw_frame is None:
@@ -944,6 +1077,8 @@ class TopdownDetectorApp:
                             if not ok or raw_frame is None:
                                 print(f"Could not restart video: {source_name}", file=sys.stderr)
                                 return 1
+                            last_tick = time.perf_counter()
+                            self.reset_detection_state()
                         else:
                             print(f"Frame read failed from {source_name}", file=sys.stderr)
                             return 1
@@ -958,12 +1093,69 @@ class TopdownDetectorApp:
                         resize_notice_shown = True
 
                 start = time.perf_counter()
+                preprocessed = pipeline.preprocessor.process(
+                    raw_frame,
+                    use_aruco=True,
+                    normalize_illumination=False,
+                )
+                selector_view = self.draw_selector_view(preprocessed.undistorted)
+                manual_selection_pending = (
+                    preprocessed.calibration_state == CalibrationState.CALIBRATING_MANUAL
+                    and preprocessed.transform_matrix is None
+                )
+                if manual_selection_pending:
+                    cv2.imshow(self.config.windows.manual_selector_window_name, selector_view)
+                    early_key = cv2.waitKeyEx(1)
+                    early_ascii = early_key & 0xFF
+                    if early_ascii in (27, ord("q")):
+                        break
+                    if self.handle_key(early_key, drive_runtime):
+                        break
+                    if self.homography_calibrator is not None and self.homography_calibrator.transform_matrix is not None:
+                        continue
+
+                self.sync_camera_ground_trackbars(preprocessed)
                 params = self.read_params()
-                result = pipeline.process(raw_frame, params=params, use_aruco=True, normalize_illumination=False)
-                self.sync_camera_ground_trackbars(result)
-                params = self.read_params()
-                selector_view = self.draw_selector_view(result.preprocessed.undistorted)
-                self.update_robot_pose(result.frame_for_detection, params)
+
+                if preprocessed.transform_matrix is None or preprocessed.normalized is None:
+                    self.reset_detection_state()
+                    result = self.build_missing_transform_result(raw_frame, preprocessed, params)
+                    drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for top-down calibration")
+                    combined, masks, schematic = self.render(result, params, fps=0.0, drive_runtime=drive_runtime)
+                    processing_ms = (time.perf_counter() - start) * 1000.0
+                    cv2.putText(
+                        combined,
+                        f"{mode_label} mode  Proc: {processing_ms:.1f} ms"
+                        + ("  Space/p: pause" if mode_label == "Video" else ""),
+                        (20, combined.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.imshow(self.config.windows.manual_selector_window_name, selector_view)
+                    cv2.imshow(self.config.windows.main_window_name, combined)
+                    cv2.imshow(self.config.windows.schematic_window_name, schematic)
+                    cv2.imshow(self.config.windows.mask_window_name, masks)
+                    if mode_label == "Video":
+                        paused_views = (selector_view.copy(), combined.copy(), schematic.copy(), masks.copy())
+                    wait_ms = max(1, frame_delay_ms - int(round(processing_ms)))
+                    key = cv2.waitKeyEx(wait_ms)
+                    ascii_key = key & 0xFF
+                    if ascii_key in (27, ord("q")):
+                        break
+                    if mode_label == "Video" and ascii_key in (ord(" "), ord("p")):
+                        video_paused = True
+                        drive_runtime.stop(DriveControlState.STOPPED, "video paused")
+                        continue
+                    if self.handle_key(key, drive_runtime):
+                        break
+                    raw_frame = None
+                    continue
+
+                self.update_robot_pose(preprocessed.normalized, params)
+                result = self.process_preprocessed_topdown(pipeline, raw_frame, preprocessed, params)
                 self.update_route(result, params)
                 self.drive_guard.enforce_xte_guard_before_replan(
                     self.runtime.robot_pose,
@@ -981,6 +1173,8 @@ class TopdownDetectorApp:
                 fps = 1.0 / max(1e-6, now - last_tick)
                 last_tick = now
                 combined, masks, schematic = self.render(result, params, fps=fps, drive_runtime=drive_runtime)
+                self.latest_result = result
+                self.latest_params = params
                 processing_ms = (time.perf_counter() - start) * 1000.0
                 cv2.putText(
                     combined,
@@ -997,8 +1191,18 @@ class TopdownDetectorApp:
                 cv2.imshow(self.config.windows.main_window_name, combined)
                 cv2.imshow(self.config.windows.schematic_window_name, schematic)
                 cv2.imshow(self.config.windows.mask_window_name, masks)
+                if mode_label == "Video":
+                    paused_views = (selector_view.copy(), combined.copy(), schematic.copy(), masks.copy())
                 wait_ms = max(1, frame_delay_ms - int(round(processing_ms)))
-                if self.handle_key(cv2.waitKeyEx(wait_ms), drive_runtime):
+                key = cv2.waitKeyEx(wait_ms)
+                ascii_key = key & 0xFF
+                if ascii_key in (27, ord("q")):
+                    break
+                if mode_label == "Video" and ascii_key in (ord(" "), ord("p")):
+                    video_paused = True
+                    drive_runtime.stop(DriveControlState.STOPPED, "video paused")
+                    continue
+                if self.handle_key(key, drive_runtime):
                     break
                 raw_frame = None
         finally:

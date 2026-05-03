@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
@@ -269,6 +270,11 @@ class RobotCalibrationCollector:
                 if isinstance(marker_config.get(key), (int, float)):
                     marker_config[key] = float(marker_config[key]) * scale
         scaled["topdown_size"] = [topdown_size[0], topdown_size[1]]
+        print(
+            f"Scaled robot calibration from {(int(stored_width), int(stored_height))} to {topdown_size}. "
+            "Recalibrate in this detector for best accuracy.",
+            file=sys.stderr,
+        )
         return scaled
 
     def load_robot_calibration(
@@ -284,6 +290,7 @@ class RobotCalibrationCollector:
 
         markers = calibration.get("markers", {})
         if not all(str(marker_id) in markers for marker_id in self.robot_config.marker_ids):
+            print(f"Robot calibration missing marker IDs {self.robot_config.marker_ids}: {path}", file=sys.stderr)
             return None
         return self.scale_robot_calibration_to_topdown(calibration, topdown_size)
 

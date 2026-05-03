@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -47,7 +48,7 @@ class TopdownDetectorAppShellTests(unittest.TestCase):
             __import__("sys").argv = original_argv
 
         self.assertFalse(args.live)
-        self.assertIsNone(args.image)
+        self.assertEqual(args.image, Path(__file__).resolve().parents[1] / "Bane_undistorted_transformed_close_balls.png")
         self.assertIsNone(args.video)
         self.assertFalse(args.drive)
 

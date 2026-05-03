@@ -41,6 +41,10 @@ from vision.pipeline import VisionFrameResult, VisionPipeline
 from vision.preprocessing import PreprocessedFrame
 
 
+def noop(_value: int) -> None:
+    """Trackbar callback placeholder matching the legacy OpenCV API."""
+
+
 @dataclass
 class RuntimeState:
     """Mutable UI/application state owned by the OpenCV shell."""
@@ -108,23 +112,67 @@ class TopdownDetectorApp:
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
+        default_paths = AppConfig.from_repo_root(REPO_ROOT).paths
         parser = argparse.ArgumentParser(
-            description="Detect balls/red zones, estimate robot pose, plan routes, and optionally dispatch wheels."
+            description=(
+                "Detect red zones, white ping-pong balls, and one orange ball from a "
+                "top-down arena image, live camera feed, or recorded camera video."
+            )
         )
         mode_group = parser.add_mutually_exclusive_group()
-        mode_group.add_argument("--live", action="store_true", help="Read frames from a live camera.")
-        mode_group.add_argument("--image", type=Path, help="Path to an already top-down test image.")
-        mode_group.add_argument("--video", type=Path, help="Path to a recorded camera video.")
-        parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index for live mode.")
-        parser.add_argument("--balance", type=float, default=0.0, help="Fisheye undistortion balance.")
-        parser.add_argument("--width", type=int, default=0, help="Optional live camera width.")
-        parser.add_argument("--height", type=int, default=0, help="Optional live camera height.")
+        mode_group.add_argument(
+            "--live",
+            action="store_true",
+            help="Read frames from a live camera instead of a still image.",
+        )
+        mode_group.add_argument(
+            "--image",
+            type=Path,
+            default=default_paths.default_image,
+            help=f"Path to a top-down test image. Default: {default_paths.default_image}",
+        )
+        mode_group.add_argument(
+            "--video",
+            type=Path,
+            help=f"Path to a recorded camera video. Store local recordings under {default_paths.default_video_dir}.",
+        )
+        parser.add_argument(
+            "--camera-index",
+            type=int,
+            default=0,
+            help="OpenCV camera index for live mode. Default: 0",
+        )
+        parser.add_argument(
+            "--balance",
+            type=float,
+            default=0.0,
+            help="Fisheye undistortion balance used for live/video camera frames.",
+        )
+        parser.add_argument(
+            "--width",
+            type=int,
+            default=0,
+            help="Optional live camera width. 0 keeps the driver default.",
+        )
+        parser.add_argument(
+            "--height",
+            type=int,
+            default=0,
+            help="Optional live camera height. 0 keeps the driver default.",
+        )
         parser.add_argument(
             "--resize-video-to-calibration",
             action="store_true",
-            help="Resize recorded frames to calibration size before undistortion.",
+            help=(
+                "Video mode only: resize each recorded frame to calibration_data.npz size "
+                "before undistortion if the recording resolution differs."
+            ),
         )
-        parser.add_argument("--drive", action="store_true", help="Enable UDP wheel dispatch.")
+        parser.add_argument(
+            "--drive",
+            action="store_true",
+            help="Enable non-blocking UDP dispatch of autonomous left/right wheel speeds.",
+        )
         return parser.parse_args()
 
     def _trackbar_defaults(self) -> dict[str, int]:
@@ -153,7 +201,9 @@ class TopdownDetectorApp:
             return 1000
         return 255
 
-    def create_trackbars(self) -> None:
+    def create_trackbars(self, frame_size: tuple[int, int]) -> None:
+        """Create trackbars for red zones, camera geometry, and robot geometry."""
+        _frame_width, _frame_height = frame_size
         for window_name in (
             self.config.windows.control_color_window_name,
             self.config.windows.control_filter_window_name,
@@ -170,7 +220,7 @@ class TopdownDetectorApp:
                 windows[key],
                 value,
                 self._trackbar_max_value(key),
-                lambda _value: None,
+                noop,
             )
 
     def get_trackbar_value(self, key: str) -> int:
@@ -424,7 +474,50 @@ class TopdownDetectorApp:
         params: dict[str, object],
         fps: float,
         drive_runtime: DriveRuntime | None,
+        video_paused: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if result.frame_for_detection is None:
+            placeholder_message = self.topdown_placeholder_message()
+            placeholder = self.renderer.make_topdown_placeholder(placeholder_message)
+            zero_mask = np.zeros(placeholder.shape[:2], dtype=np.uint8)
+            masks = self.renderer.build_mask_preview(zero_mask, zero_mask, zero_mask)
+            schematic = self.renderer.draw_schematic(
+                frame_shape=placeholder.shape,
+                red_zones=[],
+                smoothed_ball_coordinates=[],
+                camera_center_pixels=(float(params["camera_center_x"]), float(params["camera_center_y"])),
+                route_points_cm=[],
+                route_pickup_poses_cm=[],
+                selected_start_cm=None,
+                selected_ball_track_id=None,
+                robot_pose=None,
+                params=params,
+                drive_runtime=drive_runtime,
+                num_intermediate_snapshots=self.config.planner.num_intermediate_snapshots,
+                route_heading_marker_interval=self.config.planner.route_heading_marker_interval,
+            )
+            combined = np.hstack(self.renderer.resize_to_match_height(placeholder, schematic))
+            self.renderer.draw_drive_status(combined, drive_runtime)
+            waiting_text = (
+                "Waiting for manual top-down selection"
+                if self.homography_calibrator is not None
+                and self.homography_calibrator.calibration_state == CalibrationState.CALIBRATING_MANUAL
+                else "Waiting for ArUco auto-calibration"
+            )
+            cv2.putText(
+                combined,
+                waiting_text,
+                (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 165, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            if video_paused:
+                self.renderer.draw_video_pause_overlay(combined)
+            return combined, masks, schematic
+
         frame_for_debug = result.frame_for_detection if result.frame_for_detection is not None else result.preprocessed.undistorted
         annotated = self.renderer.annotate_camera_frame(
             frame_for_debug,
@@ -461,6 +554,8 @@ class TopdownDetectorApp:
             robot_pose=self.runtime.robot_pose,
             params=params,
             drive_runtime=drive_runtime,
+            num_intermediate_snapshots=self.config.planner.num_intermediate_snapshots,
+            route_heading_marker_interval=self.config.planner.route_heading_marker_interval,
         )
         masks = self.renderer.build_mask_preview(
             result.red_mask,
@@ -469,7 +564,19 @@ class TopdownDetectorApp:
         )
         combined = np.hstack(self.renderer.resize_to_match_height(annotated, schematic))
         self.renderer.draw_drive_status(combined, drive_runtime)
+        if video_paused:
+            self.renderer.draw_video_pause_overlay(combined)
         return combined, masks, schematic
+
+    def topdown_placeholder_message(self) -> str:
+        """Return the legacy top-down placeholder text for the current calibration state."""
+        if self.homography_calibrator is None:
+            return "Waiting for 4 selected points"
+        if self.homography_calibrator.calibration_state == CalibrationState.CALIBRATING_MANUAL:
+            return "Waiting for 4 selected points"
+        if not self.homography_calibrator.aruco_available:
+            return "ArUco unavailable, press m for manual mode"
+        return "Waiting for ArUco markers 0,1,2,3"
 
     def on_schematic_mouse(self, event: int, x: int, y: int, _flags: int, _userdata: Any) -> None:
         if event != cv2.EVENT_LBUTTONDOWN or not self.runtime.latest_smoothed_balls:
@@ -502,6 +609,27 @@ class TopdownDetectorApp:
         view = frame.copy()
         if self.homography_calibrator is None:
             return view
+        manual_mode_active = self.homography_calibrator.calibration_state in (
+            CalibrationState.CALIBRATING_MANUAL,
+            CalibrationState.CALIBRATED_MANUAL,
+        )
+        if not manual_mode_active:
+            if self.homography_calibrator.latest_aruco_ids is not None and self.homography_calibrator.latest_aruco_corners:
+                cv2.aruco.drawDetectedMarkers(
+                    view,
+                    self.homography_calibrator.latest_aruco_corners,
+                    self.homography_calibrator.latest_aruco_ids,
+                )
+            view = self.renderer.draw_detected_aruco_centers(
+                view,
+                self.homography_calibrator.latest_aruco_centers,
+            )
+            if self.homography_calibrator.transform_matrix is not None:
+                view = self.renderer.draw_projected_aruco_debug(
+                    view,
+                    self.homography_calibrator.transform_matrix,
+                )
+        view = self.renderer.draw_loupe(view, self.homography_calibrator.cursor)
         points = (
             self.homography_calibrator.current_tracked_points
             if self.homography_calibrator.current_tracked_points is not None
@@ -517,7 +645,16 @@ class TopdownDetectorApp:
                 color = (0, 0, 255)
             cv2.circle(view, point_xy, self.config.camera.point_radius, color, -1, cv2.LINE_AA)
             cv2.circle(view, point_xy, self.config.camera.point_radius + 4, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(view, str(index), (point_xy[0] + 10, point_xy[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(
+                view,
+                str(index),
+                (point_xy[0] + 10, point_xy[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
         if len(points_array) >= 2:
             cv2.polylines(view, [np.round(points_array).astype(np.int32).reshape(-1, 1, 2)], False, (0, 255, 0), 2, cv2.LINE_AA)
         if len(points_array) == 4:
@@ -545,7 +682,16 @@ class TopdownDetectorApp:
         elif self.latest_camera_ground_warning:
             help_lines.append(self.latest_camera_ground_warning)
         for index, text in enumerate(help_lines):
-            cv2.putText(view, text, (16, 30 + index * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(
+                view,
+                text,
+                (16, 30 + index * 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
         if self.homography_calibrator.transform_matrix is not None and self.homography_calibrator.calibration_state == CalibrationState.CALIBRATED_AUTO:
             status = "Top-down transform active (ArUco auto)"
             color = (0, 255, 0)
@@ -555,10 +701,27 @@ class TopdownDetectorApp:
         elif self.homography_calibrator.calibration_state == CalibrationState.CALIBRATING_MANUAL:
             status = "Select 4 inner corners for manual top-down warp"
             color = (0, 165, 255)
+        elif not self.homography_calibrator.aruco_available:
+            status = "ArUco unavailable, press m for manual calibration"
+            color = (0, 0, 255)
         else:
-            status = "Scanning for ArUco markers 0,1,2,3"
+            missing = [
+                str(marker_id)
+                for marker_id in self.config.camera.required_aruco_ids
+                if marker_id not in self.homography_calibrator.latest_aruco_centers
+            ]
+            status = "Scanning for ArUco markers 0,1,2,3" if not missing else f"Missing ArUco IDs: {', '.join(missing)}"
             color = (0, 165, 255)
-        cv2.putText(view, status, (16, view.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+        cv2.putText(
+            view,
+            status,
+            (16, view.shape[0] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
         return view
 
     def handle_robot_calibration_key(self, ascii_key: int) -> None:
@@ -701,7 +864,7 @@ class TopdownDetectorApp:
     def run_image_mode(self, image_path: Path) -> int:
         frame = self.load_image_frame(image_path)
         pipeline = self.build_image_pipeline()
-        self.create_trackbars()
+        self.create_trackbars((int(frame.shape[1]), int(frame.shape[0])))
         cv2.namedWindow(self.config.windows.schematic_window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(self.config.windows.schematic_window_name, self.on_schematic_mouse)
 
@@ -713,7 +876,16 @@ class TopdownDetectorApp:
             self.update_route(result, params)
             combined, masks, schematic = self.render(result, params, fps=0.0, drive_runtime=None)
             processing_ms = (time.perf_counter() - start) * 1000.0
-            cv2.putText(combined, f"Image mode  Proc: {processing_ms:.1f} ms", (20, combined.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(
+                combined,
+                f"Image mode  Proc: {processing_ms:.1f} ms",
+                (20, combined.shape[0] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
             cv2.imshow(self.config.windows.main_window_name, combined)
             cv2.imshow(self.config.windows.schematic_window_name, schematic)
             cv2.imshow(self.config.windows.mask_window_name, masks)
@@ -745,7 +917,14 @@ class TopdownDetectorApp:
             self.config.camera.topdown_warp_size,
         )
         drive_runtime, dispatcher = self._make_drive_runtime(drive_enabled)
-        self.create_trackbars()
+        if drive_enabled:
+            print(
+                f"Integrated drive dispatch enabled: UDP "
+                f"{self.config.drive.robot_ip}:{self.config.drive.robot_udp_port}"
+            )
+        else:
+            print("Integrated drive controller running with dispatch disabled; motors stay halted.")
+        self.create_trackbars(self.config.camera.topdown_warp_size)
         cv2.namedWindow(self.config.windows.schematic_window_name, cv2.WINDOW_NORMAL)
         cv2.namedWindow(self.config.windows.manual_selector_window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(self.config.windows.schematic_window_name, self.on_schematic_mouse)
@@ -753,6 +932,7 @@ class TopdownDetectorApp:
 
         last_tick = time.perf_counter()
         raw_frame: np.ndarray | None = first_frame
+        resize_notice_shown = False
         try:
             while True:
                 if raw_frame is None:
@@ -768,7 +948,14 @@ class TopdownDetectorApp:
                             print(f"Frame read failed from {source_name}", file=sys.stderr)
                             return 1
                 if resize_to_size is not None:
+                    original_size = (int(raw_frame.shape[1]), int(raw_frame.shape[0]))
                     raw_frame = self.resize_frame_to_size(raw_frame, resize_to_size)
+                    if original_size != resize_to_size and not resize_notice_shown:
+                        print(
+                            f"Resizing video frames from {original_size} to {resize_to_size} "
+                            "before undistortion."
+                        )
+                        resize_notice_shown = True
 
                 start = time.perf_counter()
                 params = self.read_params()
@@ -795,7 +982,17 @@ class TopdownDetectorApp:
                 last_tick = now
                 combined, masks, schematic = self.render(result, params, fps=fps, drive_runtime=drive_runtime)
                 processing_ms = (time.perf_counter() - start) * 1000.0
-                cv2.putText(combined, f"{mode_label} mode  Proc: {processing_ms:.1f} ms", (20, combined.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(
+                    combined,
+                    f"{mode_label} mode  Proc: {processing_ms:.1f} ms"
+                    + ("  Space/p: pause" if mode_label == "Video" else ""),
+                    (20, combined.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
                 cv2.imshow(self.config.windows.manual_selector_window_name, selector_view)
                 cv2.imshow(self.config.windows.main_window_name, combined)
                 cv2.imshow(self.config.windows.schematic_window_name, schematic)
@@ -811,14 +1008,20 @@ class TopdownDetectorApp:
         return 0
 
     def run_live_mode(self, camera_index: int, balance: float, width: int, height: int, drive_enabled: bool) -> int:
+        if not self.config.paths.calibration_file.exists():
+            print(f"Calibration file not found: {self.config.paths.calibration_file}", file=sys.stderr)
+            return 1
+        from vision.calibration import UndistortionProvider
+
+        calibration_width, calibration_height = UndistortionProvider.load_calibration_image_size(
+            self.config.paths.calibration_file
+        )
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             print(f"Could not open camera {camera_index}", file=sys.stderr)
             return 1
-        if width > 0:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        if height > 0:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width if width > 0 else calibration_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height if height > 0 else calibration_height)
         try:
             return self.run_stream(cap, f"camera {camera_index}", balance, "Live", 1, drive_enabled)
         finally:
@@ -834,6 +1037,10 @@ class TopdownDetectorApp:
             return 1
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_delay_ms = int(round(1000.0 / fps)) if fps and fps > 0.0 else 1
+        if resize_to_calibration and not self.config.paths.calibration_file.exists():
+            print(f"Calibration file not found: {self.config.paths.calibration_file}", file=sys.stderr)
+            cap.release()
+            return 1
         resize_to_size = None
         if resize_to_calibration:
             from vision.calibration import UndistortionProvider

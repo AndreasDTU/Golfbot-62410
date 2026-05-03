@@ -127,6 +127,175 @@ class DebugRenderer:
             tube_px = self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.tube_center_for_pose(pose, geometry))
             cv2.arrowedLine(schematic, origin_px, tube_px, (255, 255, 0), 2, cv2.LINE_AA, tipLength=0.35)
 
+    def draw_loupe(self, frame: np.ndarray, cursor: tuple[int, int]) -> np.ndarray:
+        """Draw the zoomed cursor loupe used during manual corner selection."""
+        overlay = frame.copy()
+        height, width = overlay.shape[:2]
+        crop_w = min(self.mapper.camera.loupe_crop_size, width)
+        crop_h = min(self.mapper.camera.loupe_crop_size, height)
+
+        x0, x1 = self._clamp_crop_bounds(cursor[0], crop_w, width)
+        y0, y1 = self._clamp_crop_bounds(cursor[1], crop_h, height)
+        crop = overlay[y0:y1, x0:x1]
+        loupe = cv2.resize(
+            crop,
+            (crop.shape[1] * self.mapper.camera.loupe_scale, crop.shape[0] * self.mapper.camera.loupe_scale),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        loupe_h, loupe_w = loupe.shape[:2]
+        dest_x1 = width - self.mapper.camera.loupe_padding
+        dest_x0 = max(0, dest_x1 - loupe_w)
+        dest_y0 = self.mapper.camera.loupe_padding
+        dest_y1 = min(height, dest_y0 + loupe_h)
+
+        visible_loupe = loupe[: dest_y1 - dest_y0, : dest_x1 - dest_x0]
+        overlay[dest_y0:dest_y1, dest_x0:dest_x1] = visible_loupe
+        cv2.rectangle(overlay, (dest_x0, dest_y0), (dest_x1, dest_y1), (255, 255, 255), 2)
+
+        center_x = dest_x0 + visible_loupe.shape[1] // 2
+        center_y = dest_y0 + visible_loupe.shape[0] // 2
+        cv2.line(overlay, (center_x, dest_y0), (center_x, dest_y1), (0, 255, 255), 1)
+        cv2.line(overlay, (dest_x0, center_y), (dest_x1, center_y), (0, 255, 255), 1)
+        cv2.putText(
+            overlay,
+            "Loupe",
+            (dest_x0, max(20, dest_y0 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return overlay
+
+    @staticmethod
+    def _clamp_crop_bounds(center: int, crop_size: int, limit: int) -> tuple[int, int]:
+        """Clamp a crop region so the loupe stays inside frame bounds."""
+        if limit <= crop_size:
+            return 0, limit
+        half = crop_size // 2
+        start = max(0, center - half)
+        end = start + crop_size
+        if end > limit:
+            end = limit
+            start = end - crop_size
+        return start, end
+
+    def draw_detected_aruco_centers(
+        self,
+        frame: np.ndarray,
+        marker_centers: dict[int, np.ndarray],
+    ) -> np.ndarray:
+        """Overlay the detected ArUco marker centers used for auto calibration."""
+        overlay = frame.copy()
+        for marker_id in self.mapper.camera.required_aruco_ids:
+            if marker_id not in marker_centers:
+                continue
+
+            center = marker_centers[marker_id]
+            point = (int(round(center[0])), int(round(center[1])))
+            cv2.circle(overlay, point, 6, (0, 255, 0), -1, cv2.LINE_AA)
+            cv2.putText(
+                overlay,
+                f"ID {marker_id}",
+                (point[0] + 10, point[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        return overlay
+
+    def draw_projected_aruco_debug(
+        self,
+        frame: np.ndarray,
+        transform_matrix: np.ndarray,
+    ) -> np.ndarray:
+        """Project the field and marker-center geometry back onto the selector view."""
+        overlay = frame.copy()
+        inverse_transform = np.linalg.inv(transform_matrix)
+
+        field_outline = cv2.perspectiveTransform(
+            self.mapper.destination_corners(self.mapper.camera.topdown_warp_size).reshape(-1, 1, 2),
+            inverse_transform,
+        ).astype(np.int32)
+
+        total_offset_cm = self.mapper.camera.wall_thickness_cm + self.mapper.camera.marker_outer_offset_cm
+        world_points_cm = (
+            (-total_offset_cm, -total_offset_cm),
+            (self.field.width_cm + total_offset_cm, -total_offset_cm),
+            (self.field.width_cm + total_offset_cm, self.field.height_cm + total_offset_cm),
+            (-total_offset_cm, self.field.height_cm + total_offset_cm),
+        )
+        marker_destination = np.array(
+            [self.mapper.field_cm_to_topdown_px_unflipped(x_cm, y_cm) for x_cm, y_cm in world_points_cm],
+            dtype=np.float32,
+        )
+        marker_outline = cv2.perspectiveTransform(
+            marker_destination.reshape(-1, 1, 2),
+            inverse_transform,
+        ).astype(np.int32)
+
+        cv2.polylines(overlay, [field_outline], True, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.polylines(overlay, [marker_outline], True, (255, 200, 0), 2, cv2.LINE_AA)
+
+        field_labels = ("Field TL", "Field TR", "Field BR", "Field BL")
+        for label, point in zip(field_labels, field_outline.reshape(-1, 2)):
+            point_xy = (int(point[0]), int(point[1]))
+            cv2.circle(overlay, point_xy, 5, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.putText(
+                overlay,
+                label,
+                (point_xy[0] + 8, point_xy[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        marker_labels = ("Marker TL", "Marker TR", "Marker BR", "Marker BL")
+        for label, point in zip(marker_labels, marker_outline.reshape(-1, 2)):
+            point_xy = (int(point[0]), int(point[1]))
+            cv2.circle(overlay, point_xy, 4, (255, 200, 0), -1, cv2.LINE_AA)
+            cv2.putText(
+                overlay,
+                label,
+                (point_xy[0] + 8, point_xy[1] + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 200, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+        cv2.putText(
+            overlay,
+            "Yellow: inferred inner field   Blue: expected ArUco center quad",
+            (16, overlay.shape[0] - 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return overlay
+
+    def draw_video_pause_overlay(self, frame: np.ndarray) -> None:
+        """Draw the legacy paused-video status text."""
+        cv2.putText(
+            frame,
+            "PAUSED - press Space or p to resume",
+            (20, 62),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
     def draw_pickup_footprints(
         self,
         schematic: np.ndarray,
@@ -316,8 +485,7 @@ class DebugRenderer:
         ]
         if robot_pose is not None:
             lines.append(
-                f"Robot: X={robot_pose.x_cm:.1f}cm Y={robot_pose.y_cm:.1f}cm "
-                f"H={math.degrees(robot_pose.heading_rad):.1f}deg"
+                f"Robot: X={robot_pose.x_cm:.1f}cm Y={robot_pose.y_cm:.1f}cm H={math.degrees(robot_pose.heading_rad):.1f}deg"
             )
         elif runtime.calibration is None:
             lines.append("No robot_calibration.json loaded")
@@ -445,6 +613,7 @@ class DebugRenderer:
         params: dict[str, object] | None = None,
         drive_runtime: DriveRuntime | None = None,
         num_intermediate_snapshots: int = 0,
+        route_heading_marker_interval: int = 20,
     ) -> np.ndarray:
         """Draw a clean synthetic field view containing detected objects and route state."""
         source_height, source_width = frame_shape[:2]
@@ -497,7 +666,12 @@ class DebugRenderer:
             ).reshape((-1, 1, 2))
             if len(route_points) >= 2:
                 cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
-            self.draw_route_heading_indicators(schematic, route_points_cm, geometry)
+            self.draw_route_heading_indicators(
+                schematic,
+                route_points_cm,
+                geometry,
+                interval=route_heading_marker_interval,
+            )
             if num_intermediate_snapshots > 0 and len(route_points_cm) > 2:
                 denominator = num_intermediate_snapshots + 1
                 for index in sorted(
@@ -554,7 +728,23 @@ class DebugRenderer:
             (source_width, source_height),
             self.window.schematic_size_px,
         )
-        cv2.drawMarker(schematic, camera_center_schematic, (255, 80, 80), cv2.MARKER_CROSS, 24, 3, cv2.LINE_AA)
+        cv2.line(
+            schematic,
+            (camera_center_schematic[0] - 12, camera_center_schematic[1]),
+            (camera_center_schematic[0] + 12, camera_center_schematic[1]),
+            (255, 80, 80),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            schematic,
+            (camera_center_schematic[0], camera_center_schematic[1] - 12),
+            (camera_center_schematic[0], camera_center_schematic[1] + 12),
+            (255, 80, 80),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.circle(schematic, camera_center_schematic, 7, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(
             schematic,
             f"Field {self.field.width_cm:.1f}x{self.field.height_cm:.1f} cm",

@@ -151,6 +151,8 @@ class HomographyCalibrator:
             ),
         }
         self.latest_aruco_centers: dict[int, np.ndarray] = {}
+        self.latest_aruco_corners: list[np.ndarray] = []
+        self.latest_aruco_ids: np.ndarray | None = None
         self.aruco_dictionary, self.aruco_detector = self.build_aruco_detector()
 
     @property
@@ -251,6 +253,8 @@ class HomographyCalibrator:
         self.manual_points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.latest_aruco_corners = []
+        self.latest_aruco_ids = None
         self.reset_manual_tracking()
         self.calibration_state = CalibrationState.CALIBRATING_MANUAL
 
@@ -259,6 +263,8 @@ class HomographyCalibrator:
         self.manual_points.clear()
         self.transform_matrix = None
         self.latest_aruco_centers.clear()
+        self.latest_aruco_corners = []
+        self.latest_aruco_ids = None
         self.reset_manual_tracking()
         self.calibration_state = CalibrationState.NEEDS_CALIBRATION
 
@@ -267,6 +273,8 @@ class HomographyCalibrator:
         self.manual_points.clear()
         self.transform_matrix = None
         self.reset_manual_tracking()
+        self.latest_aruco_corners = []
+        self.latest_aruco_ids = None
         if self.calibration_state in (CalibrationState.CALIBRATING_MANUAL, CalibrationState.CALIBRATED_MANUAL):
             self.calibration_state = CalibrationState.CALIBRATING_MANUAL
         else:
@@ -396,6 +404,8 @@ class HomographyCalibrator:
             self.aruco_detector,
         )
         self.latest_aruco_centers = self.extract_required_marker_centers(corners, ids)
+        self.latest_aruco_corners = corners
+        self.latest_aruco_ids = ids
         auto_transform = self.build_auto_topdown_transform(self.latest_aruco_centers)
         if auto_transform is not None:
             self.transform_matrix = auto_transform

@@ -54,7 +54,7 @@ class HybridPlannerConfig:
     step_cm: float = 4.0
     theta_bins: int = 36
     goal_tolerance_cm: float = 4.0
-    max_expansions: int = 12000
+    max_expansions: int = 36000
     translation_directions: tuple[float, ...] = (1.0, -1.0)
     reverse_cost_multiplier: float = 1.8
     rotation_deltas_rad: tuple[float, ...] = (

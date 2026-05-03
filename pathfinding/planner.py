@@ -128,6 +128,89 @@ class RobotFootprintCollisionChecker:
         return True
 
 
+class GridDijkstraHeuristic:
+    """Obstacle-aware 2D cost-to-go map for guiding Hybrid A* around red zones."""
+
+    _NEIGHBORS: tuple[tuple[int, int, float], ...] = (
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)),
+        (-1, 1, math.sqrt(2.0)),
+        (1, 1, math.sqrt(2.0)),
+    )
+
+    def __init__(self, raw_red_grid: np.ndarray, goal_node: tuple[int, int]) -> None:
+        self.grid = raw_red_grid
+        self.height = int(raw_red_grid.shape[0])
+        self.width = int(raw_red_grid.shape[1])
+        self.costs = np.full((self.height, self.width), np.inf, dtype=np.float64)
+        self.goal = self._nearest_free_node(goal_node)
+        if self.goal is not None:
+            self._compute()
+
+    def _in_bounds(self, node: tuple[int, int]) -> bool:
+        return 0 <= node[0] < self.width and 0 <= node[1] < self.height
+
+    def _is_free(self, node: tuple[int, int]) -> bool:
+        return self._in_bounds(node) and self.grid[node[1], node[0]] == 0
+
+    def _nearest_free_node(self, node: tuple[int, int]) -> tuple[int, int] | None:
+        """Return the target node, or a nearby free cell if the exact target is occupied."""
+        x = int(np.clip(node[0], 0, self.width - 1))
+        y = int(np.clip(node[1], 0, self.height - 1))
+        if self._is_free((x, y)):
+            return x, y
+
+        max_radius = max(self.width, self.height)
+        for radius in range(1, max_radius + 1):
+            x_min = max(0, x - radius)
+            x_max = min(self.width - 1, x + radius)
+            y_min = max(0, y - radius)
+            y_max = min(self.height - 1, y + radius)
+            candidates: list[tuple[float, tuple[int, int]]] = []
+            for nx in range(x_min, x_max + 1):
+                for ny in (y_min, y_max):
+                    if self._is_free((nx, ny)):
+                        candidates.append((math.hypot(nx - x, ny - y), (nx, ny)))
+            for ny in range(y_min + 1, y_max):
+                for nx in (x_min, x_max):
+                    if self._is_free((nx, ny)):
+                        candidates.append((math.hypot(nx - x, ny - y), (nx, ny)))
+            if candidates:
+                candidates.sort(key=lambda item: (item[0], item[1][1], item[1][0]))
+                return candidates[0][1]
+        return None
+
+    def _compute(self) -> None:
+        assert self.goal is not None
+        heap: list[tuple[float, tuple[int, int]]] = [(0.0, self.goal)]
+        self.costs[self.goal[1], self.goal[0]] = 0.0
+
+        while heap:
+            current_cost, current = heapq.heappop(heap)
+            if current_cost > float(self.costs[current[1], current[0]]) + 1e-9:
+                continue
+            for dx, dy, step_cost in self._NEIGHBORS:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if not self._is_free(neighbor):
+                    continue
+                next_cost = current_cost + step_cost
+                if next_cost >= float(self.costs[neighbor[1], neighbor[0]]):
+                    continue
+                self.costs[neighbor[1], neighbor[0]] = next_cost
+                heapq.heappush(heap, (next_cost, neighbor))
+
+    def cost_from_field_point(self, point_cm: tuple[float, float], field: FieldConfig) -> float:
+        if self.goal is None:
+            return float("inf")
+        x = int(np.clip(round(point_cm[0]), 0, self.width - 1))
+        y = int(np.clip(round(field.height_cm - point_cm[1]), 0, self.height - 1))
+        return float(self.costs[y, x])
+
+
 class HybridAStarPlanner:
     """Search kinematically valid trajectories in ``x, y, theta``."""
 
@@ -206,6 +289,23 @@ class HybridAStarPlanner:
         tube_x, tube_y = self.tube_center_for_pose(pose, geometry)
         return math.hypot(goal_x - tube_x, goal_y - tube_y)
 
+    def heuristic_cost(
+        self,
+        pose: HybridPose,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        dijkstra_heuristic: GridDijkstraHeuristic,
+        config: HybridPlannerConfig | None = None,
+        goal_point_cm: tuple[float, float] | None = None,
+    ) -> float:
+        """Return obstacle-aware 2D cost from the intake tip to the target."""
+        cfg = config or self.config
+        tube_point = self.tube_center_for_pose(pose, geometry)
+        cost = dijkstra_heuristic.cost_from_field_point(tube_point, self.field)
+        if math.isfinite(cost):
+            return max(0.0, cost - cfg.goal_tolerance_cm)
+        return max(0.0, self.goal_distance(pose, goal_node, geometry, goal_point_cm) - cfg.goal_tolerance_cm)
+
     @staticmethod
     def reconstruct_path(
         came_from: dict[tuple[int, int, int], tuple[int, int, int]],
@@ -270,10 +370,11 @@ class HybridAStarPlanner:
         if not collision_checker.is_pose_valid(start_pose):
             return []
 
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
         start_key = self.state_key(start_pose, cfg.theta_bins)
         open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
         counter = 0
-        start_h = max(0.0, self.goal_distance(start_pose, goal_node, geometry, goal_point_cm) - cfg.goal_tolerance_cm)
+        start_h = self.heuristic_cost(start_pose, goal_node, geometry, dijkstra_heuristic, cfg, goal_point_cm)
         heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
 
         came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
@@ -315,10 +416,7 @@ class HybridAStarPlanner:
                 came_from[neighbor_key] = current_key
                 pose_by_key[neighbor_key] = neighbor_pose
                 g_score[neighbor_key] = tentative_g
-                heuristic = max(
-                    0.0,
-                    self.goal_distance(neighbor_pose, goal_node, geometry, goal_point_cm) - cfg.goal_tolerance_cm,
-                )
+                heuristic = self.heuristic_cost(neighbor_pose, goal_node, geometry, dijkstra_heuristic, cfg, goal_point_cm)
                 heading_change = abs(normalize_planner_angle(neighbor_pose.theta_rad - current_pose.theta_rad))
                 counter += 1
                 heapq.heappush(
@@ -331,6 +429,11 @@ class HybridAStarPlanner:
                     ),
                 )
 
+        if expansions >= cfg.max_expansions:
+            print(
+                f"Hybrid A* search exhausted max nodes ({cfg.max_expansions}) "
+                f"for goal {goal_node} after {expansions} expansions."
+            )
         return []
 
 
@@ -449,6 +552,10 @@ class GreedyRoutePlanner:
             )
             unvisited.remove(orange_target)
             if not orange_segment:
+                print(
+                    f"Hybrid A* could not route to orange target {orange_target.track_id}; "
+                    "continuing with remaining targets."
+                )
                 continue
             active_target = orange_target
             route.extend(orange_segment[1:])
@@ -477,6 +584,10 @@ class GreedyRoutePlanner:
                     chosen_target = candidate
                     chosen_segment = segment
                     break
+                print(
+                    f"Hybrid A* could not route to target {candidate.track_id} "
+                    f"({candidate.label}); trying next target."
+                )
 
             if chosen_target is None:
                 break

@@ -38,7 +38,6 @@ class RobotFootprintCollisionChecker:
         free_mask = (raw_red_grid == 0).astype(np.uint8)
         self.distance_to_red = cv2.distanceTransform(free_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
         self.base_circles = self._build_base_circle_specs()
-        self.intake_circles = self._build_intake_circle_specs()
 
     def _build_base_circle_specs(self) -> list[tuple[float, float, float]]:
         """Approximate the rectangular wheelbase with overlapping circles."""
@@ -55,23 +54,6 @@ class RobotFootprintCollisionChecker:
                 for index in range(circle_count)
             ]
         return [(offset, 0.0, radius) for offset in offsets]
-
-    def _build_intake_circle_specs(self) -> list[tuple[float, float, float]]:
-        """Approximate the forward intake tube with small overlapping circles."""
-        radius = max(1.0, self.robot_config.tube_width_cm * 0.5)
-        start = self.geometry.front_cm + radius
-        end = self.geometry.tube_forward_cm
-        if end <= start:
-            return [(end, self.geometry.tube_right_cm, radius)]
-        circle_count = max(2, int(math.ceil((end - start) / max(1.0, radius * 1.25))) + 1)
-        return [
-            (
-                start + (end - start) * index / (circle_count - 1),
-                self.geometry.tube_right_cm,
-                radius,
-            )
-            for index in range(circle_count)
-        ]
 
     def oriented_circle_centers(
         self,
@@ -126,7 +108,11 @@ class RobotFootprintCollisionChecker:
         return base, tube
 
     def is_pose_valid(self, pose: HybridPose) -> bool:
-        """Return true when base circles have no strict red-zone intersection."""
+        """Return true when the robot body is inside the field and clear of red zones.
+
+        The pickup tube is intentionally excluded from boundary and red-zone
+        collision checks so it can overhang walls while reaching corner balls.
+        """
         for x_grid, y_grid, radius_cm in self.oriented_circle_centers(pose, self.base_circles):
             if (
                 x_grid - radius_cm < 0.0
@@ -250,7 +236,7 @@ class HybridAStarPlanner:
                 y_cm=pose.y_cm + math.sin(pose.theta_rad) * cfg.step_cm * direction,
                 theta_rad=pose.theta_rad,
             )
-            reverse_penalty = 1.8 if direction < 0.0 else 1.0
+            reverse_penalty = cfg.reverse_cost_multiplier if direction < 0.0 else 1.0
             neighbors.append((next_pose, cfg.step_cm * reverse_penalty))
 
         for delta_theta in cfg.rotation_deltas_rad:
@@ -540,6 +526,7 @@ class RoutePlanningFacade:
             max_expansions=self.planner_config.max_expansions,
             translation_directions=self.planner_config.translation_directions,
             rotation_deltas_rad=self.planner_config.rotation_deltas_rad,
+            reverse_cost_multiplier=self.planner_config.reverse_cost_multiplier,
             in_place_rotation_cost=self.planner_config.in_place_rotation_cost,
         )
         self.hybrid_planner = HybridAStarPlanner(self.field, self.robot_config, self.hybrid_config)

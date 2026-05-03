@@ -275,7 +275,8 @@ class PlannerConfig:
     step_cm: float = 4.0
     goal_tolerance_cm: float = 4.0
     max_expansions: int = 12000
-    translation_directions: tuple[float, ...] = (1.0,)
+    translation_directions: tuple[float, ...] = (1.0, -1.0)
+    reverse_cost_multiplier: float = 1.8
     rotation_deltas_rad: tuple[float, ...] = (math.radians(-10.0), math.radians(10.0))
     in_place_rotation_cost: float = 1.1
     num_intermediate_snapshots: int = 0

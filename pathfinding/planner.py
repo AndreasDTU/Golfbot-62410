@@ -216,6 +216,9 @@ class GridDijkstraHeuristic:
 class HybridAStarPlanner:
     """Search kinematically valid trajectories in ``x, y, theta``."""
 
+    TIGHT_CORNER_PICKUP_THRESHOLD_CM = 3.5
+    CORNER_PICKUP_HEADING_OFFSETS_DEG = (-3.0, 3.0, 0.0, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 6.0, -6.0, 9.0, -9.0)
+
     def __init__(
         self,
         field_config: FieldConfig | None = None,
@@ -534,6 +537,70 @@ class HybridAStarPlanner:
             y_cm=ball_y - forward[1] * intake_length_cm - right[1] * geometry.tube_right_cm,
             theta_rad=normalize_planner_angle(theta_rad),
         )
+
+    def tight_corner_pickup_heading(
+        self,
+        goal_point_cm: tuple[float, float],
+    ) -> float | None:
+        """Return the diagonal pickup heading for balls tightly tucked into a corner."""
+        x_cm, y_cm = goal_point_cm
+        threshold = self.TIGHT_CORNER_PICKUP_THRESHOLD_CM
+        near_left = x_cm <= threshold
+        near_right = self.field.width_cm - x_cm <= threshold
+        near_bottom = y_cm <= threshold
+        near_top = self.field.height_cm - y_cm <= threshold
+
+        if near_right and near_top:
+            return math.radians(45.0)
+        if near_right and near_bottom:
+            return math.radians(-45.0)
+        if near_left and near_top:
+            return math.radians(135.0)
+        if near_left and near_bottom:
+            return math.radians(-135.0)
+        return None
+
+    def corner_pickup_pose_candidates(
+        self,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        goal_point_cm: tuple[float, float],
+    ) -> list[HybridPose]:
+        """Return deterministic diagonal pickup poses for a tightly cornered ball."""
+        heading_rad = self.tight_corner_pickup_heading(goal_point_cm)
+        if heading_rad is None:
+            return []
+        return [
+            self.pickup_aligned_pose_for_theta(
+                goal_node,
+                normalize_planner_angle(heading_rad + math.radians(offset_deg)),
+                geometry,
+                goal_point_cm,
+            )
+            for offset_deg in self.CORNER_PICKUP_HEADING_OFFSETS_DEG
+        ]
+
+    def search_corner_pickup(
+        self,
+        raw_red_grid: np.ndarray,
+        start_pose: HybridPose,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig | None = None,
+        goal_point_cm: tuple[float, float] | None = None,
+    ) -> list[HybridPose]:
+        """Route to a deterministic diagonal pickup pose for a tightly cornered ball."""
+        if goal_point_cm is None:
+            return []
+        cfg = config or self.config
+        collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry, self.field, self.robot_config)
+        for pickup_pose in self.corner_pickup_pose_candidates(goal_node, geometry, goal_point_cm):
+            if not collision_checker.is_pose_valid(pickup_pose):
+                continue
+            segment = self.search_pose_goal(raw_red_grid, start_pose, pickup_pose, geometry, cfg)
+            if segment:
+                return segment
+        return []
 
     def goal_distance(
         self,
@@ -905,6 +972,35 @@ class GreedyRoutePlanner:
         print("Hybrid A* could not route from current pose to the small goal unload region.")
         return [], None, None
 
+    def plan_target_segment(
+        self,
+        grid: np.ndarray,
+        current_pose: HybridPose,
+        target: PlannedBallTarget,
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig,
+    ) -> list[HybridPose]:
+        """Plan to one ball, using deterministic diagonal pickup for tight corners."""
+        goal_point_cm = (target.x_cm, target.y_cm)
+        corner_segment = self.hybrid_planner.search_corner_pickup(
+            grid,
+            current_pose,
+            target.node_cm,
+            geometry,
+            config,
+            goal_point_cm=goal_point_cm,
+        )
+        if corner_segment:
+            return corner_segment
+        return self.hybrid_planner.search(
+            grid,
+            current_pose,
+            target.node_cm,
+            geometry,
+            config,
+            goal_point_cm=goal_point_cm,
+        )
+
     def plan(
         self,
         grid: np.ndarray,
@@ -929,13 +1025,12 @@ class GreedyRoutePlanner:
             key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
         )
         for orange_target in orange_targets:
-            orange_segment = self.hybrid_planner.search(
+            orange_segment = self.plan_target_segment(
                 grid,
                 current_pose,
-                orange_target.node_cm,
+                orange_target,
                 geometry,
                 cfg,
-                goal_point_cm=(orange_target.x_cm, orange_target.y_cm),
             )
             unvisited.remove(orange_target)
             if not orange_segment:
@@ -959,13 +1054,12 @@ class GreedyRoutePlanner:
             chosen_segment: list[HybridPose] = []
 
             for candidate in nearest_candidates:
-                segment = self.hybrid_planner.search(
+                segment = self.plan_target_segment(
                     grid,
                     current_pose,
-                    candidate.node_cm,
+                    candidate,
                     geometry,
                     cfg,
-                    goal_point_cm=(candidate.x_cm, candidate.y_cm),
                 )
                 if segment:
                     chosen_target = candidate

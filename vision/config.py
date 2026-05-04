@@ -305,6 +305,13 @@ class DriveConfig:
     max_speed_pct: float = 80.0
     heading_kp: float = 38.0
     xte_kp: float = 2.2
+    heading_kd: float = 6.0
+    xte_kd: float = 0.25
+    cruise_distance_cm: float = 30.0
+    creep_distance_cm: float = 10.0
+    creep_speed_pct: float = 7.0
+    blind_approach_trigger_cm: float = 8.0
+    blind_approach_duration_s: float = 1.0
     max_heading_for_forward_rad: float = math.radians(70.0)
     min_send_interval_s: float = 0.02
     command_deadband_pct: float = 1.0

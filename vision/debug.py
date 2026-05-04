@@ -10,6 +10,7 @@ import numpy as np
 
 from pathfinding.models import HybridPose
 from pathfinding.planner import HybridAStarPlanner
+from robot.control import WheelCommandController, route_checkpoint_indices
 from robot.localization import RobotPoseEstimator
 from robot.models import (
     DriveRuntime,
@@ -19,7 +20,7 @@ from robot.models import (
     RobotMarkerObservation,
     RobotPose,
 )
-from vision.config import FieldConfig, RobotGeometryConfig, WindowConfig
+from vision.config import DriveConfig, FieldConfig, RobotGeometryConfig, WindowConfig
 from vision.geometry import CoordinateMapper
 from vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinate
 
@@ -32,16 +33,58 @@ class DebugRenderer:
         field_config: FieldConfig | None = None,
         window_config: WindowConfig | None = None,
         robot_config: RobotGeometryConfig | None = None,
+        drive_config: DriveConfig | None = None,
         mapper: CoordinateMapper | None = None,
     ) -> None:
         self.field = field_config or FieldConfig()
         self.window = window_config or WindowConfig()
         self.robot_config = robot_config or RobotGeometryConfig()
+        self.drive_config = drive_config or DriveConfig()
         self.mapper = mapper or CoordinateMapper(self.field, window_config=self.window)
 
     def robot_geometry_from_params(self, params: dict[str, object] | None) -> RobotGeometry:
         """Read live robot geometry, falling back to tuned defaults."""
         return RobotPoseEstimator(self.field, self.robot_config, self.mapper).robot_geometry_from_params(params)
+
+    def route_velocity_color(self, distance_to_goal_cm: float) -> tuple[int, int, int]:
+        """Map the profiled route speed to a BGR heatmap color."""
+        target = WheelCommandController.target_speed_for_distance(distance_to_goal_cm, self.drive_config)
+        creep = max(0.0, float(self.drive_config.creep_speed_pct))
+        cruise = max(creep + 1e-6, float(self.drive_config.base_speed_pct))
+        ratio = float(np.clip((target - creep) / (cruise - creep), 0.0, 1.0))
+        if ratio < 0.5:
+            local = ratio / 0.5
+            red = int(round(255 * local))
+            green = 255
+        else:
+            local = (ratio - 0.5) / 0.5
+            red = 255
+            green = int(round(255 * (1.0 - local)))
+        return (0, green, red)
+
+    def draw_velocity_profile_route(
+        self,
+        schematic: np.ndarray,
+        route_points_cm: list[HybridPose],
+        route_pickup_poses_cm: list[HybridPose] | None = None,
+    ) -> None:
+        """Draw each route segment with the same distance-based speed profile used by control."""
+        if len(route_points_cm) < 2:
+            return
+        checkpoints = route_checkpoint_indices(route_points_cm, route_pickup_poses_cm, include_final=True)
+        if not checkpoints:
+            checkpoints = [len(route_points_cm) - 1]
+        for segment_index, (start, end) in enumerate(zip(route_points_cm[:-1], route_points_cm[1:])):
+            start_px = self.mapper.field_metric_cm_to_schematic((start.x_cm, start.y_cm))
+            end_px = self.mapper.field_metric_cm_to_schematic((end.x_cm, end.y_cm))
+            next_route_index = min(len(route_points_cm) - 1, segment_index + 1)
+            checkpoint_index = next(
+                (checkpoint for checkpoint in checkpoints if checkpoint >= next_route_index),
+                checkpoints[-1],
+            )
+            goal = route_points_cm[checkpoint_index]
+            distance_to_goal = math.hypot(start.x_cm - goal.x_cm, start.y_cm - goal.y_cm)
+            cv2.line(schematic, start_px, end_px, self.route_velocity_color(distance_to_goal), 3, cv2.LINE_AA)
 
     def robot_footprint_metric_polygons(
         self,
@@ -718,12 +761,7 @@ class DebugRenderer:
 
         geometry = self.robot_geometry_from_params(params)
         if route_points_cm:
-            route_points = np.array(
-                [self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm)) for pose in route_points_cm],
-                dtype=np.int32,
-            ).reshape((-1, 1, 2))
-            if len(route_points) >= 2:
-                cv2.polylines(schematic, [route_points], False, (0, 255, 255), 2, cv2.LINE_AA)
+            self.draw_velocity_profile_route(schematic, route_points_cm, route_pickup_poses_cm)
             self.draw_route_heading_indicators(
                 schematic,
                 route_points_cm,

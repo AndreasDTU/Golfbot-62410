@@ -15,8 +15,10 @@ import math
 import multiprocessing as mp
 import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +31,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from pathfinding.planner import RoutePlanningFacade
-from robot.control import DriveSafetyGuard
+from robot.control import DriveSafetyGuard, WheelCommandController, distance_to_route_goal_cm
+from robot.controller import RobotController
 from robot.io import UdpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
-from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose
+from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose, WheelCommand
 from vision.calibration import HomographyCalibrator
 from vision.config import AppConfig
 from vision.debug import DebugRenderer
@@ -45,6 +48,15 @@ from vision.preprocessing import PreprocessedFrame
 
 def noop(_value: int) -> None:
     """Trackbar callback placeholder matching the legacy OpenCV API."""
+
+
+class PickupExecutionState(Enum):
+    """Deterministic pickup handoff states for the live drive loop."""
+
+    NAVIGATION = "NAVIGATION"
+    BLIND_APPROACH = "BLIND_APPROACH"
+    PICKUP = "PICKUP"
+    REPLAN = "REPLAN"
 
 
 @dataclass
@@ -65,6 +77,9 @@ class RuntimeState:
     robot_pose: RobotPose | None = None
     robot_topdown_px: tuple[float, float] | None = None
     latest_smoothed_balls: list[SmoothedBallCoordinate] = field(default_factory=list)
+    pickup_state: PickupExecutionState = PickupExecutionState.NAVIGATION
+    pickup_state_started_s: float = 0.0
+    pickup_command_fired: bool = False
 
     def clear_route(self) -> None:
         self.route_plan = RoutePlan(points=[], active_target=None, pickup_poses=[])
@@ -76,6 +91,11 @@ class RuntimeState:
         self.route_failed_ball_signature = None
         self.route_failed_unload_extension_cm = None
         self.route_failed_start_signature = None
+
+    def reset_pickup_state(self) -> None:
+        self.pickup_state = PickupExecutionState.NAVIGATION
+        self.pickup_state_started_s = 0.0
+        self.pickup_command_fired = False
 
 
 @dataclass(frozen=True)
@@ -227,7 +247,7 @@ class TopdownDetectorApp:
     def __init__(self, config: AppConfig | None = None) -> None:
         self.config = config or AppConfig.from_repo_root(REPO_ROOT)
         self.mapper = CoordinateMapper(self.config.field, self.config.camera, self.config.windows)
-        self.renderer = DebugRenderer(self.config.field, self.config.windows, self.config.robot, self.mapper)
+        self.renderer = DebugRenderer(self.config.field, self.config.windows, self.config.robot, self.config.drive, self.mapper)
         self.route_facade = RoutePlanningFacade(self.config.field, self.config.robot, self.config.planner)
         self.async_route_planner = AsyncRoutePlanner(self.config)
         self.route_request_counter = 0
@@ -244,6 +264,8 @@ class TopdownDetectorApp:
         self.active_pipeline: VisionPipeline | None = None
         self.latest_result: VisionFrameResult | None = None
         self.latest_params: dict[str, object] | None = None
+        self.pickup_thread: threading.Thread | None = None
+        self.pickup_last_error: str = ""
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
@@ -473,6 +495,90 @@ class TopdownDetectorApp:
         )
         return DriveRuntime(enabled=True, dispatcher=dispatcher), dispatcher
 
+    def _pickup_distance_to_goal_cm(self) -> float:
+        if self.runtime.robot_pose is None or len(self.runtime.route_plan.points) < 2:
+            return float("inf")
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+        )
+        if tracking_error is None:
+            return float("inf")
+        return distance_to_route_goal_cm(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+            tracking_error,
+            self.runtime.route_plan.pickup_poses,
+            include_final=False,
+        )
+
+    def _start_pickup_command_thread(self) -> None:
+        if self.pickup_thread is not None and self.pickup_thread.is_alive():
+            return
+
+        def run_pickup() -> None:
+            try:
+                RobotController(self.config.drive.robot_ip).pickup()
+                self.pickup_last_error = ""
+            except Exception as exc:
+                self.pickup_last_error = str(exc)
+
+        self.pickup_thread = threading.Thread(target=run_pickup, name="ev3-pickup-command", daemon=True)
+        self.pickup_thread.start()
+
+    def update_pickup_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
+        """Run the blind-spot pickup handoff and return True when it owns motor output."""
+        state = self.runtime.pickup_state
+        if state == PickupExecutionState.NAVIGATION and drive_runtime.dispatcher is None:
+            return False
+        if state == PickupExecutionState.NAVIGATION:
+            if self._pickup_distance_to_goal_cm() >= self.config.drive.blind_approach_trigger_cm:
+                return False
+            self.runtime.pickup_state = PickupExecutionState.BLIND_APPROACH
+            self.runtime.pickup_state_started_s = now_s
+            self.runtime.pickup_command_fired = False
+            self.drive_guard.wheel_controller.reset()
+            state = self.runtime.pickup_state
+
+        if state == PickupExecutionState.BLIND_APPROACH:
+            elapsed_s = now_s - self.runtime.pickup_state_started_s
+            if elapsed_s < self.config.drive.blind_approach_duration_s:
+                creep_speed = WheelCommandController.target_speed_for_distance(0.0, self.config.drive)
+                drive_runtime.last_command = WheelCommand(creep_speed, creep_speed)
+                drive_runtime.state = DriveControlState.BLIND_APPROACH
+                drive_runtime.last_message = "open-loop creep"
+                if drive_runtime.dispatcher is None:
+                    drive_runtime.last_message = "blind approach: no dispatcher"
+                    return True
+                if not drive_runtime.dispatcher.send_wheel_speeds(creep_speed, creep_speed, force=True):
+                    drive_runtime.state = DriveControlState.DISPATCH_ERROR
+                    drive_runtime.last_message = drive_runtime.dispatcher.last_error
+                    drive_runtime.last_command = WheelCommand(0.0, 0.0)
+                return True
+
+            drive_runtime.stop(DriveControlState.PICKUP, "pickup actuator")
+            self.runtime.pickup_state = PickupExecutionState.PICKUP
+            self.runtime.pickup_state_started_s = now_s
+            state = self.runtime.pickup_state
+
+        if state == PickupExecutionState.PICKUP:
+            drive_runtime.stop(DriveControlState.PICKUP, "pickup actuator")
+            if not self.runtime.pickup_command_fired:
+                self._start_pickup_command_thread()
+                self.runtime.pickup_command_fired = True
+            self.runtime.pickup_state = PickupExecutionState.REPLAN
+            self.runtime.pickup_state_started_s = now_s
+            return True
+
+        if state == PickupExecutionState.REPLAN:
+            self.runtime.clear_route()
+            self.drive_guard.wheel_controller.reset()
+            drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; requesting new route")
+            self.runtime.reset_pickup_state()
+            return True
+
+        return False
+
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         return [
             PlannedBallTarget(
@@ -647,6 +753,8 @@ class TopdownDetectorApp:
 
     def update_route(self, result: VisionFrameResult, params: dict[str, object]) -> None:
         self.runtime.latest_smoothed_balls = result.smoothed_ball_coordinates
+        if self.runtime.pickup_state != PickupExecutionState.NAVIGATION:
+            return
         if result.occupancy_grid is None:
             self.runtime.selected_start_cm = None
             self.runtime.clear_route()
@@ -729,6 +837,7 @@ class TopdownDetectorApp:
         self.runtime.selected_ball_track_id = None
         self.runtime.selected_start_cm = None
         self.runtime.clear_route()
+        self.runtime.reset_pickup_state()
         self.latest_result = None
         self.latest_params = None
         self.latest_camera_ground_projection = None
@@ -1404,20 +1513,25 @@ class TopdownDetectorApp:
                 self.update_robot_pose(preprocessed.normalized, params)
                 result = self.process_preprocessed_topdown(pipeline, raw_frame, preprocessed, params)
                 self.update_route(result, params)
-                self.drive_guard.enforce_xte_guard_before_replan(
-                    self.runtime.robot_pose,
-                    self.runtime.route_plan.points,
-                    drive_runtime,
-                    clear_route_cache=self.runtime.clear_route,
-                )
-                self.drive_guard.update_drive_control(
-                    self.runtime.robot_pose,
-                    self.runtime.route_plan.points,
-                    drive_runtime,
-                    clear_route_cache=self.runtime.clear_route,
-                )
                 now = time.perf_counter()
-                fps = 1.0 / max(1e-6, now - last_tick)
+                frame_dt_s = max(1e-6, now - last_tick)
+                pickup_owns_control = self.update_pickup_state(drive_runtime, now)
+                if not pickup_owns_control:
+                    self.drive_guard.enforce_xte_guard_before_replan(
+                        self.runtime.robot_pose,
+                        self.runtime.route_plan.points,
+                        drive_runtime,
+                        clear_route_cache=self.runtime.clear_route,
+                    )
+                    self.drive_guard.update_drive_control(
+                        self.runtime.robot_pose,
+                        self.runtime.route_plan.points,
+                        drive_runtime,
+                        clear_route_cache=self.runtime.clear_route,
+                        local_goal_poses=self.runtime.route_plan.pickup_poses,
+                        dt_s=frame_dt_s,
+                    )
+                fps = 1.0 / frame_dt_s
                 last_tick = now
                 combined, masks, schematic = self.render(result, params, fps=fps, drive_runtime=drive_runtime)
                 self.latest_result = result

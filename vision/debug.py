@@ -399,16 +399,16 @@ class DebugRenderer:
         pickup_poses: list[HybridPose],
         geometry: RobotGeometry,
     ) -> None:
-        """Draw bold footprints at every planned ball pickup pose."""
+        """Draw slim footprints at planned ball pickup poses."""
         for pickup_pose in pickup_poses:
             self.draw_robot_footprint_snapshot(
                 schematic,
                 pickup_pose,
                 geometry,
-                alpha=0.48,
+                alpha=0.18,
                 base_color=(255, 0, 255),
-                intake_color=(0, 255, 255),
-                thickness=3,
+                intake_color=(255, 255, 0),
+                thickness=1,
             )
 
     def draw_control_xte_on_schematic(

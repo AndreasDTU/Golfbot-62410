@@ -20,11 +20,13 @@ class WheelCommandController:
         self.config = drive_config or DriveConfig()
         self.previous_cross_track_error: float | None = None
         self.previous_heading_error: float | None = None
+        self.previous_profile_speed_pct: float = 0.0
 
     def reset(self) -> None:
         """Clear derivative history after stops, replans, or route loss."""
         self.previous_cross_track_error = None
         self.previous_heading_error = None
+        self.previous_profile_speed_pct = 0.0
 
     @staticmethod
     def target_speed_for_distance(distance_to_goal_cm: float, config: DriveConfig | None = None) -> float:
@@ -42,6 +44,20 @@ class WheelCommandController:
         ratio = (distance - drive_config.creep_distance_cm) / span
         return drive_config.creep_speed_pct + ratio * (drive_config.base_speed_pct - drive_config.creep_speed_pct)
 
+    def slew_limited_speed(self, desired_speed_pct: float, dt_s: float | None) -> float:
+        """Apply deterministic acceleration/deceleration limits to forward speed."""
+        desired = float(np.clip(desired_speed_pct, 0.0, self.config.max_speed_pct))
+        if dt_s is None or dt_s <= 1e-6:
+            self.previous_profile_speed_pct = desired
+            return desired
+
+        previous = self.previous_profile_speed_pct
+        accel_step = max(0.0, self.config.acceleration_limit_pct_per_s) * dt_s
+        decel_step = max(0.0, self.config.deceleration_limit_pct_per_s) * dt_s
+        limited = float(np.clip(desired, previous - decel_step, previous + accel_step))
+        self.previous_profile_speed_pct = limited
+        return limited
+
     def compute(
         self,
         error: RouteTrackingError,
@@ -57,7 +73,8 @@ class WheelCommandController:
             )
         )
         forward_scale = max(0.0, 1.0 - abs(heading_error) / self.config.max_heading_for_forward_rad)
-        base_speed = self.target_speed_for_distance(distance_to_goal_cm, self.config) * forward_scale
+        desired_base_speed = self.target_speed_for_distance(distance_to_goal_cm, self.config) * forward_scale
+        base_speed = self.slew_limited_speed(desired_base_speed, dt_s)
 
         heading_derivative = 0.0
         cross_track_derivative = 0.0

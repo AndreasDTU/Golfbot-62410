@@ -46,12 +46,11 @@ class DebugRenderer:
         """Read live robot geometry, falling back to tuned defaults."""
         return RobotPoseEstimator(self.field, self.robot_config, self.mapper).robot_geometry_from_params(params)
 
-    def route_velocity_color(self, distance_to_goal_cm: float) -> tuple[int, int, int]:
-        """Map the profiled route speed to a BGR heatmap color."""
-        target = WheelCommandController.target_speed_for_distance(distance_to_goal_cm, self.drive_config)
+    def route_velocity_color_for_speed(self, speed_pct: float) -> tuple[int, int, int]:
+        """Map a profiled speed to a BGR heatmap color."""
         creep = max(0.0, float(self.drive_config.creep_speed_pct))
         cruise = max(creep + 1e-6, float(self.drive_config.base_speed_pct))
-        ratio = float(np.clip((target - creep) / (cruise - creep), 0.0, 1.0))
+        ratio = float(np.clip((speed_pct - creep) / (cruise - creep), 0.0, 1.0))
         if ratio < 0.5:
             local = ratio / 0.5
             red = int(round(255 * local))
@@ -61,6 +60,19 @@ class DebugRenderer:
             red = 255
             green = int(round(255 * (1.0 - local)))
         return (0, green, red)
+
+    def route_velocity_color(self, distance_to_goal_cm: float) -> tuple[int, int, int]:
+        """Map the one-sided distance profile to a BGR heatmap color."""
+        target = WheelCommandController.target_speed_for_distance(distance_to_goal_cm, self.drive_config)
+        return self.route_velocity_color_for_speed(target)
+
+    @staticmethod
+    def cumulative_route_lengths(route_points_cm: list[HybridPose]) -> list[float]:
+        """Return cumulative route arclength at each sampled pose."""
+        cumulative = [0.0]
+        for start, end in zip(route_points_cm[:-1], route_points_cm[1:]):
+            cumulative.append(cumulative[-1] + math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm))
+        return cumulative
 
     def draw_velocity_profile_route(
         self,
@@ -74,6 +86,8 @@ class DebugRenderer:
         checkpoints = route_checkpoint_indices(route_points_cm, route_pickup_poses_cm, include_final=True)
         if not checkpoints:
             checkpoints = [len(route_points_cm) - 1]
+        stop_indices = [0, *checkpoints]
+        cumulative = self.cumulative_route_lengths(route_points_cm)
         for segment_index, (start, end) in enumerate(zip(route_points_cm[:-1], route_points_cm[1:])):
             start_px = self.mapper.field_metric_cm_to_schematic((start.x_cm, start.y_cm))
             end_px = self.mapper.field_metric_cm_to_schematic((end.x_cm, end.y_cm))
@@ -82,9 +96,19 @@ class DebugRenderer:
                 (checkpoint for checkpoint in checkpoints if checkpoint >= next_route_index),
                 checkpoints[-1],
             )
-            goal = route_points_cm[checkpoint_index]
-            distance_to_goal = math.hypot(start.x_cm - goal.x_cm, start.y_cm - goal.y_cm)
-            cv2.line(schematic, start_px, end_px, self.route_velocity_color(distance_to_goal), 3, cv2.LINE_AA)
+            previous_stop_index = max((stop for stop in stop_indices if stop <= segment_index), default=0)
+            distance_since_stop = max(0.0, cumulative[segment_index] - cumulative[previous_stop_index])
+            distance_to_stop = max(0.0, cumulative[checkpoint_index] - cumulative[segment_index])
+            accel_speed = WheelCommandController.target_speed_for_distance(distance_since_stop, self.drive_config)
+            decel_speed = WheelCommandController.target_speed_for_distance(distance_to_stop, self.drive_config)
+            cv2.line(
+                schematic,
+                start_px,
+                end_px,
+                self.route_velocity_color_for_speed(min(accel_speed, decel_speed)),
+                3,
+                cv2.LINE_AA,
+            )
 
     def robot_footprint_metric_polygons(
         self,

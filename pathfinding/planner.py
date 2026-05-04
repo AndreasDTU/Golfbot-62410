@@ -24,6 +24,8 @@ def normalize_planner_angle(theta_rad: float) -> float:
 class RobotFootprintCollisionChecker:
     """Check an oriented multi-circle robot model against raw red occupancy."""
 
+    VALID_EPSILON_CM: float = 1e-6
+
     def __init__(
         self,
         raw_red_grid: np.ndarray,
@@ -115,19 +117,20 @@ class RobotFootprintCollisionChecker:
         The pickup tube is intentionally excluded from boundary and red-zone
         collision checks so it can overhang walls while reaching corner balls.
         """
+        return self.pose_violation_score(pose) <= self.VALID_EPSILON_CM
+
+    def pose_violation_score(self, pose: HybridPose) -> float:
+        """Return summed boundary/red-zone penetration for start-escape planning."""
+        violation = 0.0
         for x_grid, y_grid, radius_cm in self.oriented_circle_centers(pose, self.base_circles):
-            if (
-                x_grid - radius_cm < 0.0
-                or x_grid + radius_cm > self.width - 1
-                or y_grid - radius_cm < 0.0
-                or y_grid + radius_cm > self.height - 1
-            ):
-                return False
+            violation += max(0.0, radius_cm - x_grid)
+            violation += max(0.0, x_grid + radius_cm - (self.width - 1))
+            violation += max(0.0, radius_cm - y_grid)
+            violation += max(0.0, y_grid + radius_cm - (self.height - 1))
             x_index = int(np.clip(round(x_grid), 0, self.width - 1))
             y_index = int(np.clip(round(y_grid), 0, self.height - 1))
-            if float(self.distance_to_red[y_index, x_index]) < radius_cm:
-                return False
-        return True
+            violation += max(0.0, radius_cm - float(self.distance_to_red[y_index, x_index]))
+        return violation
 
 
 class GridDijkstraHeuristic:
@@ -354,11 +357,11 @@ class HybridAStarPlanner:
             y_cm=float(start_pose.y_cm),
             theta_rad=normalize_planner_angle(start_pose.theta_rad),
         )
-        if not collision_checker.is_pose_valid(start_pose):
-            return []
-
         goal_x, goal_y = self.small_goal_staging_center_cm(geometry)
-        if math.hypot(start_pose.x_cm - goal_x, start_pose.y_cm - goal_y) <= radius_cm:
+        if (
+            collision_checker.is_pose_valid(start_pose)
+            and math.hypot(start_pose.x_cm - goal_x, start_pose.y_cm - goal_y) <= radius_cm
+        ):
             return [start_pose]
 
         goal_node = (
@@ -385,7 +388,10 @@ class HybridAStarPlanner:
                 continue
 
             current_pose = pose_by_key[current_key]
-            if math.hypot(goal_x - current_pose.x_cm, goal_y - current_pose.y_cm) <= radius_cm:
+            if (
+                collision_checker.is_pose_valid(current_pose)
+                and math.hypot(goal_x - current_pose.x_cm, goal_y - current_pose.y_cm) <= radius_cm
+            ):
                 return self.reconstruct_path(came_from, pose_by_key, current_key)
 
             expansions += 1
@@ -395,7 +401,12 @@ class HybridAStarPlanner:
                     y_cm=float(neighbor_pose.y_cm),
                     theta_rad=normalize_planner_angle(neighbor_pose.theta_rad),
                 )
-                if not collision_checker.is_pose_valid(neighbor_pose):
+                transition_allowed, _neighbor_violation = self.allows_start_escape_transition(
+                    collision_checker,
+                    current_pose,
+                    neighbor_pose,
+                )
+                if not transition_allowed:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
@@ -437,9 +448,6 @@ class HybridAStarPlanner:
             theta_rad=normalize_planner_angle(start_pose.theta_rad),
         )
 
-        if not collision_checker.is_pose_valid(start_pose):
-            return []
-
         goal_x, goal_y = self.small_goal_center_cm()
         goal_node = (
             int(np.clip(round(goal_x), 0, raw_red_grid.shape[1] - 1)),
@@ -467,7 +475,7 @@ class HybridAStarPlanner:
                 continue
 
             current_pose = pose_by_key[current_key]
-            if self.is_unload_goal_reached(current_pose, geometry):
+            if collision_checker.is_pose_valid(current_pose) and self.is_unload_goal_reached(current_pose, geometry):
                 return self.reconstruct_path(came_from, pose_by_key, current_key)
 
             expansions += 1
@@ -477,7 +485,12 @@ class HybridAStarPlanner:
                     y_cm=float(neighbor_pose.y_cm),
                     theta_rad=normalize_planner_angle(neighbor_pose.theta_rad),
                 )
-                if not collision_checker.is_pose_valid(neighbor_pose):
+                transition_allowed, _neighbor_violation = self.allows_start_escape_transition(
+                    collision_checker,
+                    current_pose,
+                    neighbor_pose,
+                )
+                if not transition_allowed:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
@@ -646,6 +659,22 @@ class HybridAStarPlanner:
         path.reverse()
         return path
 
+    @staticmethod
+    def allows_start_escape_transition(
+        collision_checker: RobotFootprintCollisionChecker,
+        current_pose: HybridPose,
+        next_pose: HybridPose,
+    ) -> tuple[bool, float]:
+        """Allow invalid-start expansion only when collision violation improves."""
+        current_violation = collision_checker.pose_violation_score(current_pose)
+        next_violation = collision_checker.pose_violation_score(next_pose)
+        if current_violation <= collision_checker.VALID_EPSILON_CM:
+            return next_violation <= collision_checker.VALID_EPSILON_CM, next_violation
+        return (
+            next_violation <= collision_checker.VALID_EPSILON_CM
+            or next_violation < current_violation - collision_checker.VALID_EPSILON_CM
+        ), next_violation
+
     def expand_neighbors(
         self,
         pose: HybridPose,
@@ -692,9 +721,6 @@ class HybridAStarPlanner:
             theta_rad=normalize_planner_angle(start_pose.theta_rad),
         )
 
-        if not collision_checker.is_pose_valid(start_pose):
-            return []
-
         dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
         start_key = self.state_key(start_pose, cfg.theta_bins)
         open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
@@ -713,7 +739,10 @@ class HybridAStarPlanner:
                 continue
 
             current_pose = pose_by_key[current_key]
-            if self.goal_distance(current_pose, goal_node, geometry, goal_point_cm) <= cfg.goal_tolerance_cm:
+            if (
+                collision_checker.is_pose_valid(current_pose)
+                and self.goal_distance(current_pose, goal_node, geometry, goal_point_cm) <= cfg.goal_tolerance_cm
+            ):
                 path = self.reconstruct_path(came_from, pose_by_key, current_key)
                 final_pose = self.pickup_aligned_pose_for_theta(goal_node, current_pose.theta_rad, geometry, goal_point_cm)
                 if collision_checker.is_pose_valid(final_pose):
@@ -730,7 +759,12 @@ class HybridAStarPlanner:
                     y_cm=float(neighbor_pose.y_cm),
                     theta_rad=normalize_planner_angle(neighbor_pose.theta_rad),
                 )
-                if not collision_checker.is_pose_valid(neighbor_pose):
+                transition_allowed, _neighbor_violation = self.allows_start_escape_transition(
+                    collision_checker,
+                    current_pose,
+                    neighbor_pose,
+                )
+                if not transition_allowed:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
@@ -783,7 +817,7 @@ class HybridAStarPlanner:
             theta_rad=normalize_planner_angle(goal_pose.theta_rad),
         )
 
-        if not collision_checker.is_pose_valid(start_pose) or not collision_checker.is_pose_valid(goal_pose):
+        if not collision_checker.is_pose_valid(goal_pose):
             return []
 
         goal_node = (
@@ -814,7 +848,11 @@ class HybridAStarPlanner:
             current_pose = pose_by_key[current_key]
             distance_cm = math.hypot(goal_pose.x_cm - current_pose.x_cm, goal_pose.y_cm - current_pose.y_cm)
             heading_error = abs(normalize_planner_angle(goal_pose.theta_rad - current_pose.theta_rad))
-            if distance_cm <= cfg.goal_tolerance_cm and heading_error <= heading_tolerance_rad:
+            if (
+                collision_checker.is_pose_valid(current_pose)
+                and distance_cm <= cfg.goal_tolerance_cm
+                and heading_error <= heading_tolerance_rad
+            ):
                 path = self.reconstruct_path(came_from, pose_by_key, current_key)
                 if math.hypot(goal_pose.x_cm - current_pose.x_cm, goal_pose.y_cm - current_pose.y_cm) > 1e-6:
                     path.append(goal_pose)
@@ -829,7 +867,12 @@ class HybridAStarPlanner:
                     y_cm=float(neighbor_pose.y_cm),
                     theta_rad=normalize_planner_angle(neighbor_pose.theta_rad),
                 )
-                if not collision_checker.is_pose_valid(neighbor_pose):
+                transition_allowed, _neighbor_violation = self.allows_start_escape_transition(
+                    collision_checker,
+                    current_pose,
+                    neighbor_pose,
+                )
+                if not transition_allowed:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)

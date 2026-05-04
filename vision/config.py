@@ -310,6 +310,10 @@ class DriveConfig:
     cruise_distance_cm: float = 30.0
     creep_distance_cm: float = 10.0
     creep_speed_pct: float = 7.0
+    # Percent-speed-per-second kinematic limits used by both runtime control
+    # and the route heatmap. Tune these with robot battery/load conditions.
+    acceleration_limit_pct_per_s: float = 45.0
+    deceleration_limit_pct_per_s: float = 90.0
     blind_approach_trigger_cm: float = 8.0
     blind_approach_duration_s: float = 1.0
     max_heading_for_forward_rad: float = math.radians(70.0)

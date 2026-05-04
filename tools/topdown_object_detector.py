@@ -414,7 +414,7 @@ class TopdownDetectorApp:
 
     def update_route(self, result: VisionFrameResult, params: dict[str, object]) -> None:
         self.runtime.latest_smoothed_balls = result.smoothed_ball_coordinates
-        if result.occupancy_grid is None or not result.smoothed_ball_coordinates:
+        if result.occupancy_grid is None:
             self.runtime.selected_start_cm = None
             self.runtime.clear_route()
             return
@@ -441,6 +441,11 @@ class TopdownDetectorApp:
             start_pose = HybridPose(selected_ball.cm_x, selected_ball.cm_y, 0.0)
             self.runtime.selected_start_cm = self.mapper.field_metric_cm_to_grid_node((selected_ball.cm_x, selected_ball.cm_y))
         else:
+            self.runtime.selected_start_cm = None
+            self.runtime.clear_route()
+            return
+
+        if not result.smoothed_ball_coordinates and self.runtime.robot_pose is None:
             self.runtime.selected_start_cm = None
             self.runtime.clear_route()
             return

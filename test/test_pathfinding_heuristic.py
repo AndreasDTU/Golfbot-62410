@@ -1,4 +1,5 @@
 import unittest
+import math
 
 import numpy as np
 
@@ -63,6 +64,27 @@ class SmallGoalUnloadRouteTests(unittest.TestCase):
             np.hypot(unload_tip[0] - route.unload_goal_cm[0], unload_tip[1] - route.unload_goal_cm[1]),
             1e-6,
         )
+
+    def test_empty_ball_list_routes_directly_to_small_goal(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=10.0,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        planner = HybridAStarPlanner(field_config=field)
+        route_planner = GreedyRoutePlanner(planner)
+        start_pose = HybridPose(60.0, field.height_cm * 0.5, math.pi)
+
+        route = route_planner.plan(grid, [], start_pose, geometry)
+
+        self.assertGreaterEqual(len(route.points), 2)
+        self.assertIsNotNone(route.unload_pose)
+        self.assertEqual(route.unload_goal_cm, (0.0, field.height_cm * 0.5))
 
 
 if __name__ == "__main__":

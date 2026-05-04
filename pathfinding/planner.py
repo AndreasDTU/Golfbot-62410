@@ -273,6 +273,20 @@ class HybridAStarPlanner:
             theta_rad=0.0,
         )
 
+    def small_goal_unload_pose_candidates(self, geometry: RobotGeometry) -> list[HybridPose]:
+        """Return deterministic rear-unload poses spanning the small goal opening."""
+        goal_x, goal_y = self.small_goal_center_cm()
+        reach_cm = geometry.rear_cm + geometry.unload_extension_cm
+        offsets_cm = (0.0, -2.0, 2.0, -3.5, 3.5)
+        return [
+            HybridPose(
+                x_cm=goal_x + reach_cm,
+                y_cm=float(np.clip(goal_y + offset_cm, 0.0, self.field.height_cm)),
+                theta_rad=0.0,
+            )
+            for offset_cm in offsets_cm
+        ]
+
     def goal_to_field_metric_cm(
         self,
         goal_node: tuple[int, int],
@@ -643,6 +657,46 @@ class GreedyRoutePlanner:
         self.hybrid_planner = hybrid_planner or HybridAStarPlanner(config=config)
         self.config = config or self.hybrid_planner.config
 
+    def plan_unload_segment(
+        self,
+        grid: np.ndarray,
+        current_pose: HybridPose,
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig,
+    ) -> tuple[list[HybridPose], HybridPose | None, tuple[float, float] | None]:
+        """Plan from the current pose to a valid small-goal rear-unload pose."""
+        for candidate_unload_pose in self.hybrid_planner.small_goal_unload_pose_candidates(geometry):
+            unload_segment = self.hybrid_planner.search_pose_goal(
+                grid,
+                current_pose,
+                candidate_unload_pose,
+                geometry,
+                config,
+            )
+            if unload_segment:
+                return unload_segment, unload_segment[-1], self.hybrid_planner.small_goal_center_cm()
+
+        print("Hybrid A* could not route from current pose to any small goal unload pose.")
+        return [], None, None
+
+    def plan_unload_only(
+        self,
+        grid: np.ndarray,
+        start_pose: HybridPose,
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig | None = None,
+    ) -> RoutePlan:
+        """Build a route directly to the small goal when no balls remain visible."""
+        cfg = config or self.config
+        unload_segment, unload_pose, unload_goal_cm = self.plan_unload_segment(grid, start_pose, geometry, cfg)
+        return RoutePlan(
+            points=unload_segment,
+            active_target=None,
+            pickup_poses=[],
+            unload_pose=unload_pose,
+            unload_goal_cm=unload_goal_cm,
+        )
+
     def plan(
         self,
         grid: np.ndarray,
@@ -653,7 +707,7 @@ class GreedyRoutePlanner:
     ) -> RoutePlan:
         """Build an orange-first Hybrid A* collection route."""
         if not ball_targets:
-            return RoutePlan(points=[], active_target=None, pickup_poses=[])
+            return self.plan_unload_only(grid, start_pose, geometry, config)
 
         cfg = config or self.config
         unvisited = list(ball_targets)
@@ -727,20 +781,9 @@ class GreedyRoutePlanner:
         unload_pose: HybridPose | None = None
         unload_goal_cm: tuple[float, float] | None = None
         if pickup_poses:
-            candidate_unload_pose = self.hybrid_planner.small_goal_unload_pose(geometry)
-            unload_segment = self.hybrid_planner.search_pose_goal(
-                grid,
-                current_pose,
-                candidate_unload_pose,
-                geometry,
-                cfg,
-            )
+            unload_segment, unload_pose, unload_goal_cm = self.plan_unload_segment(grid, current_pose, geometry, cfg)
             if unload_segment:
                 route.extend(unload_segment[1:])
-                unload_pose = unload_segment[-1]
-                unload_goal_cm = self.hybrid_planner.small_goal_center_cm()
-            else:
-                print("Hybrid A* could not route from final pickup to the small goal unload pose.")
 
         return RoutePlan(
             points=route,

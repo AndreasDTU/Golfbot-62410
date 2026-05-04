@@ -53,6 +53,7 @@ class RobotGeometry:
     rear_cm: float
     tube_forward_cm: float
     tube_right_cm: float
+    unload_extension_cm: float = 15.0
 
 
 @dataclass(frozen=True)

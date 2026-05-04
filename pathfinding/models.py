@@ -33,6 +33,8 @@ class RoutePlan:
     points: list[HybridPose]
     active_target: PlannedBallTarget | None
     pickup_poses: list[HybridPose]
+    unload_pose: HybridPose | None = None
+    unload_goal_cm: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)

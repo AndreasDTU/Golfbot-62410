@@ -249,6 +249,30 @@ class HybridAStarPlanner:
             pose.y_cm + forward[1] * geometry.tube_forward_cm + right[1] * geometry.tube_right_cm,
         )
 
+    @staticmethod
+    def rear_unload_point_for_pose(pose: HybridPose, geometry: RobotGeometry) -> tuple[float, float]:
+        """Return the field-coordinate rear unload tip when the mechanism is lowered."""
+        reach_cm = geometry.rear_cm + geometry.unload_extension_cm
+        forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
+        return (
+            pose.x_cm - forward[0] * reach_cm,
+            pose.y_cm - forward[1] * reach_cm,
+        )
+
+    def small_goal_center_cm(self) -> tuple[float, float]:
+        """Return the fixed small-goal center on the left side of the field."""
+        return 0.0, self.field.height_cm * 0.5
+
+    def small_goal_unload_pose(self, geometry: RobotGeometry) -> HybridPose:
+        """Return the base pose whose rear unload tip reaches the small goal."""
+        goal_x, goal_y = self.small_goal_center_cm()
+        reach_cm = geometry.rear_cm + geometry.unload_extension_cm
+        return HybridPose(
+            x_cm=goal_x + reach_cm,
+            y_cm=goal_y,
+            theta_rad=0.0,
+        )
+
     def goal_to_field_metric_cm(
         self,
         goal_node: tuple[int, int],
@@ -436,6 +460,107 @@ class HybridAStarPlanner:
             )
         return []
 
+    def search_pose_goal(
+        self,
+        raw_red_grid: np.ndarray,
+        start_pose: HybridPose,
+        goal_pose: HybridPose,
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig | None = None,
+    ) -> list[HybridPose]:
+        """Search a kinematically valid trajectory to a robot-origin pose."""
+        cfg = config or self.config
+        collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry, self.field, self.robot_config)
+        start_pose = HybridPose(
+            x_cm=float(start_pose.x_cm),
+            y_cm=float(start_pose.y_cm),
+            theta_rad=normalize_planner_angle(start_pose.theta_rad),
+        )
+        goal_pose = HybridPose(
+            x_cm=float(goal_pose.x_cm),
+            y_cm=float(goal_pose.y_cm),
+            theta_rad=normalize_planner_angle(goal_pose.theta_rad),
+        )
+
+        if not collision_checker.is_pose_valid(start_pose) or not collision_checker.is_pose_valid(goal_pose):
+            return []
+
+        goal_node = (
+            int(np.clip(round(goal_pose.x_cm), 0, raw_red_grid.shape[1] - 1)),
+            int(np.clip(round(self.field.height_cm - goal_pose.y_cm), 0, raw_red_grid.shape[0] - 1)),
+        )
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
+        heading_tolerance_rad = max(math.pi / float(cfg.theta_bins), math.radians(8.0))
+
+        start_key = self.state_key(start_pose, cfg.theta_bins)
+        open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+        counter = 0
+        start_h = dijkstra_heuristic.cost_from_field_point((start_pose.x_cm, start_pose.y_cm), self.field)
+        if not math.isfinite(start_h):
+            start_h = math.hypot(goal_pose.x_cm - start_pose.x_cm, goal_pose.y_cm - start_pose.y_cm)
+        heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+
+        came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+        pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
+        g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+        expansions = 0
+
+        while open_heap and expansions < cfg.max_expansions:
+            _f_cost, current_cost, _counter, current_key = heapq.heappop(open_heap)
+            if current_cost > g_score.get(current_key, float("inf")):
+                continue
+
+            current_pose = pose_by_key[current_key]
+            distance_cm = math.hypot(goal_pose.x_cm - current_pose.x_cm, goal_pose.y_cm - current_pose.y_cm)
+            heading_error = abs(normalize_planner_angle(goal_pose.theta_rad - current_pose.theta_rad))
+            if distance_cm <= cfg.goal_tolerance_cm and heading_error <= heading_tolerance_rad:
+                path = self.reconstruct_path(came_from, pose_by_key, current_key)
+                if math.hypot(goal_pose.x_cm - current_pose.x_cm, goal_pose.y_cm - current_pose.y_cm) > 1e-6:
+                    path.append(goal_pose)
+                else:
+                    path[-1] = goal_pose
+                return path
+
+            expansions += 1
+            for neighbor_pose, primitive_cost in self.expand_neighbors(current_pose, cfg):
+                neighbor_pose = HybridPose(
+                    x_cm=float(neighbor_pose.x_cm),
+                    y_cm=float(neighbor_pose.y_cm),
+                    theta_rad=normalize_planner_angle(neighbor_pose.theta_rad),
+                )
+                if not collision_checker.is_pose_valid(neighbor_pose):
+                    continue
+
+                neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
+                tentative_g = g_score[current_key] + primitive_cost
+                if tentative_g >= g_score.get(neighbor_key, float("inf")):
+                    continue
+
+                came_from[neighbor_key] = current_key
+                pose_by_key[neighbor_key] = neighbor_pose
+                g_score[neighbor_key] = tentative_g
+                heuristic = dijkstra_heuristic.cost_from_field_point((neighbor_pose.x_cm, neighbor_pose.y_cm), self.field)
+                if not math.isfinite(heuristic):
+                    heuristic = math.hypot(goal_pose.x_cm - neighbor_pose.x_cm, goal_pose.y_cm - neighbor_pose.y_cm)
+                heading_error = abs(normalize_planner_angle(goal_pose.theta_rad - neighbor_pose.theta_rad))
+                counter += 1
+                heapq.heappush(
+                    open_heap,
+                    (
+                        tentative_g + max(0.0, heuristic - cfg.goal_tolerance_cm) + heading_error * 3.0,
+                        tentative_g,
+                        counter,
+                        neighbor_key,
+                    ),
+                )
+
+        if expansions >= cfg.max_expansions:
+            print(
+                f"Hybrid A* search exhausted max nodes ({cfg.max_expansions}) "
+                f"for unload goal after {expansions} expansions."
+            )
+        return []
+
 
 class LegacyAStarPlanner:
     """Legacy 8-connected A* search on a binary occupancy grid."""
@@ -599,7 +724,31 @@ class GreedyRoutePlanner:
             if active_target is None:
                 active_target = chosen_target
 
-        return RoutePlan(points=route, active_target=active_target, pickup_poses=pickup_poses)
+        unload_pose: HybridPose | None = None
+        unload_goal_cm: tuple[float, float] | None = None
+        if pickup_poses:
+            candidate_unload_pose = self.hybrid_planner.small_goal_unload_pose(geometry)
+            unload_segment = self.hybrid_planner.search_pose_goal(
+                grid,
+                current_pose,
+                candidate_unload_pose,
+                geometry,
+                cfg,
+            )
+            if unload_segment:
+                route.extend(unload_segment[1:])
+                unload_pose = unload_segment[-1]
+                unload_goal_cm = self.hybrid_planner.small_goal_center_cm()
+            else:
+                print("Hybrid A* could not route from final pickup to the small goal unload pose.")
+
+        return RoutePlan(
+            points=route,
+            active_target=active_target,
+            pickup_poses=pickup_poses,
+            unload_pose=unload_pose,
+            unload_goal_cm=unload_goal_cm,
+        )
 
 
 class RoutePlanner(Protocol):

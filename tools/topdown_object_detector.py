@@ -56,6 +56,7 @@ class RuntimeState:
     route_cache_target_label: str | None = None
     route_cache_target_cm: tuple[float, float] | None = None
     route_cache_ball_signature: tuple[tuple[int, str, int, int], ...] = field(default_factory=tuple)
+    route_cache_unload_extension_cm: float | None = None
     robot_pose: RobotPose | None = None
     robot_topdown_px: tuple[float, float] | None = None
     latest_smoothed_balls: list[SmoothedBallCoordinate] = field(default_factory=list)
@@ -66,6 +67,7 @@ class RuntimeState:
         self.route_cache_target_label = None
         self.route_cache_target_cm = None
         self.route_cache_ball_signature = ()
+        self.route_cache_unload_extension_cm = None
 
 
 class IdentityPreprocessor:
@@ -198,7 +200,7 @@ class TopdownDetectorApp:
             return self.config.field.grid_height_cm
         if key == "heading_tuning":
             return 360
-        if key in {"robot_width_cmx10", "robot_front_cmx10", "robot_rear_cmx10", "tube_forward_cmx10"}:
+        if key in {"robot_width_cmx10", "robot_front_cmx10", "robot_rear_cmx10", "tube_forward_cmx10", "unload_extension_cmx10"}:
             return 500
         if key == "tube_right_cmx10":
             return 1000
@@ -303,6 +305,7 @@ class TopdownDetectorApp:
             "robot_rear_cm": float(self.get_trackbar_value("robot_rear_cmx10")) / 10.0,
             "tube_forward_cm": float(self.get_trackbar_value("tube_forward_cmx10")) / 10.0,
             "tube_right_cm": float(self.get_trackbar_value("tube_right_cmx10")) / 10.0 - 50.0,
+            "unload_extension_cm": float(self.get_trackbar_value("unload_extension_cmx10")) / 10.0,
         }
 
     def build_image_pipeline(self) -> VisionPipeline:
@@ -379,6 +382,10 @@ class TopdownDetectorApp:
             return False
         if self.runtime.route_cache_ball_signature != self.ball_cache_signature(smoothed_balls):
             return False
+        if self.runtime.route_cache_unload_extension_cm is None:
+            return False
+        if abs(float(params["unload_extension_cm"]) - self.runtime.route_cache_unload_extension_cm) > 1e-6:
+            return False
         if self.runtime.route_cache_target_id < 0:
             return (
                 self.route_facade.nearest_route_distance_cm(current_pose, self.runtime.route_plan.points)
@@ -448,6 +455,7 @@ class TopdownDetectorApp:
             geometry,
         )
         self.runtime.route_cache_ball_signature = self.ball_cache_signature(result.smoothed_ball_coordinates)
+        self.runtime.route_cache_unload_extension_cm = geometry.unload_extension_cm
         if self.runtime.route_plan.active_target is None:
             self.runtime.route_cache_target_id = -1
             self.runtime.route_cache_target_label = None
@@ -586,6 +594,8 @@ class TopdownDetectorApp:
                 camera_center_pixels=(float(params["camera_center_x"]), float(params["camera_center_y"])),
                 route_points_cm=[],
                 route_pickup_poses_cm=[],
+                route_unload_pose_cm=None,
+                route_unload_goal_cm=None,
                 selected_start_cm=None,
                 selected_ball_track_id=None,
                 robot_pose=None,
@@ -647,6 +657,8 @@ class TopdownDetectorApp:
             camera_center_pixels=(float(params["camera_center_x"]), float(params["camera_center_y"])),
             route_points_cm=self.runtime.route_plan.points,
             route_pickup_poses_cm=self.runtime.route_plan.pickup_poses,
+            route_unload_pose_cm=self.runtime.route_plan.unload_pose,
+            route_unload_goal_cm=self.runtime.route_plan.unload_goal_cm,
             selected_start_cm=self.runtime.selected_start_cm,
             selected_ball_track_id=self.runtime.selected_ball_track_id,
             robot_pose=self.runtime.robot_pose,

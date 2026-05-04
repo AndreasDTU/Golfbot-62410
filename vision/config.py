@@ -128,6 +128,7 @@ class RobotGeometryConfig:
     tuned_tube_offset_cm: float = 17.1
     tuned_tube_right_offset_cm: float = 0.0
     tube_width_cm: float = 6.0
+    tuned_unload_extension_cm: float = 15.0
 
     @property
     def front_axle_from_origin_cm(self) -> float:
@@ -206,6 +207,7 @@ class DetectionConfig:
             "robot_rear_cmx10": int(round(robot.tuned_footprint_rear_from_origin_cm * 10.0)),
             "tube_forward_cmx10": int(round(robot.tuned_tube_offset_cm * 10.0)),
             "tube_right_cmx10": int(round((robot.tuned_tube_right_offset_cm + 50.0) * 10.0)),
+            "unload_extension_cmx10": int(round(robot.tuned_unload_extension_cm * 10.0)),
         }
 
 
@@ -237,6 +239,7 @@ class TrackbarConfig:
             "robot_rear_cmx10": "Body R x10",
             "tube_forward_cmx10": "Tube F x10",
             "tube_right_cmx10": "Tube R+50 x10",
+            "unload_extension_cmx10": "Unload ext x10",
         }
     )
 
@@ -264,6 +267,7 @@ class TrackbarConfig:
             "robot_rear_cmx10": window.control_geometry_window_name,
             "tube_forward_cmx10": window.control_geometry_window_name,
             "tube_right_cmx10": window.control_geometry_window_name,
+            "unload_extension_cmx10": window.control_geometry_window_name,
         }
 
 

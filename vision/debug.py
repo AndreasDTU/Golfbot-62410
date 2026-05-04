@@ -85,6 +85,41 @@ class DebugRenderer:
         ]
         return base, intake
 
+    def unload_mechanism_metric_polygon(
+        self,
+        pose: HybridPose,
+        geometry: RobotGeometry,
+    ) -> list[tuple[float, float]]:
+        """Return the lowered rear unloading mechanism in bottom-left field centimeters."""
+        if geometry.unload_extension_cm <= 0.0:
+            return []
+        forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
+        right = (math.sin(pose.theta_rad), -math.cos(pose.theta_rad))
+        half_width_cm = self.robot_config.tube_width_cm * 0.5
+        rear_center = (
+            pose.x_cm - forward[0] * geometry.rear_cm,
+            pose.y_cm - forward[1] * geometry.rear_cm,
+        )
+        unload_tip = HybridAStarPlanner.rear_unload_point_for_pose(pose, geometry)
+        return [
+            (rear_center[0] + right[0] * half_width_cm, rear_center[1] + right[1] * half_width_cm),
+            (rear_center[0] - right[0] * half_width_cm, rear_center[1] - right[1] * half_width_cm),
+            (unload_tip[0] - right[0] * half_width_cm, unload_tip[1] - right[1] * half_width_cm),
+            (unload_tip[0] + right[0] * half_width_cm, unload_tip[1] + right[1] * half_width_cm),
+        ]
+
+    def draw_field_goals(self, schematic: np.ndarray) -> None:
+        """Draw the fixed goal openings centered on each field end."""
+        center_y = self.field.height_cm * 0.5
+        small_half_cm = 4.0
+        large_half_cm = 10.0
+        small_a = self.mapper.field_metric_cm_to_schematic((0.0, center_y - small_half_cm))
+        small_b = self.mapper.field_metric_cm_to_schematic((0.0, center_y + small_half_cm))
+        large_a = self.mapper.field_metric_cm_to_schematic((self.field.width_cm, center_y - large_half_cm))
+        large_b = self.mapper.field_metric_cm_to_schematic((self.field.width_cm, center_y + large_half_cm))
+        cv2.line(schematic, large_a, large_b, (180, 220, 180), 7, cv2.LINE_AA)
+        cv2.line(schematic, small_a, small_b, (0, 255, 180), 7, cv2.LINE_AA)
+
     def draw_robot_footprint_snapshot(
         self,
         schematic: np.ndarray,
@@ -94,21 +129,40 @@ class DebugRenderer:
         base_color: tuple[int, int, int],
         intake_color: tuple[int, int, int],
         thickness: int,
+        show_unload: bool = False,
     ) -> None:
         """Draw one stylized robot footprint snapshot for route orientation QA."""
         base_cm, intake_cm = self.robot_footprint_metric_polygons(pose, geometry)
+        unload_cm = self.unload_mechanism_metric_polygon(pose, geometry) if show_unload else []
         base_px = np.array([self.mapper.field_metric_cm_to_schematic(point) for point in base_cm], dtype=np.int32).reshape(-1, 1, 2)
         intake_px = np.array([self.mapper.field_metric_cm_to_schematic(point) for point in intake_cm], dtype=np.int32).reshape(-1, 1, 2)
+        unload_px = (
+            np.array([self.mapper.field_metric_cm_to_schematic(point) for point in unload_cm], dtype=np.int32).reshape(-1, 1, 2)
+            if unload_cm
+            else None
+        )
         origin_px = self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
         tube_px = self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.tube_center_for_pose(pose, geometry))
+        unload_tip_px = (
+            self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.rear_unload_point_for_pose(pose, geometry))
+            if show_unload
+            else None
+        )
 
         overlay = schematic.copy()
         cv2.fillPoly(overlay, [base_px], base_color, cv2.LINE_AA)
         cv2.fillPoly(overlay, [intake_px], intake_color, cv2.LINE_AA)
+        if unload_px is not None:
+            cv2.fillPoly(overlay, [unload_px], (0, 255, 180), cv2.LINE_AA)
         cv2.addWeighted(overlay, alpha, schematic, 1.0 - alpha, 0.0, schematic)
         cv2.polylines(schematic, [base_px], True, base_color, thickness, cv2.LINE_AA)
         cv2.polylines(schematic, [intake_px], True, intake_color, max(1, thickness - 1), cv2.LINE_AA)
+        if unload_px is not None:
+            cv2.polylines(schematic, [unload_px], True, (0, 255, 180), max(1, thickness - 1), cv2.LINE_AA)
         cv2.arrowedLine(schematic, origin_px, tube_px, intake_color, thickness, cv2.LINE_AA, tipLength=0.35)
+        if unload_tip_px is not None:
+            cv2.line(schematic, origin_px, unload_tip_px, (0, 255, 180), max(1, thickness - 1), cv2.LINE_AA)
+            cv2.circle(schematic, unload_tip_px, max(3, thickness + 1), (0, 255, 180), -1, cv2.LINE_AA)
         cv2.circle(schematic, origin_px, max(3, thickness + 2), base_color, -1, cv2.LINE_AA)
 
     def draw_route_heading_indicators(
@@ -480,7 +534,8 @@ class DebugRenderer:
             f"Spin points: {counts}",
             (
                 f"Geom W:{geometry.width_cm:.1f} F/R:{geometry.front_cm:.1f}/{geometry.rear_cm:.1f} "
-                f"Tube:{geometry.tube_forward_cm:.1f},{geometry.tube_right_cm:.1f}"
+                f"Tube:{geometry.tube_forward_cm:.1f},{geometry.tube_right_cm:.1f} "
+                f"Unload:{geometry.unload_extension_cm:.1f}"
             ),
         ]
         if robot_pose is not None:
@@ -607,6 +662,8 @@ class DebugRenderer:
         camera_center_pixels: tuple[float, float],
         route_points_cm: list[HybridPose] | None = None,
         route_pickup_poses_cm: list[HybridPose] | None = None,
+        route_unload_pose_cm: HybridPose | None = None,
+        route_unload_goal_cm: tuple[float, float] | None = None,
         selected_start_cm: tuple[int, int] | None = None,
         selected_ball_track_id: int | None = None,
         robot_pose: RobotPose | None = None,
@@ -630,6 +687,7 @@ class DebugRenderer:
             2,
             cv2.LINE_AA,
         )
+        self.draw_field_goals(schematic)
 
         for zone in red_zones:
             mapped_contour = zone.corrected_contour.astype(np.float32).copy()
@@ -682,6 +740,20 @@ class DebugRenderer:
                 ):
                     self.draw_robot_footprint_snapshot(schematic, route_points_cm[index], geometry, 0.18, (255, 0, 255), (255, 255, 0), 1)
             self.draw_pickup_footprints(schematic, route_pickup_poses_cm or [], geometry)
+            if route_unload_pose_cm is not None:
+                self.draw_robot_footprint_snapshot(
+                    schematic,
+                    route_unload_pose_cm,
+                    geometry,
+                    0.28,
+                    (255, 0, 255),
+                    (255, 255, 0),
+                    2,
+                    show_unload=True,
+                )
+            if route_unload_goal_cm is not None:
+                goal_px = self.mapper.field_metric_cm_to_schematic(route_unload_goal_cm)
+                cv2.drawMarker(schematic, goal_px, (0, 255, 180), cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
 
         if selected_start_cm is not None:
             if robot_pose is not None:
@@ -701,10 +773,13 @@ class DebugRenderer:
         if robot_pose is not None:
             pose = robot_pose
             robot_center = self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
-            base_cm, _intake_cm = self.robot_footprint_metric_polygons(HybridPose(pose.x_cm, pose.y_cm, pose.heading_rad), geometry)
+            live_pose = HybridPose(pose.x_cm, pose.y_cm, pose.heading_rad)
+            base_cm, intake_cm = self.robot_footprint_metric_polygons(live_pose, geometry)
             footprint_px = np.array([self.mapper.field_metric_cm_to_schematic(point) for point in base_cm], dtype=np.int32).reshape(-1, 1, 2)
+            intake_px = np.array([self.mapper.field_metric_cm_to_schematic(point) for point in intake_cm], dtype=np.int32).reshape(-1, 1, 2)
             tube_center = self.mapper.field_metric_cm_to_schematic((pose.tube_x_cm, pose.tube_y_cm))
             cv2.polylines(schematic, [footprint_px], True, (255, 90, 30), 2, cv2.LINE_AA)
+            cv2.polylines(schematic, [intake_px], True, (0, 255, 255), 2, cv2.LINE_AA)
             cv2.circle(schematic, robot_center, 7, (255, 90, 30), -1, cv2.LINE_AA)
             cv2.circle(schematic, robot_center, 11, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.arrowedLine(schematic, robot_center, tube_center, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.28)

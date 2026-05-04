@@ -37,6 +37,13 @@ Vision module outputs, every frame (or at fixed tick rate):
 -   DebugOverlays (for development): masks + detections + grid + corner
     markers
 
+Routing/control note: path planning and drive control consume these mapped
+outputs after Grid Mapping. The current detector UI uses Hybrid A* over
+`(x, y, theta)` with an oriented robot footprint, then computes XTE/heading
+error and dispatches left/right wheel speeds directly from
+`tools/topdown_object_detector.py`; see `docs/PATHFINDING_ARCHITECTURE.md`.
+This does not change the required vision pipeline order below.
+
 ------------------------------------------------------------------------
 
 ## Pipeline Overview (Required Order)

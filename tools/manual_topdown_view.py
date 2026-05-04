@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,7 @@ from camera.imageprocessing import undistort_with_calibration
 
 
 CALIBRATION_FILE = REPO_ROOT / "calibration_data.npz"
+VIDEOS_DIR = REPO_ROOT / "videos"
 CAMERA_INDEX = 0
 LIVE_WINDOW = "Manual Top-Down Selector"
 TOPDOWN_WINDOW = "Top-Down View"
@@ -153,6 +155,7 @@ def draw_selection_overlay(frame: np.ndarray, state: SelectionState) -> np.ndarr
         f"Points: {len(state.points)}/4",
         "Left click: add point",
         "Right click or r: reset",
+        "Space: pause/resume",
         "q: quit",
     ]
     for line_index, text in enumerate(help_lines):
@@ -222,32 +225,141 @@ def on_mouse(event: int, x: int, y: int, _flags: int, param: SelectionState) -> 
         param.transform_matrix = build_transform(param.points)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Manually select four corners and view the undistorted top-down warp."
+    )
+    parser.add_argument(
+        "--video",
+        type=Path,
+        help="Read frames from a video file instead of the default camera. Bare names are loaded from videos/.",
+    )
+    parser.add_argument(
+        "--resize-video-to-calibration",
+        action="store_true",
+        help=(
+            "Video mode only: resize each recorded frame to calibration_data.npz size "
+            "before undistortion if the recording resolution differs."
+        ),
+    )
+    return parser.parse_args()
+
+
+def load_calibration_image_size(calibration_file: Path) -> tuple[int, int]:
+    data = np.load(str(calibration_file))
+    return tuple(int(value) for value in data["image_size"])
+
+
+def resolve_video_path(video_path: Path) -> Path:
+    if video_path.exists():
+        return video_path
+
+    repo_path = REPO_ROOT / video_path
+    if repo_path.exists():
+        return repo_path
+
+    videos_path = VIDEOS_DIR / video_path
+    if videos_path.exists():
+        return videos_path
+
+    return video_path
+
+
+def open_capture(video_path: Path | None) -> tuple[cv2.VideoCapture, str]:
+    if video_path is None:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        return cap, f"camera {CAMERA_INDEX}"
+
+    cap = cv2.VideoCapture(str(video_path))
+    return cap, str(video_path)
+
+
+def playback_delay_ms(cap: cv2.VideoCapture, is_video: bool) -> int:
+    if not is_video:
+        return 1
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        return 30
+    return max(1, int(round(1000 / fps)))
+
+
+def resize_frame_to_size(frame_bgr: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
+    target_width, target_height = target_size
+    frame_height, frame_width = frame_bgr.shape[:2]
+    if (frame_width, frame_height) == target_size:
+        return frame_bgr
+
+    interpolation = (
+        cv2.INTER_AREA
+        if frame_width > target_width or frame_height > target_height
+        else cv2.INTER_LINEAR
+    )
+    return cv2.resize(frame_bgr, target_size, interpolation=interpolation)
+
+
 def main() -> int:
+    args = parse_args()
     cv2.ocl.setUseOpenCL(False)
 
     if not CALIBRATION_FILE.exists():
         print(f"Calibration file not found: {CALIBRATION_FILE}", file=sys.stderr)
         return 1
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print(f"Could not open camera {CAMERA_INDEX}", file=sys.stderr)
+    video_path = resolve_video_path(args.video) if args.video is not None else None
+    if video_path is not None and not video_path.exists():
+        print(
+            f"Video file not found: {args.video} "
+            f"(also checked {VIDEOS_DIR / args.video})",
+            file=sys.stderr,
+        )
+        return 1
+    if args.resize_video_to_calibration and video_path is None:
+        print("--resize-video-to-calibration only applies when --video is used.", file=sys.stderr)
         return 1
 
+    resize_to_size = (
+        load_calibration_image_size(CALIBRATION_FILE)
+        if args.resize_video_to_calibration
+        else None
+    )
+
+    cap, source_name = open_capture(video_path)
+    if not cap.isOpened():
+        print(f"Could not open {source_name}", file=sys.stderr)
+        return 1
+
+    wait_delay = playback_delay_ms(cap, video_path is not None)
     state = SelectionState()
+    paused = False
+    current_frame: np.ndarray | None = None
+    resize_notice_shown = False
     cv2.namedWindow(LIVE_WINDOW)
     cv2.namedWindow(TOPDOWN_WINDOW)
     cv2.setMouseCallback(LIVE_WINDOW, on_mouse, state)
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                print("Could not read frame from camera", file=sys.stderr)
-                return 1
+            if not paused or current_frame is None:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    if video_path is not None:
+                        break
+                    print(f"Could not read frame from {source_name}", file=sys.stderr)
+                    return 1
+                if resize_to_size is not None:
+                    original_size = (int(frame.shape[1]), int(frame.shape[0]))
+                    frame = resize_frame_to_size(frame, resize_to_size)
+                    if original_size != resize_to_size and not resize_notice_shown:
+                        print(
+                            f"Resizing video frames from {original_size} to {resize_to_size} "
+                            "before undistortion."
+                        )
+                        resize_notice_shown = True
+                current_frame = frame
 
             try:
-                undistorted = undistort_with_calibration(frame, str(CALIBRATION_FILE))
+                undistorted = undistort_with_calibration(current_frame, str(CALIBRATION_FILE))
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -266,11 +378,13 @@ def main() -> int:
             cv2.imshow(LIVE_WINDOW, live_view)
             cv2.imshow(TOPDOWN_WINDOW, topdown)
 
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(wait_delay) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("r"):
                 state.clear_points()
+            if key == ord(" "):
+                paused = not paused
 
         return 0
     finally:

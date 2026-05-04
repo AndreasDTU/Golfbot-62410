@@ -40,6 +40,9 @@ class TopdownDetectorAppShellTests(unittest.TestCase):
         self.assertEqual(state.route_plan.pickup_poses, [])
         self.assertIsNone(state.route_plan.unload_pose)
         self.assertIsNone(state.route_plan.unload_goal_cm)
+        self.assertIsNone(state.route_failed_ball_signature)
+        self.assertIsNone(state.route_failed_unload_extension_cm)
+        self.assertIsNone(state.route_failed_start_signature)
 
     def test_parse_args_defaults(self) -> None:
         original_argv = __import__("sys").argv

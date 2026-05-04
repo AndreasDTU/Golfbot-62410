@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
+import queue
 import sys
 import time
 from dataclasses import dataclass, field
@@ -30,7 +32,7 @@ from pathfinding.planner import RoutePlanningFacade
 from robot.control import DriveSafetyGuard
 from robot.io import UdpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
-from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotPose
+from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose
 from vision.calibration import HomographyCalibrator
 from vision.config import AppConfig
 from vision.debug import DebugRenderer
@@ -57,6 +59,9 @@ class RuntimeState:
     route_cache_target_cm: tuple[float, float] | None = None
     route_cache_ball_signature: tuple[tuple[int, str, int, int], ...] = field(default_factory=tuple)
     route_cache_unload_extension_cm: float | None = None
+    route_failed_ball_signature: tuple[tuple[int, str, int, int], ...] | None = None
+    route_failed_unload_extension_cm: float | None = None
+    route_failed_start_signature: tuple[int, int, int] | None = None
     robot_pose: RobotPose | None = None
     robot_topdown_px: tuple[float, float] | None = None
     latest_smoothed_balls: list[SmoothedBallCoordinate] = field(default_factory=list)
@@ -68,6 +73,129 @@ class RuntimeState:
         self.route_cache_target_cm = None
         self.route_cache_ball_signature = ()
         self.route_cache_unload_extension_cm = None
+        self.route_failed_ball_signature = None
+        self.route_failed_unload_extension_cm = None
+        self.route_failed_start_signature = None
+
+
+@dataclass(frozen=True)
+class RoutePlanningRequest:
+    """Immutable route-planning job submitted from the UI loop."""
+
+    request_id: int
+    grid: np.ndarray
+    ball_targets: list[PlannedBallTarget]
+    start_pose: HybridPose
+    geometry: RobotGeometry
+    ball_signature: tuple[tuple[int, str, int, int], ...]
+    start_signature: tuple[int, int, int]
+    unload_extension_cm: float
+
+
+@dataclass(frozen=True)
+class RoutePlanningResult:
+    """Completed route-planning job returned by the background worker."""
+
+    request: RoutePlanningRequest
+    route_plan: RoutePlan
+    duration_ms: float
+    error: str | None = None
+
+
+def route_planning_worker(
+    request_queue: mp.Queue,
+    result_queue: mp.Queue,
+    config: AppConfig,
+) -> None:
+    """Run Hybrid A* requests in a separate process."""
+    cv2.ocl.setUseOpenCL(False)
+    route_facade = RoutePlanningFacade(config.field, config.robot, config.planner)
+    while True:
+        request = request_queue.get()
+        if request is None:
+            return
+        start = time.perf_counter()
+        try:
+            route_plan = route_facade.plan_route(
+                request.grid,
+                request.ball_targets,
+                request.start_pose,
+                request.geometry,
+            )
+            result = RoutePlanningResult(
+                request=request,
+                route_plan=route_plan,
+                duration_ms=(time.perf_counter() - start) * 1000.0,
+            )
+        except Exception as exc:
+            result = RoutePlanningResult(
+                request=request,
+                route_plan=RoutePlan(points=[], active_target=None, pickup_poses=[]),
+                duration_ms=(time.perf_counter() - start) * 1000.0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        result_queue.put(result)
+
+
+class AsyncRoutePlanner:
+    """Run Hybrid A* planning in a separate process via queues."""
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self._context = mp.get_context("spawn")
+        self._request_queue: mp.Queue = self._context.Queue(maxsize=1)
+        self._result_queue: mp.Queue = self._context.Queue(maxsize=1)
+        self._process: mp.Process | None = None
+        self._busy = False
+
+    def is_busy(self) -> bool:
+        if self._process is None:
+            return False
+        if self._process is not None and not self._process.is_alive():
+            self._busy = False
+            self._start_worker()
+        return self._busy
+
+    def submit(self, request: RoutePlanningRequest) -> bool:
+        if self.is_busy():
+            return False
+        if self._process is None or not self._process.is_alive():
+            self._start_worker()
+        try:
+            self._request_queue.put_nowait(request)
+        except queue.Full:
+            return False
+        self._busy = True
+        return True
+
+    def poll_completed(self) -> RoutePlanningResult | None:
+        try:
+            result = self._result_queue.get_nowait()
+        except queue.Empty:
+            return None
+        self._busy = False
+        return result
+
+    def close(self) -> None:
+        if self._process is None:
+            return
+        try:
+            self._request_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._process.join(timeout=0.5)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=0.5)
+
+    def _start_worker(self) -> None:
+        self._process = self._context.Process(
+            target=route_planning_worker,
+            args=(self._request_queue, self._result_queue, self.config),
+            name="hybrid-route-planner",
+            daemon=True,
+        )
+        self._process.start()
 
 
 class IdentityPreprocessor:
@@ -101,6 +229,8 @@ class TopdownDetectorApp:
         self.mapper = CoordinateMapper(self.config.field, self.config.camera, self.config.windows)
         self.renderer = DebugRenderer(self.config.field, self.config.windows, self.config.robot, self.mapper)
         self.route_facade = RoutePlanningFacade(self.config.field, self.config.robot, self.config.planner)
+        self.async_route_planner = AsyncRoutePlanner(self.config)
+        self.route_request_counter = 0
         self.robot_estimator = RobotPoseEstimator(self.config.field, self.config.robot, self.mapper)
         self.robot_calibration_collector = RobotCalibrationCollector(self.config.robot, self.config.robot_calibration)
         self.drive_guard = DriveSafetyGuard(self.config.drive, self.route_facade)
@@ -372,6 +502,109 @@ class TopdownDetectorApp:
             )
         )
 
+    def install_route_plan(
+        self,
+        route_plan: RoutePlan,
+        ball_signature: tuple[tuple[int, str, int, int], ...],
+        unload_extension_cm: float,
+    ) -> None:
+        """Publish a completed route and its cache metadata to the UI/control loop."""
+        self.runtime.route_plan = route_plan
+        self.runtime.route_cache_ball_signature = ball_signature
+        self.runtime.route_cache_unload_extension_cm = unload_extension_cm
+        self.runtime.route_failed_ball_signature = None
+        self.runtime.route_failed_unload_extension_cm = None
+        self.runtime.route_failed_start_signature = None
+        if route_plan.active_target is None:
+            self.runtime.route_cache_target_id = -1
+            self.runtime.route_cache_target_label = None
+            self.runtime.route_cache_target_cm = None
+        else:
+            target = route_plan.active_target
+            self.runtime.route_cache_target_id = target.track_id
+            self.runtime.route_cache_target_label = target.label
+            self.runtime.route_cache_target_cm = (target.x_cm, target.y_cm)
+
+    def mark_route_failed(
+        self,
+        ball_signature: tuple[tuple[int, str, int, int], ...],
+        start_signature: tuple[int, int, int],
+        unload_extension_cm: float,
+    ) -> None:
+        """Remember a failed route request so the frame loop does not resubmit it every frame."""
+        self.runtime.route_failed_ball_signature = ball_signature
+        self.runtime.route_failed_start_signature = start_signature
+        self.runtime.route_failed_unload_extension_cm = unload_extension_cm
+
+    def route_failure_is_current(
+        self,
+        ball_signature: tuple[tuple[int, str, int, int], ...],
+        start_signature: tuple[int, int, int],
+        unload_extension_cm: float,
+    ) -> bool:
+        return (
+            self.runtime.route_failed_ball_signature == ball_signature
+            and self.runtime.route_failed_start_signature == start_signature
+            and self.runtime.route_failed_unload_extension_cm is not None
+            and abs(self.runtime.route_failed_unload_extension_cm - unload_extension_cm) <= 1e-6
+        )
+
+    @staticmethod
+    def route_start_signature(start_pose: HybridPose) -> tuple[int, int, int]:
+        """Bucket a start pose so failed-route throttling can recover after movement."""
+        return (
+            int(round(start_pose.x_cm / 5.0)),
+            int(round(start_pose.y_cm / 5.0)),
+            int(round(normalize_angle(start_pose.theta_rad) / math.radians(15.0))),
+        )
+
+    def accept_completed_route_if_current(
+        self,
+        ball_signature: tuple[tuple[int, str, int, int], ...],
+        unload_extension_cm: float,
+    ) -> None:
+        """Install a finished worker route only when it still matches the current scene."""
+        completed = self.async_route_planner.poll_completed()
+        if completed is None:
+            return
+        request = completed.request
+        if request.ball_signature != ball_signature or abs(request.unload_extension_cm - unload_extension_cm) > 1e-6:
+            return
+        if completed.error is not None:
+            self.robot_runtime.warning = f"Route worker failed: {completed.error}"
+            self.mark_route_failed(request.ball_signature, request.start_signature, request.unload_extension_cm)
+        elif completed.route_plan.points:
+            self.install_route_plan(completed.route_plan, request.ball_signature, request.unload_extension_cm)
+        else:
+            self.mark_route_failed(request.ball_signature, request.start_signature, request.unload_extension_cm)
+
+    def submit_route_plan_if_needed(
+        self,
+        grid: np.ndarray,
+        ball_targets: list[PlannedBallTarget],
+        start_pose: HybridPose,
+        geometry: RobotGeometry,
+        ball_signature: tuple[tuple[int, str, int, int], ...],
+    ) -> None:
+        """Submit a route request without blocking the frame/control loop."""
+        unload_extension_cm = geometry.unload_extension_cm
+        start_signature = self.route_start_signature(start_pose)
+        if self.async_route_planner.is_busy() or self.route_failure_is_current(ball_signature, start_signature, unload_extension_cm):
+            return
+        self.route_request_counter += 1
+        self.async_route_planner.submit(
+            RoutePlanningRequest(
+                request_id=self.route_request_counter,
+                grid=grid.copy(),
+                ball_targets=list(ball_targets),
+                start_pose=start_pose,
+                geometry=geometry,
+                ball_signature=ball_signature,
+                start_signature=start_signature,
+                unload_extension_cm=unload_extension_cm,
+            )
+        )
+
     def cached_route_is_valid(
         self,
         current_pose: HybridPose,
@@ -449,27 +682,24 @@ class TopdownDetectorApp:
             self.runtime.selected_start_cm = None
             self.runtime.clear_route()
             return
+        if not result.smoothed_ball_coordinates:
+            if not self.runtime.route_plan.points:
+                self.runtime.clear_route()
+            return
+
+        ball_signature = self.ball_cache_signature(result.smoothed_ball_coordinates)
+        self.accept_completed_route_if_current(ball_signature, geometry.unload_extension_cm)
 
         if self.cached_route_is_valid(start_pose, result.smoothed_ball_coordinates, params):
             return
 
-        self.runtime.route_plan = self.route_facade.plan_route(
+        self.submit_route_plan_if_needed(
             result.occupancy_grid,
             self._ball_targets(result.smoothed_ball_coordinates),
             start_pose,
             geometry,
+            ball_signature,
         )
-        self.runtime.route_cache_ball_signature = self.ball_cache_signature(result.smoothed_ball_coordinates)
-        self.runtime.route_cache_unload_extension_cm = geometry.unload_extension_cm
-        if self.runtime.route_plan.active_target is None:
-            self.runtime.route_cache_target_id = -1
-            self.runtime.route_cache_target_label = None
-            self.runtime.route_cache_target_cm = None
-        else:
-            target = self.runtime.route_plan.active_target
-            self.runtime.route_cache_target_id = target.track_id
-            self.runtime.route_cache_target_label = target.label
-            self.runtime.route_cache_target_cm = (target.x_cm, target.y_cm)
 
     def update_robot_pose(self, topdown_frame: np.ndarray | None, params: dict[str, object]) -> None:
         if topdown_frame is None:
@@ -1226,6 +1456,7 @@ class TopdownDetectorApp:
             drive_runtime.stop(DriveControlState.STOPPED, "shutdown")
             if dispatcher is not None:
                 dispatcher.close()
+            self.async_route_planner.close()
         return 0
 
     def run_live_mode(self, camera_index: int, balance: float, width: int, height: int, drive_enabled: bool) -> int:
@@ -1286,6 +1517,7 @@ class TopdownDetectorApp:
 
 
 def main() -> int:
+    mp.freeze_support()
     app = TopdownDetectorApp()
     return app.run(TopdownDetectorApp.parse_args())
 

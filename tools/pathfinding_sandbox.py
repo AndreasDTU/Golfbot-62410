@@ -29,7 +29,7 @@ from vision.models import RedZoneDetection, SmoothedBallCoordinate
 
 WINDOW_NAME = "Pathfinding Sandbox"
 BALL_LABELS = ("white", "orange")
-RANDOM_SCENARIO_SEED = 62410
+RANDOM_SCENARIO_SEED = 111002
 RANDOM_BALL_COUNT = 11
 RANDOM_WHITE_BALL_COUNT = 10
 CENTER_CROSS_SIZE_CM = 20.0

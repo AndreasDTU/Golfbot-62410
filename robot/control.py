@@ -9,8 +9,8 @@ import numpy as np
 
 from pathfinding.models import HybridPose, RouteTrackingError
 from pathfinding.planner import RoutePlanningFacade
-from robot.models import DriveControlState, DriveRuntime, RobotPose, WheelCommand
-from vision.config import DriveConfig
+from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose, WheelCommand
+from vision.config import DriveConfig, FieldConfig
 
 
 class WheelCommandController:
@@ -29,20 +29,49 @@ class WheelCommandController:
         self.previous_profile_speed_pct = 0.0
 
     @staticmethod
-    def target_speed_for_distance(distance_to_goal_cm: float, config: DriveConfig | None = None) -> float:
+    def edge_control_scale(edge_clearance_cm: float | None, config: DriveConfig | None = None) -> float:
+        """Return 0..1 edge proximity scale where 1 means normal open-field control."""
+        drive_config = config or DriveConfig()
+        if edge_clearance_cm is None or not math.isfinite(edge_clearance_cm):
+            return 1.0
+        if drive_config.edge_slowdown_cm <= 1e-6:
+            return 1.0
+        return float(np.clip(edge_clearance_cm / drive_config.edge_slowdown_cm, 0.0, 1.0))
+
+    @staticmethod
+    def edge_speed_multiplier(edge_clearance_cm: float | None, config: DriveConfig | None = None) -> float:
+        """Scale forward speed down as the robot body approaches a wall."""
+        drive_config = config or DriveConfig()
+        scale = WheelCommandController.edge_control_scale(edge_clearance_cm, drive_config)
+        return drive_config.edge_min_speed_scale + scale * (1.0 - drive_config.edge_min_speed_scale)
+
+    @staticmethod
+    def edge_gain_multiplier(edge_clearance_cm: float | None, config: DriveConfig | None = None) -> float:
+        """Scale proportional correction up as the robot body approaches a wall."""
+        drive_config = config or DriveConfig()
+        scale = WheelCommandController.edge_control_scale(edge_clearance_cm, drive_config)
+        return 1.0 + (1.0 - scale) * (drive_config.edge_max_gain_scale - 1.0)
+
+    @staticmethod
+    def target_speed_for_distance(
+        distance_to_goal_cm: float,
+        config: DriveConfig | None = None,
+        edge_clearance_cm: float | None = None,
+    ) -> float:
         """Return the profiled forward speed target for a goal distance."""
         drive_config = config or DriveConfig()
         if not math.isfinite(distance_to_goal_cm):
-            return drive_config.base_speed_pct
+            return drive_config.base_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
         distance = max(0.0, float(distance_to_goal_cm))
         if distance <= drive_config.creep_distance_cm:
             return drive_config.creep_speed_pct
         if distance >= drive_config.cruise_distance_cm:
-            return drive_config.base_speed_pct
+            return drive_config.base_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
 
         span = max(1e-6, drive_config.cruise_distance_cm - drive_config.creep_distance_cm)
         ratio = (distance - drive_config.creep_distance_cm) / span
-        return drive_config.creep_speed_pct + ratio * (drive_config.base_speed_pct - drive_config.creep_speed_pct)
+        edge_base_speed = drive_config.base_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
+        return drive_config.creep_speed_pct + ratio * (edge_base_speed - drive_config.creep_speed_pct)
 
     def slew_limited_speed(self, desired_speed_pct: float, dt_s: float | None) -> float:
         """Apply deterministic acceleration/deceleration limits to forward speed."""
@@ -63,6 +92,7 @@ class WheelCommandController:
         error: RouteTrackingError,
         distance_to_goal_cm: float = float("inf"),
         dt_s: float | None = None,
+        edge_clearance_cm: float | None = None,
     ) -> WheelCommand:
         """Compute a profiled PD wheel command for route tracking."""
         heading_error = float(
@@ -73,7 +103,11 @@ class WheelCommandController:
             )
         )
         forward_scale = max(0.0, 1.0 - abs(heading_error) / self.config.max_heading_for_forward_rad)
-        desired_base_speed = self.target_speed_for_distance(distance_to_goal_cm, self.config) * forward_scale
+        desired_base_speed = self.target_speed_for_distance(
+            distance_to_goal_cm,
+            self.config,
+            edge_clearance_cm=edge_clearance_cm,
+        ) * forward_scale
         base_speed = self.slew_limited_speed(desired_base_speed, dt_s)
 
         heading_derivative = 0.0
@@ -87,10 +121,11 @@ class WheelCommandController:
         self.previous_heading_error = heading_error
         self.previous_cross_track_error = error.signed_xte_cm
 
+        edge_gain = self.edge_gain_multiplier(edge_clearance_cm, self.config)
         turn_speed = (
-            self.config.heading_kp * heading_error
+            self.config.heading_kp * edge_gain * heading_error
             + self.config.heading_kd * heading_derivative
-            - self.config.xte_kp * error.signed_xte_cm
+            - self.config.xte_kp * edge_gain * error.signed_xte_cm
             - self.config.xte_kd * cross_track_derivative
         )
         left = float(np.clip(base_speed - turn_speed, -self.config.max_speed_pct, self.config.max_speed_pct))
@@ -167,6 +202,57 @@ def distance_to_route_goal_cm(
     return math.hypot(float(robot_pose.x_cm) - float(goal.x_cm), float(robot_pose.y_cm) - float(goal.y_cm))
 
 
+def route_goal_pose(
+    route: list[HybridPose],
+    tracking_error: RouteTrackingError | None = None,
+    local_goal_poses: list[HybridPose] | None = None,
+    *,
+    include_final: bool = True,
+) -> HybridPose | None:
+    """Return the next local pickup/unload checkpoint pose on the active route."""
+    goal_index = next_route_checkpoint_index(
+        route,
+        tracking_error,
+        local_goal_poses,
+        include_final=include_final,
+    )
+    if goal_index < 0:
+        return None
+    return route[goal_index]
+
+
+def robot_body_edge_clearance_cm(
+    robot_pose: RobotPose,
+    geometry: RobotGeometry,
+    field: FieldConfig | None = None,
+) -> float:
+    """Distance from the main robot body footprint to the nearest field edge."""
+    field_config = field or FieldConfig()
+    forward_x = math.cos(robot_pose.heading_rad)
+    forward_y = math.sin(robot_pose.heading_rad)
+    right_x = -math.sin(robot_pose.heading_rad)
+    right_y = math.cos(robot_pose.heading_rad)
+    half_width = max(0.0, float(geometry.width_cm) * 0.5)
+    extents = (
+        (float(geometry.front_cm), half_width),
+        (float(geometry.front_cm), -half_width),
+        (-float(geometry.rear_cm), half_width),
+        (-float(geometry.rear_cm), -half_width),
+    )
+    corners = [
+        (
+            float(robot_pose.x_cm) + forward_x * forward_cm + right_x * right_cm,
+            float(robot_pose.y_cm) + forward_y * forward_cm + right_y * right_cm,
+        )
+        for forward_cm, right_cm in extents
+    ]
+    min_x = min(corner[0] for corner in corners)
+    max_x = max(corner[0] for corner in corners)
+    min_y = min(corner[1] for corner in corners)
+    max_y = max(corner[1] for corner in corners)
+    return min(min_x, min_y, float(field_config.width_cm) - max_x, float(field_config.height_cm) - max_y)
+
+
 class DriveSafetyGuard:
     """Apply deterministic route-tracking safety decisions before motor dispatch."""
 
@@ -218,6 +304,7 @@ class DriveSafetyGuard:
         replan: Callable[[], None] | None = None,
         local_goal_poses: list[HybridPose] | None = None,
         dt_s: float | None = None,
+        robot_geometry: RobotGeometry | None = None,
     ) -> None:
         """Run the master-controller step after perception and route-cache update."""
         if drive_runtime is None:
@@ -261,6 +348,11 @@ class DriveSafetyGuard:
                 replan()
             return
 
+        edge_clearance_cm = (
+            robot_body_edge_clearance_cm(robot_pose, robot_geometry, self.route_facade.field)
+            if robot_geometry is not None
+            else None
+        )
         command = self.wheel_controller.compute(
             tracking_error,
             distance_to_goal_cm=distance_to_route_goal_cm(
@@ -270,6 +362,7 @@ class DriveSafetyGuard:
                 local_goal_poses,
             ),
             dt_s=dt_s,
+            edge_clearance_cm=edge_clearance_cm,
         )
         drive_runtime.last_command = command
         if drive_runtime.dispatcher is None:

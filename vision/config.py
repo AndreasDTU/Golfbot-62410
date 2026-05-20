@@ -310,6 +310,12 @@ class DriveConfig:
     cruise_distance_cm: float = 30.0
     creep_distance_cm: float = 10.0
     creep_speed_pct: float = 7.0
+    near_zone_cm: float = 15.0
+    near_zone_turn_speed_pct: float = 30.0
+    near_zone_move_speed_pct: float = 25.0
+    edge_slowdown_cm: float = 15.0
+    edge_min_speed_scale: float = 0.35
+    edge_max_gain_scale: float = 1.6
     # Percent-speed-per-second kinematic limits used by both runtime control
     # and the route heatmap. Tune these with robot battery/load conditions.
     acceleration_limit_pct_per_s: float = 45.0

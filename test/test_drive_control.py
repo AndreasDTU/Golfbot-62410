@@ -1,0 +1,105 @@
+import math
+import unittest
+from unittest.mock import patch
+
+from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
+from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
+from robot.models import DriveRuntime, RobotGeometry, RobotPose
+from tools.topdown_object_detector import PickupExecutionState, TopdownDetectorApp
+from vision.config import DriveConfig, FieldConfig
+
+
+class FakeDispatcher:
+    def __init__(self) -> None:
+        self.commands: list[tuple[float, float, bool]] = []
+        self.last_error = ""
+
+    def send_wheel_speeds(self, left_pct: float, right_pct: float, force: bool = False) -> bool:
+        self.commands.append((left_pct, right_pct, force))
+        return True
+
+
+class DriveControlTests(unittest.TestCase):
+    def test_body_edge_clearance_uses_main_body_footprint(self) -> None:
+        pose = RobotPose(x_cm=20.0, y_cm=20.0, heading_rad=0.0, tube_x_cm=35.0, tube_y_cm=20.0)
+        geometry = RobotGeometry(width_cm=20.0, front_cm=8.0, rear_cm=10.0, tube_forward_cm=18.0, tube_right_cm=0.0)
+
+        clearance = robot_body_edge_clearance_cm(pose, geometry, FieldConfig(width_cm=167.0, height_cm=121.5))
+
+        self.assertAlmostEqual(clearance, 10.0)
+
+    def test_edge_scaling_slows_forward_speed_and_increases_correction(self) -> None:
+        config = DriveConfig()
+        error = RouteTrackingError(
+            xte_cm=2.0,
+            signed_xte_cm=2.0,
+            heading_error_rad=0.1,
+            closest_point_cm=(0.0, 0.0),
+            segment_heading_rad=0.0,
+            segment_index=0,
+        )
+
+        open_field = WheelCommandController(config).compute(error, distance_to_goal_cm=50.0, edge_clearance_cm=30.0)
+        near_wall = WheelCommandController(config).compute(error, distance_to_goal_cm=50.0, edge_clearance_cm=0.0)
+
+        self.assertLess((near_wall.left_pct + near_wall.right_pct) * 0.5, (open_field.left_pct + open_field.right_pct) * 0.5)
+        self.assertGreater(abs(near_wall.right_pct - near_wall.left_pct), abs(open_field.right_pct - open_field.left_pct))
+
+    def test_route_goal_pose_uses_next_pickup_checkpoint(self) -> None:
+        route = [HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0), HybridPose(20.0, 0.0, 0.0)]
+        pickup = [HybridPose(10.0, 0.0, 0.0)]
+        error = RouteTrackingError(0.0, 0.0, 0.0, (0.0, 0.0), 0.0, 0)
+
+        self.assertEqual(route_goal_pose(route, error, pickup, include_final=False), route[1])
+
+    def test_near_zone_handoff_stops_udp_then_turns_and_runs_tcp_move(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.robot_pose = RobotPose(
+            x_cm=6.0,
+            y_cm=0.0,
+            heading_rad=math.radians(10.0),
+            tube_x_cm=0.0,
+            tube_y_cm=0.0,
+        )
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
+        )
+
+        events = []
+
+        def record_stop(left_pct: float, right_pct: float, force: bool = False) -> bool:
+            dispatcher.commands.append((left_pct, right_pct, force))
+            events.append(("udp", left_pct, None))
+            return True
+
+        dispatcher.send_wheel_speeds = record_stop
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+            def move(self, distance: float, speed_percent: int) -> str:
+                events.append(("move", distance, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
+
+        self.assertTrue(owns_control)
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+        self.assertEqual(events[0], ("udp", 0.0, None))
+        self.assertEqual(events[1], ("turn", 10.0, int(round(app.config.drive.near_zone_turn_speed_pct))))
+        self.assertEqual(events[2], ("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))))
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -31,11 +31,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from pathfinding.planner import RoutePlanningFacade
-from robot.control import DriveSafetyGuard, WheelCommandController, distance_to_route_goal_cm
+from robot.control import DriveSafetyGuard, distance_to_route_goal_cm, route_goal_pose
 from robot.controller import RobotController
 from robot.io import UdpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
-from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose, WheelCommand
+from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose
 from vision.calibration import HomographyCalibrator
 from vision.config import AppConfig
 from vision.debug import DebugRenderer
@@ -80,6 +80,7 @@ class RuntimeState:
     pickup_state: PickupExecutionState = PickupExecutionState.NAVIGATION
     pickup_state_started_s: float = 0.0
     pickup_command_fired: bool = False
+    near_zone_move_fired: bool = False
 
     def clear_route(self) -> None:
         self.route_plan = RoutePlan(points=[], active_target=None, pickup_poses=[])
@@ -96,6 +97,7 @@ class RuntimeState:
         self.pickup_state = PickupExecutionState.NAVIGATION
         self.pickup_state_started_s = 0.0
         self.pickup_command_fired = False
+        self.near_zone_move_fired = False
 
 
 @dataclass(frozen=True)
@@ -512,6 +514,81 @@ class TopdownDetectorApp:
             include_final=False,
         )
 
+    def _pickup_goal_pose(self) -> HybridPose | None:
+        if self.runtime.robot_pose is None or len(self.runtime.route_plan.points) < 2:
+            return None
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+        )
+        if tracking_error is None:
+            return None
+        return route_goal_pose(
+            self.runtime.route_plan.points,
+            tracking_error,
+            self.runtime.route_plan.pickup_poses,
+            include_final=False,
+        )
+
+    def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
+        """Stop UDP tracking, align with TCP turn, then finish with TCP encoder move."""
+        if self.runtime.near_zone_move_fired:
+            return True
+        distance_cm = self._pickup_distance_to_goal_cm()
+        if not math.isfinite(distance_cm) or distance_cm > self.config.drive.near_zone_cm:
+            return False
+
+        self.runtime.near_zone_move_fired = True
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.PRECISE_MOVE, "near-zone TCP align")
+        goal = self._pickup_goal_pose()
+        if goal is None:
+            drive_runtime.stop(DriveControlState.NO_ROUTE, "near-zone goal missing")
+            self.runtime.pickup_state = PickupExecutionState.REPLAN
+            self.runtime.pickup_state_started_s = time.perf_counter()
+            return True
+        remaining_cm = math.hypot(
+            float(goal.x_cm) - float(self.runtime.robot_pose.x_cm),
+            float(goal.y_cm) - float(self.runtime.robot_pose.y_cm),
+        )
+        if not math.isfinite(remaining_cm):
+            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, "near-zone distance invalid")
+            return True
+
+        target_heading_rad = math.atan2(
+            float(goal.y_cm) - float(self.runtime.robot_pose.y_cm),
+            float(goal.x_cm) - float(self.runtime.robot_pose.x_cm),
+        )
+        heading_error_deg = math.degrees(normalize_angle(target_heading_rad - float(self.runtime.robot_pose.heading_rad)))
+        tcp_turn_deg = -heading_error_deg
+
+        if remaining_cm <= 0.5:
+            self.runtime.pickup_state = PickupExecutionState.PICKUP
+            self.runtime.pickup_state_started_s = time.perf_counter()
+            return True
+
+        try:
+            controller = RobotController(self.config.drive.robot_ip)
+            if abs(tcp_turn_deg) > 0.5:
+                drive_runtime.last_message = f"TCP turn {tcp_turn_deg:.1f}deg"
+                controller.turn(
+                    round(tcp_turn_deg, 1),
+                    int(round(self.config.drive.near_zone_turn_speed_pct)),
+                )
+            drive_runtime.last_message = f"TCP move {remaining_cm:.1f}cm"
+            controller.move(
+                round(remaining_cm, 1),
+                int(round(self.config.drive.near_zone_move_speed_pct)),
+            )
+            drive_runtime.stop(DriveControlState.PICKUP, "TCP align/move complete")
+            self.runtime.pickup_state = PickupExecutionState.PICKUP
+            self.runtime.pickup_state_started_s = time.perf_counter()
+        except Exception as exc:
+            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"TCP align/move failed: {exc}")
+            self.runtime.pickup_state = PickupExecutionState.REPLAN
+            self.runtime.pickup_state_started_s = time.perf_counter()
+        return True
+
     def _start_pickup_command_thread(self) -> None:
         if self.pickup_thread is not None and self.pickup_thread.is_alive():
             return
@@ -527,39 +604,12 @@ class TopdownDetectorApp:
         self.pickup_thread.start()
 
     def update_pickup_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
-        """Run the blind-spot pickup handoff and return True when it owns motor output."""
+        """Run the near-zone TCP pickup handoff and return True when it owns motor output."""
         state = self.runtime.pickup_state
         if state == PickupExecutionState.NAVIGATION and drive_runtime.dispatcher is None:
             return False
         if state == PickupExecutionState.NAVIGATION:
-            if self._pickup_distance_to_goal_cm() >= self.config.drive.blind_approach_trigger_cm:
-                return False
-            self.runtime.pickup_state = PickupExecutionState.BLIND_APPROACH
-            self.runtime.pickup_state_started_s = now_s
-            self.runtime.pickup_command_fired = False
-            self.drive_guard.wheel_controller.reset()
-            state = self.runtime.pickup_state
-
-        if state == PickupExecutionState.BLIND_APPROACH:
-            elapsed_s = now_s - self.runtime.pickup_state_started_s
-            if elapsed_s < self.config.drive.blind_approach_duration_s:
-                creep_speed = WheelCommandController.target_speed_for_distance(0.0, self.config.drive)
-                drive_runtime.last_command = WheelCommand(creep_speed, creep_speed)
-                drive_runtime.state = DriveControlState.BLIND_APPROACH
-                drive_runtime.last_message = "open-loop creep"
-                if drive_runtime.dispatcher is None:
-                    drive_runtime.last_message = "blind approach: no dispatcher"
-                    return True
-                if not drive_runtime.dispatcher.send_wheel_speeds(creep_speed, creep_speed, force=True):
-                    drive_runtime.state = DriveControlState.DISPATCH_ERROR
-                    drive_runtime.last_message = drive_runtime.dispatcher.last_error
-                    drive_runtime.last_command = WheelCommand(0.0, 0.0)
-                return True
-
-            drive_runtime.stop(DriveControlState.PICKUP, "pickup actuator")
-            self.runtime.pickup_state = PickupExecutionState.PICKUP
-            self.runtime.pickup_state_started_s = now_s
-            state = self.runtime.pickup_state
+            return self._run_near_zone_precise_move(drive_runtime)
 
         if state == PickupExecutionState.PICKUP:
             drive_runtime.stop(DriveControlState.PICKUP, "pickup actuator")
@@ -1515,6 +1565,7 @@ class TopdownDetectorApp:
                 self.update_route(result, params)
                 now = time.perf_counter()
                 frame_dt_s = max(1e-6, now - last_tick)
+                robot_geometry = self.robot_estimator.robot_geometry_from_params(params)
                 pickup_owns_control = self.update_pickup_state(drive_runtime, now)
                 if not pickup_owns_control:
                     self.drive_guard.enforce_xte_guard_before_replan(
@@ -1530,6 +1581,7 @@ class TopdownDetectorApp:
                         clear_route_cache=self.runtime.clear_route,
                         local_goal_poses=self.runtime.route_plan.pickup_poses,
                         dt_s=frame_dt_s,
+                        robot_geometry=robot_geometry,
                     )
                 fps = 1.0 / frame_dt_s
                 last_tick = now

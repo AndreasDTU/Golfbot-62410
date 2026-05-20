@@ -17,22 +17,22 @@ class RobotController:
         try:
             self.sock.sendall((cmd + '\n').encode('utf-8'))
             return self.sock.recv(1024).decode('utf-8').strip()
-        except:
+        except OSError:
             self._connect()
             time.sleep(0.5)
-            self._send(cmd)
+            return self._send(cmd)
     
     def move(self, distance, speedPercent = 100):
-        self._send(f"move {distance} {speedPercent}")
+        return self._send(f"move {distance} {speedPercent}")
 
     def turn(self, degrees, speedPercent = 100):
-        self._send(f"turn {degrees} {speedPercent}")
+        return self._send(f"turn {degrees} {speedPercent}")
 
     def pickup(self):
-        self._send("pickup")
+        return self._send("pickup")
 
     def dropoff(self):
-        self._send("dropoff")
+        return self._send("dropoff")
 
     def stop(self):
-        self._send("stop")
+        return self._send("stop")

@@ -31,6 +31,13 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Changed
 
+- Rewrote `AGENTS.md` to match the current top-down object detection,
+  Hybrid A*, and hybrid UDP/TCP robot-control architecture.
+  - Updated the expected file structure.
+  - Replaced outdated vision-system assumptions with the current
+    `vision/`, `pathfinding/`, `robot/`, `tools/`, `docs/`, and `test/`
+    module responsibilities.
+  - Added current testing, safety, documentation, and changelog expectations.
 - Updated route planning to better match differential-drive physical behavior.
   - Final TCP moves are constrained to be collinear with the robot heading.
   - The visual route now traces the robot body center only; it no longer draws route lines to ball/tube coordinates.

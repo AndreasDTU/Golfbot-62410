@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
@@ -74,10 +75,46 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(breaks[0].final_pickup_pose, route[2])
         self.assertEqual(breaks[1].final_pickup_pose, route[4])
 
+    def test_ball_count_initializes_after_stable_detection_window(self) -> None:
+        app = TopdownDetectorApp()
+        result = SimpleNamespace(white_balls=[object(), object()], orange_balls=[object()])
+
+        for index in range(15):
+            app.update_ball_count_reconciliation(result, now_s=index * 0.06)
+
+        self.assertEqual(app.runtime.initial_total_balls, 3)
+        self.assertEqual(app.runtime.stable_visible_balls, 3)
+        self.assertEqual(app.runtime.balls_collected, 0)
+
+    def test_ball_count_debounce_rejects_flicker_before_reconciliation(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.initial_total_balls = 3
+        app.runtime.balls_collected = 1
+
+        for index, count in enumerate([2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2]):
+            result = SimpleNamespace(white_balls=[object()] * count, orange_balls=[])
+            app.update_ball_count_reconciliation(result, now_s=index * 0.06)
+
+        self.assertIsNone(app.runtime.stable_visible_balls)
+        self.assertEqual(app.runtime.balls_collected, 1)
+
+    def test_ball_count_reconciliation_decrements_missed_pickup(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.initial_total_balls = 3
+        app.runtime.balls_collected = 1
+        result = SimpleNamespace(white_balls=[object(), object(), object()], orange_balls=[])
+
+        for index in range(15):
+            app.update_ball_count_reconciliation(result, now_s=index * 0.06)
+
+        self.assertEqual(app.runtime.stable_visible_balls, 3)
+        self.assertEqual(app.runtime.balls_collected, 0)
+
     def test_near_zone_handoff_stops_udp_then_turns_and_runs_tcp_move(self) -> None:
         app = TopdownDetectorApp()
         dispatcher = FakeDispatcher()
         drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
         app.runtime.robot_pose = RobotPose(
             x_cm=6.0,
             y_cm=0.0,
@@ -120,6 +157,7 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(events[0], ("udp", 0.0, None))
         self.assertEqual(events[1], ("turn", 10.0, int(round(app.config.drive.near_zone_turn_speed_pct))))
         self.assertEqual(events[2], ("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))))
+        self.assertEqual(app.runtime.balls_collected, 1)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP)
 
 

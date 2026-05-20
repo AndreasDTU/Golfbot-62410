@@ -210,6 +210,22 @@ Agents SHOULD include simple validation scripts when appropriate.
 
 ---
 
+# Change Documentation
+
+Agents MUST update `CHANGELOG.md` whenever making a larger addition, behavioral
+change, architecture change, or user-visible workflow change.
+
+Changelog entries SHOULD summarize:
+
+* What was added or changed
+* Why the change matters operationally
+* Which key files or subsystems were affected
+* What validation or tests were run
+
+Tiny typo fixes or purely local cleanup do not require a changelog entry.
+
+---
+
 # Failure Handling Contract
 
 If vision cannot confidently detect balls:

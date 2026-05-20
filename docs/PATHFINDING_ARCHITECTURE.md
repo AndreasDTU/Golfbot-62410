@@ -66,9 +66,14 @@ geometry dependencies beyond OpenCV and NumPy.
 
 ## Pickup Offset
 
-The route goal is the intake tip, not the robot origin. Once Hybrid A* finds a
-feasible approach heading near a ball, the final waypoint is snapped to the
-exact base-center pose:
+The route is expressed in robot body-center coordinates. Ball pickup goals are
+generated as paired poses:
+
+- a standoff pose where UDP route tracking stops
+- a final pickup pose where the TCP encoder move ends and the tube center is on
+  the ball
+
+The final pickup pose is computed from each candidate approach heading:
 
 ```text
 base_target_x = ball_x - cos(theta) * intake_length
@@ -78,6 +83,21 @@ base_target_y = ball_y - sin(theta) * intake_length
 `intake_length` is the tuned `tube_forward_cm`, the physical pivot-to-pickup
 distance. If a lateral tube offset is tuned, it is also subtracted so the
 visualized pickup point still lands on the ball.
+
+The standoff pose is then computed from the final pickup pose, not radially from
+the ball:
+
+```text
+standoff_x = base_target_x - cos(theta) * near_zone_cm
+standoff_y = base_target_y - sin(theta) * near_zone_cm
+standoff_theta = theta
+```
+
+Both poses must be collision-free for the main robot body. The intake tube may
+overhang walls, but the body may not. Hybrid A* targets the set of valid
+standoff poses and appends the paired final pickup pose only after the standoff
+is reached. This guarantees the final TCP straight-line segment is collinear
+with the robot heading and does not require impossible sideways motion.
 
 ## Route Cache
 
@@ -120,6 +140,24 @@ a zero-speed STOP command, invalidates the cached route, and immediately runs a
 fresh Hybrid A* search from the deviated robot pose. Motor output resumes only
 after a valid route is cached again.
 
+Near pickup targets, the drive loop switches from UDP velocity control to
+calibrated TCP position control:
+
+1. Stop UDP wheel output with `LR 0 0`.
+2. Compute the current heading error to the final pickup pose.
+3. Execute blocking TCP `turn(degrees, speedPercent)`.
+4. Execute blocking TCP `move(distance, speedPercent)`.
+5. Continue to pickup/replan after the TCP motion completes.
+
+The near-zone TCP speed and turn speed are configured through `DriveConfig`.
+
+Before `--drive` dispatch is allowed, the detector also waits for a stable
+initial YOLO ball count. After each TCP pickup move it optimistically increments
+`balls_collected`, then reconciles against a debounced rolling visible-ball
+count. If stable visible balls exceed the expected visible count, the pickup is
+treated as missed and `balls_collected` is decremented so the ball can be routed
+again.
+
 When any of those checks fails, the cache is cleared and the next frame replans.
 This keeps the UI responsive while still reacting to target collection, target
 motion, and robot drift.
@@ -128,16 +166,19 @@ If no ball is reachable, that negative result is cached too. The cache is still
 invalidated by ball-set changes or robot drift, which avoids repeating the most
 expensive failure case on every video frame.
 
-## Heading Visualization
+## Route Visualization
 
-The schematic draws the yellow route polyline and sparse cyan heading arrows by
-default. Intermediate footprint snapshots are controlled by
-`NUM_INTERMEDIATE_SNAPSHOTS`, which defaults to `0` to keep the UI uncluttered.
+The schematic route is a robot body-center preview. Both the UDP path and the
+final TCP near-zone segment are drawn with the same speed heatmap palette.
 
-Every successful planned pickup pose is drawn as a bold magenta footprint, not
-just the final endpoint of the greedy route. These pickup footprints show the
-base-center offset and intake alignment for each orange or white target that
-the route actually connects.
+At each near-zone handoff, a red marker indicates the `LR 0 0` stop and TCP
+turn point. The line from the standoff center to the final pickup center uses
+the configured TCP move speed for its heatmap color. No route line is drawn to
+the ball coordinate, because the robot center never moves there.
+
+Every successful planned pickup pose is drawn as a bold magenta footprint. These
+pickup footprints show the base-center offset and intake alignment for each
+orange or white target that the route actually connects.
 
 ## Orange Ball Priority
 

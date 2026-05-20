@@ -10,6 +10,7 @@ dispatch.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import multiprocessing as mp
@@ -59,6 +60,10 @@ class PickupExecutionState(Enum):
     REPLAN = "REPLAN"
 
 
+BALL_COUNT_HISTORY_FRAMES = 15
+INITIAL_BALL_COUNT_STABLE_S = 0.75
+
+
 @dataclass
 class RuntimeState:
     """Mutable UI/application state owned by the OpenCV shell."""
@@ -81,6 +86,12 @@ class RuntimeState:
     pickup_state_started_s: float = 0.0
     pickup_command_fired: bool = False
     near_zone_move_fired: bool = False
+    initial_total_balls: int | None = None
+    balls_collected: int = 0
+    stable_visible_balls: int | None = None
+    visible_ball_count_history: deque[tuple[float, int]] = field(
+        default_factory=lambda: deque(maxlen=BALL_COUNT_HISTORY_FRAMES)
+    )
 
     def clear_route(self) -> None:
         self.route_plan = RoutePlan(points=[], active_target=None, pickup_poses=[])
@@ -530,6 +541,65 @@ class TopdownDetectorApp:
             include_final=False,
         )
 
+    def current_visible_ball_count(self, result: VisionFrameResult) -> int:
+        """Return current raw detector ball count before smoothing/tracking persistence."""
+        return len(result.white_balls) + len(result.orange_balls)
+
+    def update_ball_count_reconciliation(self, result: VisionFrameResult, now_s: float) -> None:
+        """Track global visible ball count and correct optimistic pickup misses."""
+        current_visible_balls = self.current_visible_ball_count(result)
+        self.runtime.visible_ball_count_history.append((now_s, current_visible_balls))
+        history = list(self.runtime.visible_ball_count_history)
+        if len(history) < BALL_COUNT_HISTORY_FRAMES:
+            return
+        counts = [count for _timestamp, count in history]
+        if len(set(counts)) != 1:
+            return
+
+        stable_count = counts[-1]
+        stable_duration_s = history[-1][0] - history[0][0]
+        if stable_duration_s < INITIAL_BALL_COUNT_STABLE_S:
+            return
+
+        self.runtime.stable_visible_balls = stable_count
+        if self.runtime.initial_total_balls is None:
+            self.runtime.initial_total_balls = stable_count
+            self.runtime.balls_collected = 0
+            return
+
+        expected_visible_balls = max(0, self.runtime.initial_total_balls - self.runtime.balls_collected)
+        if stable_count > expected_visible_balls and self.runtime.balls_collected > 0:
+            self.runtime.balls_collected -= 1
+
+    def ball_count_initialized(self) -> bool:
+        """Return true when the global ball baseline is ready for autonomous drive."""
+        return self.runtime.initial_total_balls is not None
+
+    def mark_optimistic_pickup_complete(self) -> None:
+        """Optimistically count a completed TCP pickup so the route can move on."""
+        if self.runtime.initial_total_balls is None:
+            return
+        self.runtime.balls_collected = min(
+            self.runtime.initial_total_balls,
+            self.runtime.balls_collected + 1,
+        )
+
+    def draw_ball_reconciliation_overlay(self, frame: np.ndarray) -> None:
+        """Draw global pickup reconciliation counters on the debug frame."""
+        initial = "?" if self.runtime.initial_total_balls is None else str(self.runtime.initial_total_balls)
+        stable = "?" if self.runtime.stable_visible_balls is None else str(self.runtime.stable_visible_balls)
+        text = f"Balls initial:{initial}  collected:{self.runtime.balls_collected}  visible stable:{stable}"
+        cv2.putText(
+            frame,
+            text,
+            (20, 92),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
     def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
         """Stop UDP tracking, align with TCP turn, then finish with TCP encoder move."""
         if self.runtime.near_zone_move_fired:
@@ -580,6 +650,7 @@ class TopdownDetectorApp:
                 round(remaining_cm, 1),
                 int(round(self.config.drive.near_zone_move_speed_pct)),
             )
+            self.mark_optimistic_pickup_complete()
             drive_runtime.stop(DriveControlState.PICKUP, "TCP align/move complete")
             self.runtime.pickup_state = PickupExecutionState.PICKUP
             self.runtime.pickup_state_started_s = time.perf_counter()
@@ -1000,6 +1071,7 @@ class TopdownDetectorApp:
             )
             combined = np.hstack(self.renderer.resize_to_match_height(placeholder, schematic))
             self.renderer.draw_drive_status(combined, drive_runtime)
+            self.draw_ball_reconciliation_overlay(combined)
             waiting_text = (
                 "Waiting for manual top-down selection"
                 if self.homography_calibrator is not None
@@ -1068,6 +1140,7 @@ class TopdownDetectorApp:
         )
         combined = np.hstack(self.renderer.resize_to_match_height(annotated, schematic))
         self.renderer.draw_drive_status(combined, drive_runtime)
+        self.draw_ball_reconciliation_overlay(combined)
         if video_paused:
             self.renderer.draw_video_pause_overlay(combined)
         return combined, masks, schematic
@@ -1562,27 +1635,36 @@ class TopdownDetectorApp:
 
                 self.update_robot_pose(preprocessed.normalized, params)
                 result = self.process_preprocessed_topdown(pipeline, raw_frame, preprocessed, params)
-                self.update_route(result, params)
                 now = time.perf_counter()
+                self.update_ball_count_reconciliation(result, now)
+                self.update_route(result, params)
                 frame_dt_s = max(1e-6, now - last_tick)
                 robot_geometry = self.robot_estimator.robot_geometry_from_params(params)
-                pickup_owns_control = self.update_pickup_state(drive_runtime, now)
-                if not pickup_owns_control:
-                    self.drive_guard.enforce_xte_guard_before_replan(
-                        self.runtime.robot_pose,
-                        self.runtime.route_plan.points,
-                        drive_runtime,
-                        clear_route_cache=self.runtime.clear_route,
-                    )
-                    self.drive_guard.update_drive_control(
-                        self.runtime.robot_pose,
-                        self.runtime.route_plan.points,
-                        drive_runtime,
-                        clear_route_cache=self.runtime.clear_route,
-                        local_goal_poses=self.runtime.route_plan.pickup_poses,
-                        dt_s=frame_dt_s,
-                        robot_geometry=robot_geometry,
-                    )
+                drive_waiting_for_ball_count = (
+                    drive_runtime.dispatcher is not None
+                    and not self.ball_count_initialized()
+                )
+                if drive_waiting_for_ball_count:
+                    self.drive_guard.wheel_controller.reset()
+                    drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for stable ball count")
+                else:
+                    pickup_owns_control = self.update_pickup_state(drive_runtime, now)
+                    if not pickup_owns_control:
+                        self.drive_guard.enforce_xte_guard_before_replan(
+                            self.runtime.robot_pose,
+                            self.runtime.route_plan.points,
+                            drive_runtime,
+                            clear_route_cache=self.runtime.clear_route,
+                        )
+                        self.drive_guard.update_drive_control(
+                            self.runtime.robot_pose,
+                            self.runtime.route_plan.points,
+                            drive_runtime,
+                            clear_route_cache=self.runtime.clear_route,
+                            local_goal_poses=self.runtime.route_plan.pickup_poses,
+                            dt_s=frame_dt_s,
+                            robot_geometry=robot_geometry,
+                        )
                 fps = 1.0 / frame_dt_s
                 last_tick = now
                 combined, masks, schematic = self.render(result, params, fps=fps, drive_runtime=drive_runtime)

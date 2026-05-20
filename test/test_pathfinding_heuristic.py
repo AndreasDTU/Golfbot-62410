@@ -60,6 +60,50 @@ class SmallGoalUnloadRouteTests(unittest.TestCase):
         self.assertTrue(planner.is_unload_goal_reached(route.unload_pose, geometry))
 
 
+class PickupStandoffRouteTests(unittest.TestCase):
+    def test_target_segment_routes_to_robot_body_standoff_pose(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        planner = HybridAStarPlanner(field_config=field)
+        route_planner = GreedyRoutePlanner(planner)
+        start_pose = HybridPose(30.0, 60.0, 0.0)
+        ball = PlannedBallTarget(
+            track_id=1,
+            label="white",
+            x_cm=80.0,
+            y_cm=60.0,
+            node_cm=(80, int(round(field.height_cm - 60.0))),
+        )
+
+        segment = route_planner.plan_target_segment(grid, start_pose, ball, geometry, planner.config)
+        valid_standoffs = planner.valid_pickup_standoff_poses(grid, ball.node_cm, geometry, (ball.x_cm, ball.y_cm))
+
+        self.assertTrue(segment)
+        self.assertGreater(len(valid_standoffs), 1)
+        final_pose = segment[-1]
+        self.assertAlmostEqual(final_pose.x_cm, 62.9, delta=planner.config.goal_tolerance_cm)
+        self.assertAlmostEqual(final_pose.y_cm, 60.0, delta=planner.config.goal_tolerance_cm)
+        self.assertAlmostEqual(final_pose.theta_rad, 0.0, delta=np.deg2rad(8.0))
+        standoff_pose = segment[-2]
+        final_vector = (final_pose.x_cm - standoff_pose.x_cm, final_pose.y_cm - standoff_pose.y_cm)
+        self.assertAlmostEqual(
+            final_vector[0] * np.sin(final_pose.theta_rad) - final_vector[1] * np.cos(final_pose.theta_rad),
+            0.0,
+            delta=1e-6,
+        )
+        self.assertAlmostEqual(np.hypot(*final_vector), planner.MIN_STANDOFF_BODY_DISTANCE_CM, delta=1e-6)
+        tube = planner.tube_center_for_pose(final_pose, geometry)
+        self.assertLessEqual(np.hypot(tube[0] - ball.x_cm, tube[1] - ball.y_cm), 1e-6)
+
+
 class TightCornerPickupTests(unittest.TestCase):
     def test_top_right_corner_ball_uses_diagonal_pickup_pose(self) -> None:
         field = FieldConfig()

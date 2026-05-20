@@ -5,7 +5,7 @@ from __future__ import annotations
 import heapq
 import math
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import cv2
@@ -19,6 +19,14 @@ from vision.config import FieldConfig, PlannerConfig, RobotGeometryConfig
 def normalize_planner_angle(theta_rad: float) -> float:
     """Normalize planner headings to ``[-pi, pi)`` for stable state keys."""
     return (theta_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@dataclass(frozen=True)
+class PickupStandoffGoal:
+    """Kinematically valid TCP handoff pair for one ball pickup."""
+
+    standoff_pose: HybridPose
+    final_pickup_pose: HybridPose
 
 
 class RobotFootprintCollisionChecker:
@@ -221,6 +229,8 @@ class HybridAStarPlanner:
 
     TIGHT_CORNER_PICKUP_THRESHOLD_CM = 3.5
     CORNER_PICKUP_HEADING_OFFSETS_DEG = (-3.0, 3.0, 0.0, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 6.0, -6.0, 9.0, -9.0)
+    STANDOFF_HEADING_STEP_DEG = 10.0
+    MIN_STANDOFF_BODY_DISTANCE_CM = 15.0
 
     def __init__(
         self,
@@ -593,6 +603,83 @@ class HybridAStarPlanner:
             for offset_deg in self.CORNER_PICKUP_HEADING_OFFSETS_DEG
         ]
 
+    def pickup_standoff_pose_candidates(
+        self,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        goal_point_cm: tuple[float, float],
+    ) -> list[HybridPose]:
+        """Return the discretized ring of final pickup poses whose tube reaches the ball."""
+        candidates: list[HybridPose] = []
+        seen: set[tuple[int, int, int]] = set()
+        heading_count = max(1, int(round(360.0 / max(1.0, self.STANDOFF_HEADING_STEP_DEG))))
+        for index in range(heading_count):
+            heading = normalize_planner_angle(index * 2.0 * math.pi / heading_count)
+            pose = self.pickup_aligned_pose_for_theta(goal_node, heading, geometry, goal_point_cm)
+            key = (
+                int(round(pose.x_cm * 10.0)),
+                int(round(pose.y_cm * 10.0)),
+                self.theta_bin(pose.theta_rad),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(pose)
+        return candidates
+
+    @staticmethod
+    def standoff_pose_for_final_pickup(
+        final_pickup_pose: HybridPose,
+        near_zone_cm: float,
+    ) -> HybridPose:
+        """Translate the body center backward along heading for the TCP handoff stop."""
+        return HybridPose(
+            x_cm=final_pickup_pose.x_cm - math.cos(final_pickup_pose.theta_rad) * near_zone_cm,
+            y_cm=final_pickup_pose.y_cm - math.sin(final_pickup_pose.theta_rad) * near_zone_cm,
+            theta_rad=final_pickup_pose.theta_rad,
+        )
+
+    def valid_pickup_standoff_goals(
+        self,
+        raw_red_grid: np.ndarray,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        goal_point_cm: tuple[float, float],
+    ) -> list[PickupStandoffGoal]:
+        """Return collision-free standoff/final pairs for a straight TCP pickup move."""
+        collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry, self.field, self.robot_config)
+        valid: list[PickupStandoffGoal] = []
+        for final_pickup_pose in self.pickup_standoff_pose_candidates(goal_node, geometry, goal_point_cm):
+            if not collision_checker.is_pose_valid(final_pickup_pose):
+                continue
+            standoff_pose = self.standoff_pose_for_final_pickup(
+                final_pickup_pose,
+                self.MIN_STANDOFF_BODY_DISTANCE_CM,
+            )
+            if not collision_checker.is_pose_valid(standoff_pose):
+                continue
+            tube_x, tube_y = self.tube_center_for_pose(final_pickup_pose, geometry)
+            ball_x, ball_y = self.goal_to_field_metric_cm(goal_node, goal_point_cm)
+            if math.hypot(tube_x - ball_x, tube_y - ball_y) > 1e-6:
+                continue
+            if math.hypot(final_pickup_pose.x_cm - ball_x, final_pickup_pose.y_cm - ball_y) + 1e-6 < self.MIN_STANDOFF_BODY_DISTANCE_CM:
+                continue
+            valid.append(PickupStandoffGoal(standoff_pose=standoff_pose, final_pickup_pose=final_pickup_pose))
+        return valid
+
+    def valid_pickup_standoff_poses(
+        self,
+        raw_red_grid: np.ndarray,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        goal_point_cm: tuple[float, float],
+    ) -> list[HybridPose]:
+        """Return final pickup poses for compatibility with tests and diagnostics."""
+        return [
+            goal.final_pickup_pose
+            for goal in self.valid_pickup_standoff_goals(raw_red_grid, goal_node, geometry, goal_point_cm)
+        ]
+
     def search_corner_pickup(
         self,
         raw_red_grid: np.ndarray,
@@ -905,6 +992,155 @@ class HybridAStarPlanner:
             )
         return []
 
+    @staticmethod
+    def closest_pose_goal(
+        pose: HybridPose,
+        goal_poses: list[HybridPose],
+    ) -> tuple[HybridPose, float, float]:
+        """Return the nearest goal pose plus translation and heading errors."""
+        best_goal = goal_poses[0]
+        best_distance = float("inf")
+        best_heading_error = float("inf")
+        for goal_pose in goal_poses:
+            distance = math.hypot(goal_pose.x_cm - pose.x_cm, goal_pose.y_cm - pose.y_cm)
+            heading_error = abs(normalize_planner_angle(goal_pose.theta_rad - pose.theta_rad))
+            key = (distance, heading_error)
+            if key < (best_distance, best_heading_error):
+                best_goal = goal_pose
+                best_distance = distance
+                best_heading_error = heading_error
+        return best_goal, best_distance, best_heading_error
+
+    @staticmethod
+    def closest_pickup_standoff_goal(
+        pose: HybridPose,
+        goals: list[PickupStandoffGoal],
+    ) -> tuple[PickupStandoffGoal, float, float]:
+        """Return the nearest standoff goal plus standoff translation and heading errors."""
+        best_goal = goals[0]
+        best_distance = float("inf")
+        best_heading_error = float("inf")
+        for goal in goals:
+            standoff_pose = goal.standoff_pose
+            distance = math.hypot(standoff_pose.x_cm - pose.x_cm, standoff_pose.y_cm - pose.y_cm)
+            heading_error = abs(normalize_planner_angle(standoff_pose.theta_rad - pose.theta_rad))
+            key = (distance, heading_error)
+            if key < (best_distance, best_heading_error):
+                best_goal = goal
+                best_distance = distance
+                best_heading_error = heading_error
+        return best_goal, best_distance, best_heading_error
+
+    def search_pickup_standoff_goal(
+        self,
+        raw_red_grid: np.ndarray,
+        start_pose: HybridPose,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig | None = None,
+        goal_point_cm: tuple[float, float] | None = None,
+    ) -> list[HybridPose]:
+        """Search to any valid pickup standoff pose around a ball."""
+        if goal_point_cm is None:
+            return []
+        cfg = config or self.config
+        collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry, self.field, self.robot_config)
+        standoff_goals = self.valid_pickup_standoff_goals(raw_red_grid, goal_node, geometry, goal_point_cm)
+        if not standoff_goals:
+            return []
+
+        start_pose = HybridPose(
+            x_cm=float(start_pose.x_cm),
+            y_cm=float(start_pose.y_cm),
+            theta_rad=normalize_planner_angle(start_pose.theta_rad),
+        )
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
+        heading_tolerance_rad = max(math.pi / float(cfg.theta_bins), math.radians(8.0))
+
+        start_key = self.state_key(start_pose, cfg.theta_bins)
+        open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+        counter = 0
+        _start_goal, start_distance, start_heading_error = self.closest_pickup_standoff_goal(start_pose, standoff_goals)
+        start_h = max(0.0, start_distance - cfg.goal_tolerance_cm) + start_heading_error * 3.0
+        heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+
+        came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+        pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
+        g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+        expansions = 0
+
+        while open_heap and expansions < cfg.max_expansions:
+            _f_cost, current_cost, _counter, current_key = heapq.heappop(open_heap)
+            if current_cost > g_score.get(current_key, float("inf")):
+                continue
+
+            current_pose = pose_by_key[current_key]
+            closest_goal, distance_cm, heading_error = self.closest_pickup_standoff_goal(current_pose, standoff_goals)
+            if (
+                collision_checker.is_pose_valid(current_pose)
+                and distance_cm <= cfg.goal_tolerance_cm
+                and heading_error <= heading_tolerance_rad
+            ):
+                path = self.reconstruct_path(came_from, pose_by_key, current_key)
+                standoff_pose = closest_goal.standoff_pose
+                if math.hypot(standoff_pose.x_cm - current_pose.x_cm, standoff_pose.y_cm - current_pose.y_cm) > 1e-6:
+                    path.append(standoff_pose)
+                else:
+                    path[-1] = standoff_pose
+                path.append(closest_goal.final_pickup_pose)
+                return path
+
+            expansions += 1
+            for neighbor_pose, primitive_cost in self.expand_neighbors(current_pose, cfg):
+                neighbor_pose = HybridPose(
+                    x_cm=float(neighbor_pose.x_cm),
+                    y_cm=float(neighbor_pose.y_cm),
+                    theta_rad=normalize_planner_angle(neighbor_pose.theta_rad),
+                )
+                transition_allowed, _neighbor_violation = self.allows_start_escape_transition(
+                    collision_checker,
+                    current_pose,
+                    neighbor_pose,
+                )
+                if not transition_allowed:
+                    continue
+
+                neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
+                tentative_g = g_score[current_key] + primitive_cost
+                if tentative_g >= g_score.get(neighbor_key, float("inf")):
+                    continue
+
+                came_from[neighbor_key] = current_key
+                pose_by_key[neighbor_key] = neighbor_pose
+                g_score[neighbor_key] = tentative_g
+                tube_point = self.tube_center_for_pose(neighbor_pose, geometry)
+                heuristic = dijkstra_heuristic.cost_from_field_point(tube_point, self.field)
+                _nearest_goal, pose_distance, pose_heading_error = self.closest_pickup_standoff_goal(neighbor_pose, standoff_goals)
+                if not math.isfinite(heuristic):
+                    heuristic = pose_distance
+                heading_change = abs(normalize_planner_angle(neighbor_pose.theta_rad - current_pose.theta_rad))
+                counter += 1
+                heapq.heappush(
+                    open_heap,
+                    (
+                        tentative_g
+                        + max(0.0, heuristic - cfg.goal_tolerance_cm)
+                        + max(0.0, pose_distance - cfg.goal_tolerance_cm) * 0.25
+                        + pose_heading_error * 1.5
+                        + heading_change * 0.1,
+                        tentative_g,
+                        counter,
+                        neighbor_key,
+                    ),
+                )
+
+        if expansions >= cfg.max_expansions:
+            print(
+                f"Hybrid A* search exhausted max nodes ({cfg.max_expansions}) "
+                f"for pickup standoff goal {goal_node} after {expansions} expansions."
+            )
+        return []
+
 
 class LegacyAStarPlanner:
     """Legacy 8-connected A* search on a binary occupancy grid."""
@@ -1035,6 +1271,16 @@ class GreedyRoutePlanner:
         )
         if corner_segment:
             return corner_segment
+        standoff_segment = self.hybrid_planner.search_pickup_standoff_goal(
+            grid,
+            current_pose,
+            target.node_cm,
+            geometry,
+            config,
+            goal_point_cm=goal_point_cm,
+        )
+        if standoff_segment:
+            return standoff_segment
         return self.hybrid_planner.search(
             grid,
             current_pose,

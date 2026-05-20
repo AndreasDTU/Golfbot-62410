@@ -7,6 +7,7 @@ from robot.control import WheelCommandController, robot_body_edge_clearance_cm, 
 from robot.models import DriveRuntime, RobotGeometry, RobotPose
 from tools.topdown_object_detector import PickupExecutionState, TopdownDetectorApp
 from vision.config import DriveConfig, FieldConfig
+from vision.debug import DebugRenderer
 
 
 class FakeDispatcher:
@@ -51,6 +52,27 @@ class DriveControlTests(unittest.TestCase):
         error = RouteTrackingError(0.0, 0.0, 0.0, (0.0, 0.0), 0.0, 0)
 
         self.assertEqual(route_goal_pose(route, error, pickup, include_final=False), route[1])
+
+    def test_route_heatmap_breaks_at_near_zone_boundary_for_each_pickup(self) -> None:
+        renderer = DebugRenderer(drive_config=DriveConfig(near_zone_cm=15.0))
+        geometry = RobotGeometry(width_cm=20.0, front_cm=8.0, rear_cm=10.0, tube_forward_cm=0.0, tube_right_cm=0.0)
+        route = [
+            HybridPose(0.0, 0.0, 0.0),
+            HybridPose(20.0, 0.0, 0.0),
+            HybridPose(40.0, 0.0, 0.0),
+            HybridPose(60.0, 0.0, 0.0),
+            HybridPose(80.0, 0.0, 0.0),
+        ]
+        pickups = [route[2], route[4]]
+
+        breaks = renderer.near_zone_visual_breaks(route, pickups, geometry)
+
+        self.assertEqual(len(breaks), 2)
+        self.assertEqual([visual_break.checkpoint_index for visual_break in breaks], [2, 4])
+        self.assertAlmostEqual(breaks[0].boundary_pose.x_cm, 25.0)
+        self.assertAlmostEqual(breaks[1].boundary_pose.x_cm, 65.0)
+        self.assertEqual(breaks[0].final_pickup_pose, route[2])
+        self.assertEqual(breaks[1].final_pickup_pose, route[4])
 
     def test_near_zone_handoff_stops_udp_then_turns_and_runs_tcp_move(self) -> None:
         app = TopdownDetectorApp()

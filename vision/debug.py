@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import cv2
@@ -23,6 +24,17 @@ from robot.models import (
 from vision.config import DriveConfig, FieldConfig, RobotGeometryConfig, WindowConfig
 from vision.geometry import CoordinateMapper
 from vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinate
+
+
+@dataclass(frozen=True)
+class NearZoneVisualBreak:
+    """Rendered handoff point between UDP route tracking and TCP pickup motion."""
+
+    checkpoint_index: int
+    segment_index: int
+    boundary_pose: HybridPose
+    boundary_cumulative_cm: float
+    final_pickup_pose: HybridPose
 
 
 class DebugRenderer:
@@ -74,31 +86,134 @@ class DebugRenderer:
             cumulative.append(cumulative[-1] + math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm))
         return cumulative
 
+    @staticmethod
+    def segment_circle_intersection_t(
+        start: HybridPose,
+        end: HybridPose,
+        center: HybridPose,
+        radius_cm: float,
+    ) -> float | None:
+        """Return the last segment parameter that intersects a checkpoint-radius circle."""
+        dx = end.x_cm - start.x_cm
+        dy = end.y_cm - start.y_cm
+        fx = start.x_cm - center.x_cm
+        fy = start.y_cm - center.y_cm
+        a = dx * dx + dy * dy
+        if a <= 1e-9:
+            return None
+        b = 2.0 * (fx * dx + fy * dy)
+        c = fx * fx + fy * fy - radius_cm * radius_cm
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0.0:
+            return None
+        root = math.sqrt(discriminant)
+        candidates = [
+            (-b - root) / (2.0 * a),
+            (-b + root) / (2.0 * a),
+        ]
+        valid = [t for t in candidates if -1e-6 <= t <= 1.0 + 1e-6]
+        if not valid:
+            return None
+        return float(np.clip(max(valid), 0.0, 1.0))
+
+    def near_zone_visual_breaks(
+        self,
+        route_points_cm: list[HybridPose],
+        route_pickup_poses_cm: list[HybridPose] | None,
+        geometry: RobotGeometry,
+    ) -> list[NearZoneVisualBreak]:
+        """Find every pickup handoff point rendered as smooth route -> stop -> TCP line."""
+        if len(route_points_cm) < 2:
+            return []
+        checkpoints = route_checkpoint_indices(route_points_cm, route_pickup_poses_cm, include_final=False)
+        if not checkpoints:
+            return []
+        cumulative = self.cumulative_route_lengths(route_points_cm)
+        breaks: list[NearZoneVisualBreak] = []
+        radius_cm = max(0.0, float(self.drive_config.near_zone_cm))
+        for checkpoint_index in checkpoints:
+            if checkpoint_index <= 0 or checkpoint_index >= len(route_points_cm):
+                continue
+            checkpoint = route_points_cm[checkpoint_index]
+            previous_checkpoint = max(
+                (existing.checkpoint_index for existing in breaks if existing.checkpoint_index < checkpoint_index),
+                default=0,
+            )
+            for segment_index in range(checkpoint_index - 1, previous_checkpoint - 1, -1):
+                start = route_points_cm[segment_index]
+                end = route_points_cm[segment_index + 1]
+                start_distance = math.hypot(start.x_cm - checkpoint.x_cm, start.y_cm - checkpoint.y_cm)
+                end_distance = math.hypot(end.x_cm - checkpoint.x_cm, end.y_cm - checkpoint.y_cm)
+                if start_distance < radius_cm and end_distance < radius_cm:
+                    continue
+                t = self.segment_circle_intersection_t(start, end, checkpoint, radius_cm)
+                if t is None:
+                    continue
+                boundary_pose = HybridPose(
+                    x_cm=start.x_cm + (end.x_cm - start.x_cm) * t,
+                    y_cm=start.y_cm + (end.y_cm - start.y_cm) * t,
+                    theta_rad=start.theta_rad + (end.theta_rad - start.theta_rad) * t,
+                )
+                segment_length = math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm)
+                breaks.append(
+                    NearZoneVisualBreak(
+                        checkpoint_index=checkpoint_index,
+                        segment_index=segment_index,
+                        boundary_pose=boundary_pose,
+                        boundary_cumulative_cm=cumulative[segment_index] + segment_length * t,
+                        final_pickup_pose=checkpoint,
+                    )
+                )
+                break
+        return breaks
+
     def draw_velocity_profile_route(
         self,
         schematic: np.ndarray,
         route_points_cm: list[HybridPose],
         route_pickup_poses_cm: list[HybridPose] | None = None,
+        geometry: RobotGeometry | None = None,
     ) -> None:
-        """Draw each route segment with the same distance-based speed profile used by control."""
+        """Draw route heatmap as UDP tracking up to near-zone, then TCP straight pickup."""
         if len(route_points_cm) < 2:
             return
-        checkpoints = route_checkpoint_indices(route_points_cm, route_pickup_poses_cm, include_final=True)
-        if not checkpoints:
-            checkpoints = [len(route_points_cm) - 1]
-        stop_indices = [0, *checkpoints]
+        robot_geometry = geometry or self.robot_geometry_from_params(None)
         cumulative = self.cumulative_route_lengths(route_points_cm)
+        visual_breaks = self.near_zone_visual_breaks(route_points_cm, route_pickup_poses_cm, robot_geometry)
+        break_by_segment = {visual_break.segment_index: visual_break for visual_break in visual_breaks}
+        hidden_segments = {
+            segment_index
+            for visual_break in visual_breaks
+            for segment_index in range(visual_break.segment_index + 1, visual_break.checkpoint_index)
+        }
+        stop_cumulative = sorted(
+            {
+                0.0,
+                cumulative[-1],
+                *(visual_break.boundary_cumulative_cm for visual_break in visual_breaks),
+                *(cumulative[visual_break.checkpoint_index] for visual_break in visual_breaks),
+            }
+        )
         for segment_index, (start, end) in enumerate(zip(route_points_cm[:-1], route_points_cm[1:])):
-            start_px = self.mapper.field_metric_cm_to_schematic((start.x_cm, start.y_cm))
-            end_px = self.mapper.field_metric_cm_to_schematic((end.x_cm, end.y_cm))
-            next_route_index = min(len(route_points_cm) - 1, segment_index + 1)
-            checkpoint_index = next(
-                (checkpoint for checkpoint in checkpoints if checkpoint >= next_route_index),
-                checkpoints[-1],
+            if segment_index in hidden_segments:
+                continue
+            draw_end = break_by_segment[segment_index].boundary_pose if segment_index in break_by_segment else end
+            start_cumulative = cumulative[segment_index]
+            end_cumulative = (
+                break_by_segment[segment_index].boundary_cumulative_cm
+                if segment_index in break_by_segment
+                else cumulative[segment_index + 1]
             )
-            previous_stop_index = max((stop for stop in stop_indices if stop <= segment_index), default=0)
-            distance_since_stop = max(0.0, cumulative[segment_index] - cumulative[previous_stop_index])
-            distance_to_stop = max(0.0, cumulative[checkpoint_index] - cumulative[segment_index])
+            if end_cumulative <= start_cumulative + 1e-6:
+                continue
+            start_px = self.mapper.field_metric_cm_to_schematic((start.x_cm, start.y_cm))
+            end_px = self.mapper.field_metric_cm_to_schematic((draw_end.x_cm, draw_end.y_cm))
+            previous_stop_cumulative = max((stop for stop in stop_cumulative if stop <= start_cumulative + 1e-6), default=0.0)
+            next_stop_cumulative = next((stop for stop in stop_cumulative if stop >= start_cumulative + 1e-6), cumulative[-1])
+            if next_stop_cumulative <= start_cumulative + 1e-6:
+                next_stop_cumulative = next((stop for stop in stop_cumulative if stop > start_cumulative + 1e-6), cumulative[-1])
+            distance_since_stop = max(0.0, start_cumulative - previous_stop_cumulative)
+            distance_to_stop = max(0.0, next_stop_cumulative - start_cumulative)
             accel_speed = WheelCommandController.target_speed_for_distance(distance_since_stop, self.drive_config)
             decel_speed = WheelCommandController.target_speed_for_distance(distance_to_stop, self.drive_config)
             cv2.line(
@@ -109,6 +224,16 @@ class DebugRenderer:
                 3,
                 cv2.LINE_AA,
             )
+        for visual_break in visual_breaks:
+            boundary_px = self.mapper.field_metric_cm_to_schematic(
+                (visual_break.boundary_pose.x_cm, visual_break.boundary_pose.y_cm)
+            )
+            final_px = self.mapper.field_metric_cm_to_schematic(
+                (visual_break.final_pickup_pose.x_cm, visual_break.final_pickup_pose.y_cm)
+            )
+            cv2.line(schematic, boundary_px, final_px, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(schematic, boundary_px, 6, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(schematic, boundary_px, 8, (255, 255, 255), 1, cv2.LINE_AA)
 
     def robot_footprint_metric_polygons(
         self,
@@ -785,22 +910,7 @@ class DebugRenderer:
 
         geometry = self.robot_geometry_from_params(params)
         if route_points_cm:
-            self.draw_velocity_profile_route(schematic, route_points_cm, route_pickup_poses_cm)
-            self.draw_route_heading_indicators(
-                schematic,
-                route_points_cm,
-                geometry,
-                interval=route_heading_marker_interval,
-            )
-            if num_intermediate_snapshots > 0 and len(route_points_cm) > 2:
-                denominator = num_intermediate_snapshots + 1
-                for index in sorted(
-                    {
-                        int(round((len(route_points_cm) - 1) * sample_index / denominator))
-                        for sample_index in range(1, num_intermediate_snapshots + 1)
-                    }
-                ):
-                    self.draw_robot_footprint_snapshot(schematic, route_points_cm[index], geometry, 0.18, (255, 0, 255), (255, 255, 0), 1)
+            self.draw_velocity_profile_route(schematic, route_points_cm, route_pickup_poses_cm, geometry)
             self.draw_pickup_footprints(schematic, route_pickup_poses_cm or [], geometry)
             if route_unload_pose_cm is not None:
                 self.draw_robot_footprint_snapshot(

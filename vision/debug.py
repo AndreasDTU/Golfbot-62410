@@ -231,7 +231,15 @@ class DebugRenderer:
             final_px = self.mapper.field_metric_cm_to_schematic(
                 (visual_break.final_pickup_pose.x_cm, visual_break.final_pickup_pose.y_cm)
             )
-            cv2.line(schematic, boundary_px, final_px, (255, 255, 255), 2, cv2.LINE_AA)
+            tcp_speed = float(np.clip(self.drive_config.near_zone_move_speed_pct, 0.0, self.drive_config.max_speed_pct))
+            cv2.line(
+                schematic,
+                boundary_px,
+                final_px,
+                self.route_velocity_color_for_speed(tcp_speed),
+                3,
+                cv2.LINE_AA,
+            )
             cv2.circle(schematic, boundary_px, 6, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.circle(schematic, boundary_px, 8, (255, 255, 255), 1, cv2.LINE_AA)
 

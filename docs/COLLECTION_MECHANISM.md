@@ -58,6 +58,51 @@ for older operator scripts:
 
 New code should use the explicit names.
 
+## Manual Collector Playground
+
+`tools/collector_playground.py` is a standalone terminal playground for manual
+collector/pipe testing before autonomous runs. It connects only to the EV3 TCP
+command interface through `robot/controller.py`; it does not start wheel
+movement, route following, the vision pipeline, the route planner, or ball
+detection.
+
+Start it from the repository root while `robot/robot_server.py` is running on
+the EV3:
+
+```text
+python3 tools/collector_playground.py --host <EV3_IP>
+```
+
+Useful options:
+
+```text
+--port 5555
+--timeout 15
+--max-manual-units 5
+--no-confirm
+```
+
+Available commands:
+
+- `travel`: command `collector_travel_position()` for raised/safe driving
+  height.
+- `assist` / `pickup`: command `pickup_assist()` for the small collection
+  motion.
+- `unload` / `dropoff`: command `unload_full_cycle()` for the full unloading
+  stroke; this asks for confirmation unless `--no-confirm` or `--yes` is used.
+- `up <units>` / `down <units>`: manually raise/lower the pipe by a bounded
+  open-loop amount.
+- `stop`: stop the pipe motor when supported by the EV3 server.
+- `status`: print the current software belief.
+- `help`, `quit`, `exit`: show help or exit after a pipe-stop attempt.
+
+There is no collector position sensor. The playground state is only a software
+belief such as `UNKNOWN`, `TRAVEL`, `PICKUP_ASSIST`, or `UNLOADING`; it is not a
+verified physical height. Before testing, place the collector in a known safe
+position, power the EV3 server, start the playground, run `status`, then use
+small bounded `up`/`down` commands or `travel` to confirm movement direction.
+Do not run `unload` unless the robot is physically clear for a full stroke.
+
 ## Safety Rule
 
 Full pipe motion is allowed only in an `UNLOADING` state at the goal.

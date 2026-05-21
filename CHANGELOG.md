@@ -6,6 +6,15 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Added
 
+- Added `tools/collector_playground.py`, a standalone open-loop terminal REPL
+  for manually testing the GolfBot collector/pipe over the existing EV3 TCP
+  controller without starting vision, route planning, ball detection, wheel
+  dispatch, or autonomous driving.
+  - `robot/controller.py` now exposes manual `pipe_up(...)`,
+    `pipe_down(...)`, and `pipe_stop()` helpers plus configurable TCP port and
+    timeout arguments.
+  - `docs/COLLECTION_MECHANISM.md` documents the playground startup procedure,
+    commands, confirmation behavior, and open-loop/no-sensor safety warning.
 - Added explicit collection-actuator command separation.
   - `robot/controller.py` now exposes `collector_travel_position()` for safe driving height, `pickup_assist()` for collection, and `unload_full_cycle()` for goal unloading.
   - `robot/robot_server.py` maps `collector_travel_position` to a raise/travel command, `pickup_assist` to a small pipe jiggle, and `unload_full_cycle` to the full unloading stroke, while keeping `pickup`/`dropoff` as compatibility aliases.
@@ -20,6 +29,8 @@ All notable larger additions and behavioral changes to this repository should be
 ### Verified
 
 - Added focused tests for collection actuator command separation, collector travel-position gating, and autonomous white/orange collection assist behavior.
+- Added focused tests for collector playground command dispatch, manual movement
+  validation, unload confirmation, and isolation from the autonomous stack.
 - Added focused tests for step-mode CLI parsing and pause/release behavior.
 
 ## 2026-05-20

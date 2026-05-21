@@ -45,6 +45,15 @@ class CollectionActuatorCommandTests(unittest.TestCase):
 
         self.assertEqual(sent, ["unload_full_cycle"])
 
+    def test_manual_pipe_helpers_send_existing_server_protocol(self) -> None:
+        controller, sent = self.controller_with_recorder()
+
+        controller.pipe_up(2.5)
+        controller.pipe_down(1, speed=20)
+        controller.pipe_stop()
+
+        self.assertEqual(sent, ["pipe up 2.5", "pipe down 1 20", "pipe stop"])
+
 
 if __name__ == "__main__":
     unittest.main()

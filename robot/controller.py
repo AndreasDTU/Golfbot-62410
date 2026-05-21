@@ -3,14 +3,16 @@ import time
 
 class RobotController:
 
-    def __init__(self, robot_ip = "ev3dev"):
+    def __init__(self, robot_ip = "ev3dev", port=5555, timeout=15.0):
         self.host = robot_ip
+        self.port = port
+        self.timeout = timeout
         self.sock = self._connect()
 
-    def _connect(self, port=5555):
+    def _connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(15.0)
-        self.sock.connect((self.host, port))
+        self.sock.settimeout(self.timeout)
+        self.sock.connect((self.host, self.port))
         return self.sock
 
     def _send(self, cmd):
@@ -39,6 +41,20 @@ class RobotController:
     def unload_full_cycle(self):
         """Run the full pipe cycle used only when unloading at the goal."""
         return self._send("unload_full_cycle")
+
+    def pipe_up(self, units, speed=None):
+        """Raise the pipe by an open-loop manual amount."""
+        cmd = f"pipe up {units}" if speed is None else f"pipe up {units} {speed}"
+        return self._send(cmd)
+
+    def pipe_down(self, units, speed=None):
+        """Lower the pipe by an open-loop manual amount."""
+        cmd = f"pipe down {units}" if speed is None else f"pipe down {units} {speed}"
+        return self._send(cmd)
+
+    def pipe_stop(self):
+        """Stop only the pipe motor if the EV3 server supports it."""
+        return self._send("pipe stop")
 
     def pickup(self):
         """Compatibility alias for the collection assist command."""

@@ -28,11 +28,21 @@ class RobotController:
     def turn(self, degrees, speedPercent = 100):
         return self._send(f"turn {degrees} {speedPercent}")
 
+    def pickup_assist(self):
+        """Run the small collection-only pipe jiggle used during ball pickup."""
+        return self._send("pickup_assist")
+
+    def unload_full_cycle(self):
+        """Run the full pipe cycle used only when unloading at the goal."""
+        return self._send("unload_full_cycle")
+
     def pickup(self):
-        return self._send("pickup")
+        """Compatibility alias for the collection assist command."""
+        return self.pickup_assist()
 
     def dropoff(self):
-        return self._send("dropoff")
+        """Compatibility alias for the full unload command."""
+        return self.unload_full_cycle()
 
     def stop(self):
         return self._send("stop")

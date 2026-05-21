@@ -56,7 +56,7 @@ class PickupExecutionState(Enum):
 
     NAVIGATION = "NAVIGATION"
     BLIND_APPROACH = "BLIND_APPROACH"
-    PICKUP = "PICKUP"
+    PICKUP_ASSIST = "PICKUP_ASSIST"
     REPLAN = "REPLAN"
 
 
@@ -704,7 +704,7 @@ class TopdownDetectorApp:
         tcp_turn_deg = -heading_error_deg
 
         if remaining_cm <= 0.5:
-            self.runtime.pickup_state = PickupExecutionState.PICKUP
+            self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
             self.runtime.pickup_state_started_s = time.perf_counter()
             return True
 
@@ -723,7 +723,7 @@ class TopdownDetectorApp:
             )
             self.mark_optimistic_pickup_complete()
             drive_runtime.stop(DriveControlState.PICKUP, "TCP align/move complete")
-            self.runtime.pickup_state = PickupExecutionState.PICKUP
+            self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
             self.runtime.pickup_state_started_s = time.perf_counter()
         except Exception as exc:
             drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"TCP align/move failed: {exc}")
@@ -731,18 +731,18 @@ class TopdownDetectorApp:
             self.runtime.pickup_state_started_s = time.perf_counter()
         return True
 
-    def _start_pickup_command_thread(self) -> None:
+    def _start_pickup_assist_command_thread(self) -> None:
         if self.pickup_thread is not None and self.pickup_thread.is_alive():
             return
 
-        def run_pickup() -> None:
+        def run_pickup_assist() -> None:
             try:
-                RobotController(self.config.drive.robot_ip).pickup()
+                RobotController(self.config.drive.robot_ip).pickup_assist()
                 self.pickup_last_error = ""
             except Exception as exc:
                 self.pickup_last_error = str(exc)
 
-        self.pickup_thread = threading.Thread(target=run_pickup, name="ev3-pickup-command", daemon=True)
+        self.pickup_thread = threading.Thread(target=run_pickup_assist, name="ev3-pickup-assist-command", daemon=True)
         self.pickup_thread.start()
 
     def update_pickup_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
@@ -753,10 +753,10 @@ class TopdownDetectorApp:
         if state == PickupExecutionState.NAVIGATION:
             return self._run_near_zone_precise_move(drive_runtime)
 
-        if state == PickupExecutionState.PICKUP:
-            drive_runtime.stop(DriveControlState.PICKUP, "pickup actuator")
+        if state == PickupExecutionState.PICKUP_ASSIST:
+            drive_runtime.stop(DriveControlState.PICKUP, "pickup assist")
             if not self.runtime.pickup_command_fired:
-                self._start_pickup_command_thread()
+                self._start_pickup_assist_command_thread()
                 self.runtime.pickup_command_fired = True
             self.runtime.pickup_state = PickupExecutionState.REPLAN
             self.runtime.pickup_state_started_s = now_s

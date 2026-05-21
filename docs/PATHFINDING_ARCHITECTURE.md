@@ -147,9 +147,15 @@ calibrated TCP position control:
 2. Compute the current heading error to the final pickup pose.
 3. Execute blocking TCP `turn(degrees, speedPercent)`.
 4. Execute blocking TCP `move(distance, speedPercent)`.
-5. Continue to pickup/replan after the TCP motion completes.
+5. Run the collection-only `pickup_assist()` pipe command.
+6. Continue to pickup/replan after the assist motion completes.
 
 The near-zone TCP speed and turn speed are configured through `DriveConfig`.
+The collection actuator contract is documented in
+`docs/COLLECTION_MECHANISM.md`: autonomous ball collection, including
+orange-first collection, may use only the small pickup-assist motion. The full
+`unload_full_cycle()` pipe motion is reserved for unloading at the goal and must
+not be called from the collection route logic.
 
 Before `--drive` dispatch is allowed, the detector also waits for a stable
 initial YOLO ball count. After each TCP pickup move it optimistically increments

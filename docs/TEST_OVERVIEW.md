@@ -2,6 +2,16 @@
 
 This repository has dedicated smoke tests for checkerboard undistortion and perspective warp validation.
 
+## Focused Robot Control Tests
+
+```bash
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_control test.test_collection_actuator
+```
+
+These tests cover closed-loop drive handoff, collection actuator command
+separation, and the rule that autonomous white/orange ball collection uses the
+small `pickup_assist` command rather than the full unload cycle.
+
 ## Full Perspective + Distortion Comparison (single command)
 
 Run this to generate one final comparison frame containing:

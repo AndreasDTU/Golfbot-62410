@@ -209,7 +209,68 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(events[1], ("turn", 10.0, int(round(app.config.drive.near_zone_turn_speed_pct))))
         self.assertEqual(events[2], ("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))))
         self.assertEqual(app.runtime.balls_collected, 1)
-        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
+
+    def test_autonomous_collection_runs_pickup_assist_not_full_unload(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str) -> None:
+                self.robot_ip = robot_ip
+
+            def pickup_assist(self) -> str:
+                events.append("pickup_assist")
+                return "OK"
+
+            def unload_full_cycle(self) -> str:
+                events.append("unload_full_cycle")
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
+            assert app.pickup_thread is not None
+            app.pickup_thread.join(timeout=1.0)
+
+        self.assertTrue(owns_control)
+        self.assertEqual(events, ["pickup_assist"])
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.REPLAN)
+        self.assertEqual(drive_runtime.last_message, "pickup assist")
+
+    def test_orange_autonomous_collection_runs_same_pickup_assist(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0)],
+            active_target=SimpleNamespace(label="orange"),
+            pickup_poses=[HybridPose(0.0, 0.0, 0.0)],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str) -> None:
+                self.robot_ip = robot_ip
+
+            def pickup_assist(self) -> str:
+                events.append("pickup_assist")
+                return "OK"
+
+            def unload_full_cycle(self) -> str:
+                events.append("unload_full_cycle")
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
+            assert app.pickup_thread is not None
+            app.pickup_thread.join(timeout=1.0)
+
+        self.assertTrue(owns_control)
+        self.assertEqual(events, ["pickup_assist"])
 
 
 if __name__ == "__main__":

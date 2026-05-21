@@ -60,17 +60,30 @@ New code should use the explicit names.
 
 ## Manual Collector Playground
 
-`tools/collector_playground.py` is a standalone terminal playground for manual
-collector/pipe testing before autonomous runs. It connects only to the EV3 TCP
-command interface through `robot/controller.py`; it does not start wheel
+`tools/collector_playground.py` is a standalone GUI and terminal playground for
+manual collector/pipe testing before autonomous runs. It connects only to the
+EV3 TCP command interface through `robot/controller.py`; it does not start wheel
 movement, route following, the vision pipeline, the route planner, or ball
 detection.
 
-Start it from the repository root while `robot/robot_server.py` is running on
-the EV3:
+GUI mode is the default. Start it from the repository root while
+`robot/robot_server.py` is running on the EV3:
 
 ```text
 python3 tools/collector_playground.py --host <EV3_IP>
+```
+
+To preview the GUI and exercise the command/state flow without an EV3 or robot
+server, use dummy mode:
+
+```text
+python3 tools/collector_playground.py --dummy
+```
+
+Use terminal REPL mode when a display is unavailable:
+
+```text
+python3 tools/collector_playground.py --cli --host <EV3_IP>
 ```
 
 Useful options:
@@ -80,28 +93,47 @@ Useful options:
 --timeout 15
 --max-manual-units 5
 --no-confirm
+--dummy
 ```
 
-Available commands:
+The GUI uses OpenCV HighGUI, like `tools/pathfinding_sandbox.py`, so it avoids
+native `tkinter`/Tk compatibility issues. It shows the configured host, port,
+and timeout from the CLI and provides `Connect` and `Disconnect` controls.
+Collector command buttons are disabled until a TCP connection is established,
+except in `--dummy` mode where the GUI starts ready with a local no-network
+controller. Use `+`/`-` or the unit buttons to adjust the manual movement
+amount. The robot drawing shows a simple side profile and top view: the body,
+wheels, front direction, and collector pipe. Pipe color and position change
+with the current software belief (`UNKNOWN`, `TRAVEL`, `PICKUP_ASSIST`,
+`UNLOADING`, `MANUAL_UP`, `MANUAL_DOWN`, or `STOPPED`). This visualization is
+only an open-loop belief display; it is not sensor feedback.
+
+Available GUI buttons and equivalent terminal commands:
 
 - `travel`: command `collector_travel_position()` for raised/safe driving
-  height.
+  height (`Travel Position`).
 - `assist` / `pickup`: command `pickup_assist()` for the small collection
-  motion.
+  motion (`Pickup Assist`).
 - `unload` / `dropoff`: command `unload_full_cycle()` for the full unloading
-  stroke; this asks for confirmation unless `--no-confirm` or `--yes` is used.
+  stroke (`Unload Full Cycle`); this asks for confirmation unless
+  `--no-confirm` or `--yes` is used.
 - `up <units>` / `down <units>`: manually raise/lower the pipe by a bounded
-  open-loop amount.
-- `stop`: stop the pipe motor when supported by the EV3 server.
-- `status`: print the current software belief.
-- `help`, `quit`, `exit`: show help or exit after a pipe-stop attempt.
+  open-loop amount (`Pipe Up` / `Pipe Down`).
+- `stop`: stop the pipe motor when supported by the EV3 server (`Stop Pipe`).
+- `status`: print the current software belief in terminal mode.
+- `help`, `quit`, `exit`: show terminal help or exit after a pipe-stop attempt.
 
 There is no collector position sensor. The playground state is only a software
 belief such as `UNKNOWN`, `TRAVEL`, `PICKUP_ASSIST`, or `UNLOADING`; it is not a
-verified physical height. Before testing, place the collector in a known safe
-position, power the EV3 server, start the playground, run `status`, then use
-small bounded `up`/`down` commands or `travel` to confirm movement direction.
-Do not run `unload` unless the robot is physically clear for a full stroke.
+verified physical height. Recommended startup procedure:
+
+1. Physically place the collector in a known raised/travel position.
+2. Start `tools/collector_playground.py`.
+3. Connect/configure the EV3 host and port.
+4. Press `Travel Position`.
+5. Test small bounded `Pipe Up` / `Pipe Down` movements.
+6. Use `Unload Full Cycle` only deliberately when the robot is physically clear
+   for a full stroke.
 
 ## Safety Rule
 

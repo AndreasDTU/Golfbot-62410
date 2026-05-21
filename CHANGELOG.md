@@ -6,10 +6,19 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Added
 
-- Added `tools/collector_playground.py`, a standalone open-loop terminal REPL
-  for manually testing the GolfBot collector/pipe over the existing EV3 TCP
-  controller without starting vision, route planning, ball detection, wheel
-  dispatch, or autonomous driving.
+- Added `tools/collector_playground.py`, a standalone open-loop collector
+  playground for manually testing the GolfBot collector/pipe over the existing
+  EV3 TCP controller without starting vision, route planning, ball detection,
+  wheel dispatch, or autonomous driving.
+  - The playground now starts an OpenCV HighGUI window by default, matching the
+    existing `tools/pathfinding_sandbox.py` UI style, and keeps the original
+    terminal REPL behind `--cli` / `--terminal`.
+  - The GUI uses the same `CollectorPlayground.execute(...)` command handling
+    as terminal mode, with host/port controls, bounded manual movement input,
+    command logging, software-state display, and a simple open-loop robot/pipe
+    visualization.
+  - Added `--dummy` mode so the GUI or terminal REPL can be previewed without
+    an EV3 hostname, robot server, or network connection.
   - `robot/controller.py` now exposes manual `pipe_up(...)`,
     `pipe_down(...)`, and `pipe_stop()` helpers plus configurable TCP port and
     timeout arguments.
@@ -30,7 +39,9 @@ All notable larger additions and behavioral changes to this repository should be
 
 - Added focused tests for collection actuator command separation, collector travel-position gating, and autonomous white/orange collection assist behavior.
 - Added focused tests for collector playground command dispatch, manual movement
-  validation, unload confirmation, and isolation from the autonomous stack.
+  validation, unload confirmation, GUI-to-terminal command mapping, state
+  transitions, dummy mode, startup safety, and isolation from the autonomous
+  stack.
 - Added focused tests for step-mode CLI parsing and pause/release behavior.
 
 ## 2026-05-20

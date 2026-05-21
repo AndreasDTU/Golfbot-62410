@@ -10,7 +10,10 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
 
 These tests cover closed-loop drive handoff, collection actuator command
 separation, and the rule that autonomous white/orange ball collection uses the
-small `pickup_assist` command rather than the full unload cycle.
+small `pickup_assist` command rather than the full unload cycle. They also cover
+the autonomous guard that commands `collector_travel_position` before wheel
+route-following starts and returns the collector state to `TRAVEL` after pickup
+assist completes.
 
 ## Full Perspective + Distortion Comparison (single command)
 

@@ -143,12 +143,14 @@ after a valid route is cached again.
 Near pickup targets, the drive loop switches from UDP velocity control to
 calibrated TCP position control:
 
-1. Stop UDP wheel output with `LR 0 0`.
-2. Compute the current heading error to the final pickup pose.
-3. Execute blocking TCP `turn(degrees, speedPercent)`.
-4. Execute blocking TCP `move(distance, speedPercent)`.
-5. Run the collection-only `pickup_assist()` pipe command.
-6. Continue to pickup/replan after the assist motion completes.
+1. Confirm or command `collector_travel_position()` before route following.
+2. Stop UDP wheel output with `LR 0 0`.
+3. Compute the current heading error to the final pickup pose.
+4. Execute blocking TCP `turn(degrees, speedPercent)`.
+5. Execute blocking TCP `move(distance, speedPercent)`.
+6. Run the collection-only `pickup_assist()` pipe command.
+7. Return the collector state to `TRAVEL`.
+8. Continue to pickup/replan after the assist motion completes.
 
 The near-zone TCP speed and turn speed are configured through `DriveConfig`.
 The collection actuator contract is documented in

@@ -7,10 +7,10 @@ All notable larger additions and behavioral changes to this repository should be
 ### Added
 
 - Added explicit collection-actuator command separation.
-  - `robot/controller.py` now exposes `pickup_assist()` for collection and `unload_full_cycle()` for goal unloading.
-  - `robot/robot_server.py` maps `pickup_assist` to a small pipe jiggle and `unload_full_cycle` to the full unloading stroke, while keeping `pickup`/`dropoff` as compatibility aliases.
-  - `tools/topdown_object_detector.py` autonomous pickup state now calls only `pickup_assist()`.
-  - Added `docs/COLLECTION_MECHANISM.md` to document the vertical tube, one-way retention, FIFO unloading, and actuator safety rule.
+  - `robot/controller.py` now exposes `collector_travel_position()` for safe driving height, `pickup_assist()` for collection, and `unload_full_cycle()` for goal unloading.
+  - `robot/robot_server.py` maps `collector_travel_position` to a raise/travel command, `pickup_assist` to a small pipe jiggle, and `unload_full_cycle` to the full unloading stroke, while keeping `pickup`/`dropoff` as compatibility aliases.
+  - `tools/topdown_object_detector.py` autonomous pickup state now calls only `pickup_assist()` and gates route following on a `TRAVEL` collector state.
+  - Added `docs/COLLECTION_MECHANISM.md` to document the vertical tube, travel height, one-way retention, FIFO unloading, and actuator safety rule.
 - Added step-by-step drive mode to `tools/topdown_object_detector.py`.
   - New `--step` flag works with `--drive` and starts robot motion in a paused operator-waiting state.
   - Pressing `n` releases one autonomous target run while vision, smoothing, occupancy-grid updates, and async route planning continue every frame.
@@ -19,7 +19,7 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Verified
 
-- Added focused tests for collection actuator command separation and autonomous white/orange collection assist behavior.
+- Added focused tests for collection actuator command separation, collector travel-position gating, and autonomous white/orange collection assist behavior.
 - Added focused tests for step-mode CLI parsing and pause/release behavior.
 
 ## 2026-05-20

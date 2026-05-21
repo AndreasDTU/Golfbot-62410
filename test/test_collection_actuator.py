@@ -17,6 +17,13 @@ class CollectionActuatorCommandTests(unittest.TestCase):
 
         self.assertEqual(sent, ["pickup_assist"])
 
+    def test_collector_travel_position_sends_raise_command(self) -> None:
+        controller, sent = self.controller_with_recorder()
+
+        controller.collector_travel_position()
+
+        self.assertEqual(sent, ["collector_travel_position"])
+
     def test_unload_full_cycle_sends_full_unload_command(self) -> None:
         controller, sent = self.controller_with_recorder()
 

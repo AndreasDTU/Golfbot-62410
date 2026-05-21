@@ -15,6 +15,7 @@ Commands:
   pipe up <units> [speed] - Raise the pipe N units
   pipe down <units> [speed] - Lower the pipe N units
   pipe stop               - Stop pipe motor immediately
+  collector_travel_position - Raise collector to safe driving position
   pickup_assist           - Small pipe jiggle for collecting one ball
   unload_full_cycle       - Full pipe cycle for unloading balls at the goal
   pickup                  - Compatibility alias for pickup_assist
@@ -43,6 +44,8 @@ MM_PER_UNIT = 9.9664                 # 1 unit = 10mm (1cm). Adjust to recalibrat
 # Pipe motor: degrees of motor rotation per unit of pipe travel
 # Tune this based on your pipe mechanism's gear ratio / spool size
 PIPE_DEGREES_PER_UNIT = 45.0
+COLLECTOR_TRAVEL_UNITS = 22
+COLLECTOR_TRAVEL_SPEED = 50
 PICKUP_ASSIST_UNITS = 2
 PICKUP_ASSIST_SPEED = 35
 UNLOAD_FULL_CYCLE_UNITS = 22
@@ -145,6 +148,17 @@ def cmd_pipe(parts):
     )
     return "ok: pipe {} {} units".format(subaction, units)
 
+def cmd_collector_travel_position():
+    """Move collector toward its raised travel position before route following."""
+    motor_deg = COLLECTOR_TRAVEL_UNITS * PIPE_DEGREES_PER_UNIT
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(-COLLECTOR_TRAVEL_SPEED),
+        degrees=motor_deg,
+        brake=True,
+        block=True
+    )
+    return "ok: collector travel position"
+
 def cmd_pickup_assist():
     """Small local pipe motion for collection; never a full unload stroke."""
     units = PICKUP_ASSIST_UNITS
@@ -221,6 +235,8 @@ def handle_command(cmd):
             return cmd_pipe(parts)
         elif action == "stop":
             return cmd_stop()
+        elif action == "collector_travel_position":
+            return cmd_collector_travel_position()
         elif action in ("pickup_assist", "pickup"):
             return cmd_pickup_assist()
         elif action in ("unload_full_cycle", "dropoff"):

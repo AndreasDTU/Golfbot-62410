@@ -60,6 +60,15 @@ class PickupExecutionState(Enum):
     REPLAN = "REPLAN"
 
 
+class CollectorPositionState(Enum):
+    """Best-known collector height state for autonomous drive gating."""
+
+    UNKNOWN = "UNKNOWN"
+    TRAVEL = "TRAVEL"
+    PICKUP_ASSIST = "PICKUP_ASSIST"
+    UNLOADING = "UNLOADING"
+
+
 BALL_COUNT_HISTORY_FRAMES = 15
 INITIAL_BALL_COUNT_STABLE_S = 0.75
 
@@ -86,6 +95,7 @@ class RuntimeState:
     pickup_state_started_s: float = 0.0
     pickup_command_fired: bool = False
     near_zone_move_fired: bool = False
+    collector_state: CollectorPositionState = CollectorPositionState.UNKNOWN
     initial_total_balls: int | None = None
     balls_collected: int = 0
     stable_visible_balls: int | None = None
@@ -671,6 +681,19 @@ class TopdownDetectorApp:
         self.drive_guard.wheel_controller.reset()
         drive_runtime.stop(DriveControlState.STOPPED, "step target complete; press n")
 
+    def ensure_collector_travel_position(self, drive_runtime: DriveRuntime) -> bool:
+        """Ensure the collector is in the raised travel position before wheel motion."""
+        if drive_runtime.dispatcher is None or self.runtime.collector_state == CollectorPositionState.TRAVEL:
+            return False
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.STOPPED, "collector travel position")
+        try:
+            RobotController(self.config.drive.robot_ip).collector_travel_position()
+            self.runtime.collector_state = CollectorPositionState.TRAVEL
+        except Exception as exc:
+            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"collector travel failed: {exc}")
+        return True
+
     def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
         """Stop UDP tracking, align with TCP turn, then finish with TCP encoder move."""
         if self.runtime.near_zone_move_fired:
@@ -756,8 +779,12 @@ class TopdownDetectorApp:
         if state == PickupExecutionState.PICKUP_ASSIST:
             drive_runtime.stop(DriveControlState.PICKUP, "pickup assist")
             if not self.runtime.pickup_command_fired:
+                self.runtime.collector_state = CollectorPositionState.PICKUP_ASSIST
                 self._start_pickup_assist_command_thread()
                 self.runtime.pickup_command_fired = True
+            if self.pickup_thread is not None and self.pickup_thread.is_alive():
+                return True
+            self.runtime.collector_state = CollectorPositionState.TRAVEL
             self.runtime.pickup_state = PickupExecutionState.REPLAN
             self.runtime.pickup_state_started_s = now_s
             return True
@@ -1735,8 +1762,9 @@ class TopdownDetectorApp:
                     self.drive_guard.wheel_controller.reset()
                     drive_runtime.stop(DriveControlState.STOPPED, "step paused; press n")
                 else:
+                    collector_owns_control = self.ensure_collector_travel_position(drive_runtime)
                     pickup_state_before = self.runtime.pickup_state
-                    pickup_owns_control = self.update_pickup_state(drive_runtime, now)
+                    pickup_owns_control = False if collector_owns_control else self.update_pickup_state(drive_runtime, now)
                     pickup_completed = (
                         self.runtime.step_mode_enabled
                         and pickup_state_before == PickupExecutionState.REPLAN
@@ -1745,7 +1773,7 @@ class TopdownDetectorApp:
                     if pickup_completed:
                         self.pause_step_drive_after_target(drive_runtime)
                         pickup_owns_control = True
-                    if not pickup_owns_control:
+                    if not collector_owns_control and not pickup_owns_control:
                         self.drive_guard.enforce_xte_guard_before_replan(
                             self.runtime.robot_pose,
                             self.runtime.route_plan.points,

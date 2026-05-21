@@ -6,7 +6,7 @@ from unittest.mock import patch
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
 from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
-from tools.topdown_object_detector import PickupExecutionState, TopdownDetectorApp
+from tools.topdown_object_detector import CollectorPositionState, PickupExecutionState, TopdownDetectorApp
 from vision.config import DriveConfig, FieldConfig
 from vision.debug import DebugRenderer
 
@@ -234,9 +234,12 @@ class DriveControlTests(unittest.TestCase):
             owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
             assert app.pickup_thread is not None
             app.pickup_thread.join(timeout=1.0)
+            if app.runtime.pickup_state == PickupExecutionState.PICKUP_ASSIST:
+                app.update_pickup_state(drive_runtime, now_s=1.1)
 
         self.assertTrue(owns_control)
         self.assertEqual(events, ["pickup_assist"])
+        self.assertEqual(app.runtime.collector_state, CollectorPositionState.TRAVEL)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.REPLAN)
         self.assertEqual(drive_runtime.last_message, "pickup assist")
 
@@ -268,9 +271,43 @@ class DriveControlTests(unittest.TestCase):
             owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
             assert app.pickup_thread is not None
             app.pickup_thread.join(timeout=1.0)
+            if app.runtime.pickup_state == PickupExecutionState.PICKUP_ASSIST:
+                app.update_pickup_state(drive_runtime, now_s=1.1)
 
         self.assertTrue(owns_control)
         self.assertEqual(events, ["pickup_assist"])
+        self.assertEqual(app.runtime.collector_state, CollectorPositionState.TRAVEL)
+
+    def test_drive_start_requires_collector_travel_position_before_route_following(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str) -> None:
+                self.robot_ip = robot_ip
+
+            def collector_travel_position(self) -> str:
+                events.append("collector_travel_position")
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            owns_control = app.ensure_collector_travel_position(drive_runtime)
+
+        self.assertTrue(owns_control)
+        self.assertEqual(events, ["collector_travel_position"])
+        self.assertEqual(app.runtime.collector_state, CollectorPositionState.TRAVEL)
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+
+    def test_route_following_not_blocked_after_collector_travel_confirmed(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        app.runtime.collector_state = CollectorPositionState.TRAVEL
+
+        owns_control = app.ensure_collector_travel_position(drive_runtime)
+
+        self.assertFalse(owns_control)
 
 
 if __name__ == "__main__":

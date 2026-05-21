@@ -28,6 +28,10 @@ class RobotController:
     def turn(self, degrees, speedPercent = 100):
         return self._send(f"turn {degrees} {speedPercent}")
 
+    def collector_travel_position(self):
+        """Raise or keep the collector in its safe driving position."""
+        return self._send("collector_travel_position")
+
     def pickup_assist(self):
         """Run the small collection-only pipe jiggle used during ball pickup."""
         return self._send("pickup_assist")

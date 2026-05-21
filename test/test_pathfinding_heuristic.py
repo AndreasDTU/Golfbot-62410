@@ -1,7 +1,8 @@
 import unittest
+import math
 import numpy as np
 
-from pathfinding.models import HybridPose, PlannedBallTarget
+from pathfinding.models import HybridPlannerConfig, HybridPose, PlannedBallTarget
 from pathfinding.planner import GreedyRoutePlanner, GridDijkstraHeuristic, HybridAStarPlanner
 from robot.models import RobotGeometry
 from vision.config import FieldConfig
@@ -102,6 +103,193 @@ class PickupStandoffRouteTests(unittest.TestCase):
         self.assertAlmostEqual(np.hypot(*final_vector), planner.MIN_STANDOFF_BODY_DISTANCE_CM, delta=1e-6)
         tube = planner.tube_center_for_pose(final_pose, geometry)
         self.assertLessEqual(np.hypot(tube[0] - ball.x_cm, tube[1] - ball.y_cm), 1e-6)
+
+
+class BallAwareRoutePlanningTests(unittest.TestCase):
+    def test_non_target_ball_is_added_to_obstacle_grid_and_target_is_excluded(self) -> None:
+        field = FieldConfig(width_cm=120.0, height_cm=80.0)
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        config = HybridPlannerConfig(ball_radius_cm=2.0, non_target_ball_extra_clearance_cm=0.0)
+        route_planner = GreedyRoutePlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        orange = PlannedBallTarget(1, "orange", 80.0, 40.0, (80, 40))
+        white = PlannedBallTarget(2, "white", 55.0, 40.0, (55, 40))
+
+        obstacle_grid, obstacles = route_planner.grid_with_ball_obstacles(grid, [orange, white], orange, geometry, config)
+
+        self.assertEqual([target.track_id for target in obstacles], [2])
+        self.assertEqual(obstacle_grid[int(round(field.height_cm - white.y_cm)), int(round(white.x_cm))], 1)
+        self.assertEqual(obstacle_grid[int(round(field.height_cm - orange.y_cm)), int(round(orange.x_cm))], 0)
+
+    def test_ball_obstacle_radius_uses_ball_radius_half_robot_width_and_extra_clearance(self) -> None:
+        config = HybridPlannerConfig(ball_radius_cm=2.0, non_target_ball_extra_clearance_cm=0.5)
+        route_planner = GreedyRoutePlanner(HybridAStarPlanner(config=config), config)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+
+        self.assertEqual(route_planner.ball_obstacle_radius_cm(config, geometry), 12.5)
+
+    def test_route_to_orange_avoids_white_ball_when_route_around_exists(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.3,
+            rear_cm=10.1,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        config = HybridPlannerConfig(
+            max_expansions=50000,
+            ball_radius_cm=2.0,
+            non_target_ball_extra_clearance_cm=0.0,
+        )
+        route_planner = GreedyRoutePlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        start_pose = HybridPose(30.0, 60.0, 0.0)
+        orange = PlannedBallTarget(1, "orange", 120.0, 60.0, (120, int(round(field.height_cm - 60.0))))
+        white = PlannedBallTarget(2, "white", 75.0, 60.0, (75, int(round(field.height_cm - 60.0))))
+
+        segment, obstacles, mode = route_planner.plan_target_segment_with_ball_avoidance(
+            grid,
+            [orange, white],
+            start_pose,
+            orange,
+            geometry,
+            config,
+        )
+
+        self.assertTrue(segment)
+        self.assertEqual(mode, "hard")
+        self.assertEqual([target.track_id for target in obstacles], [2])
+        min_distance_to_white = min(math.hypot(pose.x_cm - white.x_cm, pose.y_cm - white.y_cm) for pose in segment)
+        self.assertGreater(min_distance_to_white, route_planner.ball_obstacle_radius_cm(config, geometry))
+        self.assertGreater(max(abs(pose.y_cm - 60.0) for pose in segment), 10.0)
+
+    def test_orange_is_always_selected_before_white_balls(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.3,
+            rear_cm=10.1,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        config = HybridPlannerConfig(max_expansions=50000)
+        route_planner = GreedyRoutePlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        orange = PlannedBallTarget(1, "orange", 120.0, 60.0, (120, int(round(field.height_cm - 60.0))))
+        white = PlannedBallTarget(2, "white", 75.0, 60.0, (75, int(round(field.height_cm - 60.0))))
+
+        route = route_planner.plan(grid, [white, orange], HybridPose(30.0, 60.0, 0.0), geometry, config)
+
+        self.assertIsNotNone(route.active_target)
+        assert route.active_target is not None
+        self.assertEqual(route.active_target.track_id, orange.track_id)
+        self.assertEqual(route.ball_avoidance_mode, "hard")
+        self.assertNotEqual(route.ball_avoidance_mode, "intermediate pickup")
+
+    def test_orange_blocked_by_ball_falls_back_to_orange_not_white(self) -> None:
+        field = FieldConfig(width_cm=120.0, height_cm=80.0)
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        grid[:, 60] = 1
+        grid[30:51, 60] = 0
+        geometry = RobotGeometry(
+            width_cm=10.0,
+            front_cm=5.0,
+            rear_cm=5.0,
+            tube_forward_cm=10.0,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        config = HybridPlannerConfig(
+            max_expansions=25000,
+            goal_tolerance_cm=4.0,
+            ball_radius_cm=2.0,
+            non_target_ball_extra_clearance_cm=8.0,
+        )
+        route_planner = GreedyRoutePlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        orange = PlannedBallTarget(1, "orange", 95.0, 40.0, (95, 40))
+        white = PlannedBallTarget(2, "white", 60.0, 40.0, (60, 40))
+
+        route = route_planner.plan(grid, [orange, white], HybridPose(30.0, 40.0, 0.0), geometry, config)
+
+        self.assertIsNotNone(route.active_target)
+        assert route.active_target is not None
+        self.assertEqual(route.active_target.track_id, orange.track_id)
+        self.assertEqual(route.ball_avoidance_mode, "orange forced first")
+        self.assertNotEqual(route.active_target.track_id, white.track_id)
+        self.assertNotEqual(route.ball_avoidance_mode, "intermediate pickup")
+        self.assertEqual([target.track_id for target in route.ball_obstacles or []], [white.track_id])
+
+    def test_white_targets_avoid_other_balls_after_orange_is_absent(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.3,
+            rear_cm=10.1,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        config = HybridPlannerConfig(max_expansions=50000)
+        route_planner = GreedyRoutePlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        target_white = PlannedBallTarget(1, "white", 120.0, 60.0, (120, int(round(field.height_cm - 60.0))))
+        obstacle_white = PlannedBallTarget(2, "white", 75.0, 60.0, (75, int(round(field.height_cm - 60.0))))
+
+        segment, obstacles, mode = route_planner.plan_target_segment_with_ball_avoidance(
+            grid,
+            [target_white, obstacle_white],
+            HybridPose(30.0, 60.0, 0.0),
+            target_white,
+            geometry,
+            config,
+        )
+
+        self.assertTrue(segment)
+        self.assertEqual(mode, "hard")
+        self.assertEqual([target.track_id for target in obstacles], [obstacle_white.track_id])
+        self.assertGreater(
+            min(math.hypot(pose.x_cm - obstacle_white.x_cm, pose.y_cm - obstacle_white.y_cm) for pose in segment),
+            route_planner.ball_obstacle_radius_cm(config, geometry),
+        )
+
+    def test_ball_avoidance_can_be_disabled_for_debugging(self) -> None:
+        field = FieldConfig(width_cm=120.0, height_cm=80.0)
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        config = HybridPlannerConfig(avoid_non_target_balls_enabled=False)
+        route_planner = GreedyRoutePlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        orange = PlannedBallTarget(1, "orange", 80.0, 40.0, (80, 40))
+        white = PlannedBallTarget(2, "white", 55.0, 40.0, (55, 40))
+
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+
+        obstacle_grid, obstacles = route_planner.grid_with_ball_obstacles(grid, [orange, white], orange, geometry, config)
+
+        self.assertEqual(obstacles, [])
+        np.testing.assert_array_equal(obstacle_grid, grid)
 
 
 class TightCornerPickupTests(unittest.TestCase):

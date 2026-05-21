@@ -35,6 +35,9 @@ class RoutePlan:
     pickup_poses: list[HybridPose]
     unload_pose: HybridPose | None = None
     unload_goal_cm: tuple[float, float] | None = None
+    ball_obstacles: list[PlannedBallTarget] | None = None
+    ball_obstacle_radius_cm: float = 0.0
+    ball_avoidance_mode: str = "disabled"
 
 
 @dataclass(frozen=True)
@@ -64,3 +67,7 @@ class HybridPlannerConfig:
         math.radians(10.0),
     )
     in_place_rotation_cost: float = 1.1
+    avoid_non_target_balls_enabled: bool = True
+    ball_radius_cm: float = 2.0
+    non_target_ball_extra_clearance_cm: float = 0.0
+    allow_last_resort_orange_contact: bool = True

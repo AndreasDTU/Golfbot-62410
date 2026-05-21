@@ -287,6 +287,10 @@ class PlannerConfig:
     route_heading_marker_interval: int = 20
     route_target_move_invalidate_cm: float = 5.0
     route_crosstrack_invalidate_cm: float = 14.0
+    avoid_non_target_balls_enabled: bool = True
+    ball_radius_cm: float = 2.0
+    non_target_ball_extra_clearance_cm: float = 0.0
+    allow_last_resort_orange_contact: bool = True
 
     @property
     def route_target_reached_cm(self) -> float:

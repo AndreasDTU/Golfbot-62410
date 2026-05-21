@@ -6,6 +6,22 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Added
 
+- Added ball-aware route planning for autonomous collection.
+  - `pathfinding/planner.py` now inserts inflated hard obstacles for
+    non-target balls during each selected-target planning attempt.
+  - The selected target ball is excluded from its own obstacle layer so pickup
+    standoff/final-pickup poses remain reachable.
+  - Orange/VIP routing is absolute first. If a white ball blocks a safe orange
+    route, the planner keeps orange as the selected target and may use an
+    explicit `orange forced first` last-resort route instead of selecting a
+    white intermediate pickup.
+  - Non-target ball obstacle radius is computed from
+    `ball_radius_cm + 0.5 * robot_width_cm + non_target_ball_extra_clearance_cm`.
+  - Added route metadata for ball obstacles and ball-avoidance mode without
+    adding schematic ball-avoidance overlays.
+  - Added planner configuration defaults for enabling/disabling non-target ball
+    avoidance, ball radius, small extra clearance, and last-resort orange
+    contact.
 - Added `tools/collector_playground.py`, a standalone open-loop collector
   playground for manually testing the GolfBot collector/pipe over the existing
   EV3 TCP controller without starting vision, route planning, ball detection,
@@ -37,6 +53,10 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Verified
 
+- Added focused tests for non-target ball obstacle insertion, selected target
+  exclusion, configured ball obstacle inflation, route-around behavior,
+  absolute orange-first selection, `orange forced first` fallback, white-ball
+  avoidance after orange is absent, and debug disabling.
 - Added focused tests for collection actuator command separation, collector travel-position gating, and autonomous white/orange collection assist behavior.
 - Added focused tests for collector playground command dispatch, manual movement
   validation, unload confirmation, GUI-to-terminal command mapping, state

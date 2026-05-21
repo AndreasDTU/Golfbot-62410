@@ -1223,6 +1223,45 @@ class GreedyRoutePlanner:
         self.hybrid_planner = hybrid_planner or HybridAStarPlanner(config=config)
         self.config = config or self.hybrid_planner.config
 
+    @staticmethod
+    def ball_obstacle_radius_cm(config: HybridPlannerConfig, geometry: RobotGeometry) -> float:
+        """Return non-target ball clearance for the robot reference point."""
+        return max(0.0, config.ball_radius_cm + geometry.width_cm * 0.5 + config.non_target_ball_extra_clearance_cm)
+
+    def ball_obstacle_targets(
+        self,
+        ball_targets: list[PlannedBallTarget],
+        selected_target: PlannedBallTarget,
+        config: HybridPlannerConfig,
+    ) -> list[PlannedBallTarget]:
+        """Return balls that should be treated as obstacles for this selected target."""
+        if not config.avoid_non_target_balls_enabled:
+            return []
+        return [target for target in ball_targets if target.track_id != selected_target.track_id]
+
+    def grid_with_ball_obstacles(
+        self,
+        grid: np.ndarray,
+        ball_targets: list[PlannedBallTarget],
+        selected_target: PlannedBallTarget,
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig,
+    ) -> tuple[np.ndarray, list[PlannedBallTarget]]:
+        """Add inflated non-target ball obstacles while leaving the selected ball reachable."""
+        obstacle_targets = self.ball_obstacle_targets(ball_targets, selected_target, config)
+        if not obstacle_targets:
+            return grid, []
+
+        inflated = grid.copy()
+        radius_cm = int(math.ceil(self.ball_obstacle_radius_cm(config, geometry)))
+        for obstacle in obstacle_targets:
+            center = (
+                int(np.clip(round(obstacle.x_cm), 0, inflated.shape[1] - 1)),
+                int(np.clip(round(self.hybrid_planner.field.height_cm - obstacle.y_cm), 0, inflated.shape[0] - 1)),
+            )
+            cv2.circle(inflated, center, radius_cm, 1, -1, cv2.LINE_AA)
+        return (inflated > 0).astype(np.uint8), obstacle_targets
+
     def plan_unload_segment(
         self,
         grid: np.ndarray,
@@ -1290,6 +1329,21 @@ class GreedyRoutePlanner:
             goal_point_cm=goal_point_cm,
         )
 
+    def plan_target_segment_with_ball_avoidance(
+        self,
+        grid: np.ndarray,
+        all_targets: list[PlannedBallTarget],
+        current_pose: HybridPose,
+        target: PlannedBallTarget,
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig,
+    ) -> tuple[list[HybridPose], list[PlannedBallTarget], str]:
+        """Plan to ``target`` with all other balls inserted as inflated hard obstacles."""
+        obstacle_grid, obstacle_targets = self.grid_with_ball_obstacles(grid, all_targets, target, geometry, config)
+        mode = "hard" if obstacle_targets else ("disabled" if not config.avoid_non_target_balls_enabled else "hard")
+        segment = self.plan_target_segment(obstacle_grid, current_pose, target, geometry, config)
+        return segment, obstacle_targets, mode
+
     def plan(
         self,
         grid: np.ndarray,
@@ -1308,31 +1362,53 @@ class GreedyRoutePlanner:
         route: list[HybridPose] = [current_pose]
         pickup_poses: list[HybridPose] = []
         active_target: PlannedBallTarget | None = None
+        active_ball_obstacles: list[PlannedBallTarget] = []
+        ball_avoidance_mode = "disabled" if not cfg.avoid_non_target_balls_enabled else "hard"
 
         orange_targets = sorted(
             [target for target in unvisited if target.label == "orange"],
             key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
         )
         for orange_target in orange_targets:
-            orange_segment = self.plan_target_segment(
+            orange_segment, orange_obstacles, _orange_mode = self.plan_target_segment_with_ball_avoidance(
                 grid,
+                unvisited,
                 current_pose,
                 orange_target,
                 geometry,
                 cfg,
             )
-            unvisited.remove(orange_target)
             if not orange_segment:
                 print(
                     f"Hybrid A* could not route to orange target {orange_target.track_id}; "
-                    "continuing with remaining targets."
+                    "keeping orange first and trying last-resort direct orange route."
                 )
+                if cfg.allow_last_resort_orange_contact:
+                    orange_segment = self.plan_target_segment(grid, current_pose, orange_target, geometry, cfg)
+                    if orange_segment:
+                        active_target = orange_target
+                        active_ball_obstacles = orange_obstacles
+                        ball_avoidance_mode = "orange forced first"
+                        route.extend(orange_segment[1:])
+                        current_pose = orange_segment[-1]
+                        pickup_poses.append(current_pose)
+                        break
+                print(f"Hybrid A* could not route to orange target {orange_target.track_id} even as last resort.")
                 continue
             active_target = orange_target
+            active_ball_obstacles = orange_obstacles
             route.extend(orange_segment[1:])
             current_pose = orange_segment[-1]
             pickup_poses.append(current_pose)
             break
+
+        if orange_targets and active_target is None:
+            return RoutePlan(points=[], active_target=None, pickup_poses=[])
+
+        if active_target is not None:
+            unvisited = [target for target in unvisited if target.track_id != active_target.track_id]
+        else:
+            unvisited = [target for target in unvisited if target.label != "orange"]
 
         while unvisited:
             nearest_candidates = sorted(
@@ -1341,10 +1417,12 @@ class GreedyRoutePlanner:
             )
             chosen_target: PlannedBallTarget | None = None
             chosen_segment: list[HybridPose] = []
+            chosen_obstacles: list[PlannedBallTarget] = []
 
             for candidate in nearest_candidates:
-                segment = self.plan_target_segment(
+                segment, obstacle_targets, _mode = self.plan_target_segment_with_ball_avoidance(
                     grid,
+                    unvisited,
                     current_pose,
                     candidate,
                     geometry,
@@ -1353,6 +1431,7 @@ class GreedyRoutePlanner:
                 if segment:
                     chosen_target = candidate
                     chosen_segment = segment
+                    chosen_obstacles = obstacle_targets
                     break
                 print(
                     f"Hybrid A* could not route to target {candidate.track_id} "
@@ -1368,6 +1447,7 @@ class GreedyRoutePlanner:
             unvisited.remove(chosen_target)
             if active_target is None:
                 active_target = chosen_target
+                active_ball_obstacles = chosen_obstacles
 
         unload_pose: HybridPose | None = None
         unload_goal_cm: tuple[float, float] | None = None
@@ -1375,6 +1455,8 @@ class GreedyRoutePlanner:
             unload_segment, unload_pose, unload_goal_cm = self.plan_unload_segment(grid, current_pose, geometry, cfg)
             if unload_segment:
                 route.extend(unload_segment[1:])
+        else:
+            route = []
 
         return RoutePlan(
             points=route,
@@ -1382,6 +1464,9 @@ class GreedyRoutePlanner:
             pickup_poses=pickup_poses,
             unload_pose=unload_pose,
             unload_goal_cm=unload_goal_cm,
+            ball_obstacles=active_ball_obstacles,
+            ball_obstacle_radius_cm=self.ball_obstacle_radius_cm(cfg, geometry) if cfg.avoid_non_target_balls_enabled else 0.0,
+            ball_avoidance_mode=ball_avoidance_mode,
         )
 
 
@@ -1422,6 +1507,10 @@ class RoutePlanningFacade:
             rotation_deltas_rad=self.planner_config.rotation_deltas_rad,
             reverse_cost_multiplier=self.planner_config.reverse_cost_multiplier,
             in_place_rotation_cost=self.planner_config.in_place_rotation_cost,
+            avoid_non_target_balls_enabled=self.planner_config.avoid_non_target_balls_enabled,
+            ball_radius_cm=self.planner_config.ball_radius_cm,
+            non_target_ball_extra_clearance_cm=self.planner_config.non_target_ball_extra_clearance_cm,
+            allow_last_resort_orange_contact=self.planner_config.allow_last_resort_orange_contact,
         )
         self.hybrid_planner = HybridAStarPlanner(self.field, self.robot_config, self.hybrid_config)
         self.legacy_planner = LegacyAStarPlanner()

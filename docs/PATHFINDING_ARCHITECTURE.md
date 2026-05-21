@@ -64,6 +64,32 @@ center cross does not create an artificial safety-margin failure.
 This keeps clearance deterministic and orientation-aware without adding runtime
 geometry dependencies beyond OpenCV and NumPy.
 
+Detected balls are also considered during target-specific planning. For each
+selected pickup target, the planner builds a temporary copy of the red-zone
+grid and inserts every other currently unvisited ball as an inflated hard
+obstacle. The selected target ball is explicitly excluded from that temporary
+obstacle layer so its own pickup standoff/final-pickup poses remain reachable.
+
+The inflated ball obstacle radius is:
+
+```text
+ball_radius_cm + 0.5 * robot_width_cm + non_target_ball_extra_clearance_cm
+```
+
+These defaults are configured in `vision.config.PlannerConfig` and copied into
+`pathfinding.models.HybridPlannerConfig`:
+
+- `avoid_non_target_balls_enabled`
+- `ball_radius_cm`
+- `non_target_ball_extra_clearance_cm`
+- `allow_last_resort_orange_contact`
+
+This is a conservative hard-obstacle layer, not a cost-only hint. If a white
+ball lies directly between the robot and the selected target, Hybrid A* should
+route around the inflated ball region whenever the field layout allows it.
+When debugging detection or route geometry, ball avoidance can be disabled
+through configuration, but the default behavior is to avoid non-target balls.
+
 ## Pickup Offset
 
 The route is expressed in robot body-center coordinates. Ball pickup goals are
@@ -193,11 +219,14 @@ orange or white target that the route actually connects.
 `build_greedy_route()` is state-aware:
 
 1. If orange targets exist, they are sorted by distance from the robot.
-2. Hybrid A* tries each orange target in nearest-first order.
-3. If no valid orange trajectory exists in the current map, those orange targets
-   are treated as unreachable for that planning pass.
-4. Routing then falls back to nearest-reachable greedy collection for the
-   remaining balls.
+2. Hybrid A* tries each orange target in nearest-first order with all
+   non-target balls inserted as inflated hard obstacles.
+3. If no valid orange trajectory exists with ball avoidance enabled, the route
+   never changes the selected target to a white ball.
+4. Only when `allow_last_resort_orange_contact` is enabled may the planner relax
+   the non-target ball obstacle layer for orange as a last resort. The active
+   target remains orange, and this mode is labelled `orange forced first` and
+   logged so it is visible during contest debugging.
 5. After an orange ball is reached, the same nearest-reachable logic continues
    from the final `HybridPose`.
 

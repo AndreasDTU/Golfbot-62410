@@ -89,6 +89,8 @@ class RuntimeState:
     initial_total_balls: int | None = None
     balls_collected: int = 0
     stable_visible_balls: int | None = None
+    step_mode_enabled: bool = False
+    step_drive_paused: bool = False
     visible_ball_count_history: deque[tuple[float, int]] = field(
         default_factory=lambda: deque(maxlen=BALL_COUNT_HISTORY_FRAMES)
     )
@@ -342,6 +344,11 @@ class TopdownDetectorApp:
             "--drive",
             action="store_true",
             help="Enable non-blocking UDP dispatch of autonomous left/right wheel speeds.",
+        )
+        parser.add_argument(
+            "--step",
+            action="store_true",
+            help="With --drive, pause before each autonomous target and advance on the 'n' key.",
         )
         return parser.parse_args()
 
@@ -599,6 +606,70 @@ class TopdownDetectorApp:
             2,
             cv2.LINE_AA,
         )
+
+    def draw_step_pause_overlay(self, frame: np.ndarray) -> None:
+        """Draw a high-visibility operator prompt when step drive is paused."""
+        if not (self.runtime.step_mode_enabled and self.runtime.step_drive_paused):
+            return
+        text = "PAUSED - PRESS 'N' TO CONTINUE"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.1
+        thickness = 3
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        x = max(20, (frame.shape[1] - text_width) // 2)
+        y = max(60, text_height + 28)
+        cv2.rectangle(
+            frame,
+            (x - 18, y - text_height - 18),
+            (x + text_width + 18, y + baseline + 18),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.rectangle(
+            frame,
+            (x - 18, y - text_height - 18),
+            (x + text_width + 18, y + baseline + 18),
+            (0, 255, 255),
+            3,
+        )
+        cv2.putText(
+            frame,
+            text,
+            (x, y),
+            font,
+            font_scale,
+            (0, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    def release_step_drive_pause(self, drive_runtime: DriveRuntime | None) -> None:
+        """Allow one step-mode target run after the operator presses next."""
+        if not self.runtime.step_mode_enabled:
+            return
+        if not self.ball_count_initialized():
+            if drive_runtime is not None:
+                drive_runtime.last_message = "step waiting for stable ball count"
+            return
+        if self.runtime.robot_pose is None:
+            if drive_runtime is not None:
+                drive_runtime.last_message = "step waiting for robot pose"
+            return
+        if len(self.runtime.route_plan.points) < 2:
+            if drive_runtime is not None:
+                drive_runtime.last_message = "step waiting for route"
+            return
+        self.runtime.step_drive_paused = False
+        if drive_runtime is not None:
+            drive_runtime.last_message = "step released"
+
+    def pause_step_drive_after_target(self, drive_runtime: DriveRuntime) -> None:
+        """Return step-mode drive to its safe waiting state after pickup completion."""
+        if not self.runtime.step_mode_enabled:
+            return
+        self.runtime.step_drive_paused = True
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.STOPPED, "step target complete; press n")
 
     def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
         """Stop UDP tracking, align with TCP turn, then finish with TCP encoder move."""
@@ -1072,6 +1143,7 @@ class TopdownDetectorApp:
             combined = np.hstack(self.renderer.resize_to_match_height(placeholder, schematic))
             self.renderer.draw_drive_status(combined, drive_runtime)
             self.draw_ball_reconciliation_overlay(combined)
+            self.draw_step_pause_overlay(combined)
             waiting_text = (
                 "Waiting for manual top-down selection"
                 if self.homography_calibrator is not None
@@ -1141,6 +1213,7 @@ class TopdownDetectorApp:
         combined = np.hstack(self.renderer.resize_to_match_height(annotated, schematic))
         self.renderer.draw_drive_status(combined, drive_runtime)
         self.draw_ball_reconciliation_overlay(combined)
+        self.draw_step_pause_overlay(combined)
         if video_paused:
             self.renderer.draw_video_pause_overlay(combined)
         return combined, masks, schematic
@@ -1422,6 +1495,8 @@ class TopdownDetectorApp:
                 self.homography_calibrator.start_manual_calibration()
                 self.reset_detection_state()
         self.handle_robot_calibration_key(ascii_key)
+        if ascii_key == ord("n"):
+            self.release_step_drive_pause(drive_runtime)
         if ascii_key == ord("w"):
             self.save_heading_tuning_to_robot_calibration(float(self.read_params()["heading_tuning_rad"]))
         self.handle_manual_robot_key(key, drive_runtime)
@@ -1491,6 +1566,7 @@ class TopdownDetectorApp:
         mode_label: str,
         frame_delay_ms: int,
         drive_enabled: bool,
+        step_enabled: bool = False,
         resize_to_size: tuple[int, int] | None = None,
     ) -> int:
         if not self.config.paths.calibration_file.exists():
@@ -1507,11 +1583,15 @@ class TopdownDetectorApp:
             self.config.camera.topdown_warp_size,
         )
         drive_runtime, dispatcher = self._make_drive_runtime(drive_enabled)
+        self.runtime.step_mode_enabled = bool(drive_enabled and step_enabled)
+        self.runtime.step_drive_paused = self.runtime.step_mode_enabled
         if drive_enabled:
             print(
                 f"Integrated drive dispatch enabled: UDP "
                 f"{self.config.drive.robot_ip}:{self.config.drive.robot_udp_port}"
             )
+            if self.runtime.step_mode_enabled:
+                print("Step drive mode enabled: press 'n' to release each target run.")
         else:
             print("Integrated drive controller running with dispatch disabled; motors stay halted.")
         self.create_trackbars(self.config.camera.topdown_warp_size)
@@ -1599,6 +1679,8 @@ class TopdownDetectorApp:
                 if preprocessed.transform_matrix is None or preprocessed.normalized is None:
                     self.reset_detection_state()
                     result = self.build_missing_transform_result(raw_frame, preprocessed, params)
+                    if self.runtime.step_mode_enabled:
+                        self.runtime.step_drive_paused = True
                     drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for top-down calibration")
                     combined, masks, schematic = self.render(result, params, fps=0.0, drive_runtime=drive_runtime)
                     processing_ms = (time.perf_counter() - start) * 1000.0
@@ -1645,10 +1727,24 @@ class TopdownDetectorApp:
                     and not self.ball_count_initialized()
                 )
                 if drive_waiting_for_ball_count:
+                    if self.runtime.step_mode_enabled:
+                        self.runtime.step_drive_paused = True
                     self.drive_guard.wheel_controller.reset()
                     drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for stable ball count")
+                elif self.runtime.step_mode_enabled and self.runtime.step_drive_paused:
+                    self.drive_guard.wheel_controller.reset()
+                    drive_runtime.stop(DriveControlState.STOPPED, "step paused; press n")
                 else:
+                    pickup_state_before = self.runtime.pickup_state
                     pickup_owns_control = self.update_pickup_state(drive_runtime, now)
+                    pickup_completed = (
+                        self.runtime.step_mode_enabled
+                        and pickup_state_before == PickupExecutionState.REPLAN
+                        and self.runtime.pickup_state == PickupExecutionState.NAVIGATION
+                    )
+                    if pickup_completed:
+                        self.pause_step_drive_after_target(drive_runtime)
+                        pickup_owns_control = True
                     if not pickup_owns_control:
                         self.drive_guard.enforce_xte_guard_before_replan(
                             self.runtime.robot_pose,
@@ -1707,7 +1803,15 @@ class TopdownDetectorApp:
             self.async_route_planner.close()
         return 0
 
-    def run_live_mode(self, camera_index: int, balance: float, width: int, height: int, drive_enabled: bool) -> int:
+    def run_live_mode(
+        self,
+        camera_index: int,
+        balance: float,
+        width: int,
+        height: int,
+        drive_enabled: bool,
+        step_enabled: bool = False,
+    ) -> int:
         if not self.config.paths.calibration_file.exists():
             print(f"Calibration file not found: {self.config.paths.calibration_file}", file=sys.stderr)
             return 1
@@ -1723,11 +1827,18 @@ class TopdownDetectorApp:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width if width > 0 else calibration_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height if height > 0 else calibration_height)
         try:
-            return self.run_stream(cap, f"camera {camera_index}", balance, "Live", 1, drive_enabled)
+            return self.run_stream(cap, f"camera {camera_index}", balance, "Live", 1, drive_enabled, step_enabled)
         finally:
             cap.release()
 
-    def run_video_mode(self, video_path: Path, balance: float, resize_to_calibration: bool, drive_enabled: bool) -> int:
+    def run_video_mode(
+        self,
+        video_path: Path,
+        balance: float,
+        resize_to_calibration: bool,
+        drive_enabled: bool,
+        step_enabled: bool = False,
+    ) -> int:
         if not video_path.exists():
             print(f"Video file not found: {video_path}", file=sys.stderr)
             return 1
@@ -1747,7 +1858,16 @@ class TopdownDetectorApp:
 
             resize_to_size = UndistortionProvider.load_calibration_image_size(self.config.paths.calibration_file)
         try:
-            return self.run_stream(cap, str(video_path), balance, "Video", frame_delay_ms, drive_enabled, resize_to_size)
+            return self.run_stream(
+                cap,
+                str(video_path),
+                balance,
+                "Video",
+                frame_delay_ms,
+                drive_enabled,
+                step_enabled,
+                resize_to_size,
+            )
         finally:
             cap.release()
 
@@ -1756,9 +1876,22 @@ class TopdownDetectorApp:
         image_path = args.image or self.config.paths.default_image
         try:
             if args.live or self.config.camera.use_live_feed:
-                return self.run_live_mode(args.camera_index, args.balance, args.width, args.height, bool(args.drive))
+                return self.run_live_mode(
+                    args.camera_index,
+                    args.balance,
+                    args.width,
+                    args.height,
+                    bool(args.drive),
+                    bool(args.step),
+                )
             if args.video is not None:
-                return self.run_video_mode(args.video, args.balance, args.resize_video_to_calibration, bool(args.drive))
+                return self.run_video_mode(
+                    args.video,
+                    args.balance,
+                    args.resize_video_to_calibration,
+                    bool(args.drive),
+                    bool(args.step),
+                )
             return self.run_image_mode(image_path)
         finally:
             cv2.destroyAllWindows()

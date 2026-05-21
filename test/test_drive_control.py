@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
 from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
-from robot.models import DriveRuntime, RobotGeometry, RobotPose
+from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
 from tools.topdown_object_detector import PickupExecutionState, TopdownDetectorApp
 from vision.config import DriveConfig, FieldConfig
 from vision.debug import DebugRenderer
@@ -109,6 +109,57 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertEqual(app.runtime.stable_visible_balls, 3)
         self.assertEqual(app.runtime.balls_collected, 0)
+
+    def test_step_drive_release_key_unpauses_without_sending_motion(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.step_mode_enabled = True
+        app.runtime.step_drive_paused = True
+        app.runtime.initial_total_balls = 1
+        app.runtime.robot_pose = RobotPose(0.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+        )
+
+        should_quit = app.handle_key(ord("n"), drive_runtime)
+
+        self.assertFalse(should_quit)
+        self.assertFalse(app.runtime.step_drive_paused)
+        self.assertEqual(dispatcher.commands, [])
+        self.assertEqual(drive_runtime.last_message, "step released")
+
+    def test_step_drive_release_key_ignores_stale_press_before_route_ready(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.step_mode_enabled = True
+        app.runtime.step_drive_paused = True
+        app.runtime.initial_total_balls = 1
+        app.runtime.robot_pose = RobotPose(0.0, 0.0, 0.0, 0.0, 0.0)
+
+        should_quit = app.handle_key(ord("n"), drive_runtime)
+
+        self.assertFalse(should_quit)
+        self.assertTrue(app.runtime.step_drive_paused)
+        self.assertEqual(dispatcher.commands, [])
+        self.assertEqual(drive_runtime.last_message, "step waiting for route")
+
+    def test_step_drive_pause_after_target_sends_zero_speed(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.step_mode_enabled = True
+        app.runtime.step_drive_paused = False
+
+        app.pause_step_drive_after_target(drive_runtime)
+
+        self.assertTrue(app.runtime.step_drive_paused)
+        self.assertEqual(drive_runtime.state, DriveControlState.STOPPED)
+        self.assertEqual(drive_runtime.last_message, "step target complete; press n")
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
 
     def test_near_zone_handoff_stops_udp_then_turns_and_runs_tcp_move(self) -> None:
         app = TopdownDetectorApp()

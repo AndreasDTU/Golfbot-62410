@@ -2,6 +2,20 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-05-21
+
+### Added
+
+- Added step-by-step drive mode to `tools/topdown_object_detector.py`.
+  - New `--step` flag works with `--drive` and starts robot motion in a paused operator-waiting state.
+  - Pressing `n` releases one autonomous target run while vision, smoothing, occupancy-grid updates, and async route planning continue every frame.
+  - The drive loop automatically pauses again after the existing pickup completion/replan transition.
+  - Main debug output now shows a high-visibility paused prompt during step-mode waits.
+
+### Verified
+
+- Added focused tests for step-mode CLI parsing and pause/release behavior.
+
 ## 2026-05-20
 
 ### Added

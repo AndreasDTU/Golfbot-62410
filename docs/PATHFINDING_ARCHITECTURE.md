@@ -84,11 +84,19 @@ These defaults are configured in `vision.config.PlannerConfig` and copied into
 - `non_target_ball_extra_clearance_cm`
 - `allow_last_resort_orange_contact`
 
-This is a conservative hard-obstacle layer, not a cost-only hint. If a white
-ball lies directly between the robot and the selected target, Hybrid A* should
-route around the inflated ball region whenever the field layout allows it.
+This is a conservative first-pass hard-obstacle layer, not a cost-only hint. If
+a white ball lies directly between the robot and the selected target, Hybrid A*
+should route around the inflated ball region whenever the field layout allows
+it. If every candidate target is blocked by that temporary ball-obstacle layer,
+the planner retries those same targets against the real red-zone/wall grid only.
+That last-resort mode may contact non-target balls, but it still requires a
+valid robot-body trajectory and never ignores red zones or field boundaries.
+When balls are crowded tightly enough that another ball's inflated obstacle
+covers the selected target itself, the planner skips the expensive hard-avoidance
+search for that target and defers it directly to the contact-allowed fallback.
 When debugging detection or route geometry, ball avoidance can be disabled
-through configuration, but the default behavior is to avoid non-target balls.
+through configuration, but the default behavior is to avoid non-target balls
+before allowing contact.
 
 ## Pickup Offset
 
@@ -230,5 +238,8 @@ orange or white target that the route actually connects.
 5. After an orange ball is reached, the same nearest-reachable logic continues
    from the final `HybridPose`.
 
-The fallback never fabricates a route. Unreachable targets are skipped, and the
-route contains only validated Hybrid A* segments.
+For normal white-target routing, each candidate is first tried with non-target
+balls inserted as inflated hard obstacles. If no candidate can be reached that
+way, the same candidates are retried with non-target ball contact allowed. The
+fallback never fabricates a route: unreachable targets are skipped, and the
+route contains only validated Hybrid A* segments against walls and red zones.

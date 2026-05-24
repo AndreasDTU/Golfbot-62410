@@ -2,6 +2,32 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-05-24
+
+### Changed
+
+- Updated ball-aware route planning so non-target balls are avoided first but no
+  longer make white-target routing fail outright.
+  - `pathfinding/planner.py` now tries all candidate targets with inflated
+    non-target ball obstacles before retrying those same candidates with
+    non-target ball contact allowed.
+  - Orange priority still remains absolute, but orange targets now also try all
+    avoidable orange routes before using the explicit last-resort contact mode.
+  - Crowded targets whose ball position is already covered by another ball's
+    inflated obstacle now skip the impossible hard-avoidance search and go
+    straight to the contact-allowed fallback pass.
+  - Last-resort contact routes still validate robot-body motion against walls
+    and red zones.
+  - `docs/PATHFINDING_ARCHITECTURE.md` documents the avoid-first/contact-fallback
+    behavior.
+
+### Verified
+
+- Added a focused regression test for white-target contact fallback when ball
+  avoidance blocks every route.
+- Added a focused regression test for crowded targets skipping the impossible
+  hard-avoidance search.
+
 ## 2026-05-21
 
 ### Added

@@ -142,6 +142,47 @@ class BallAwareRoutePlanningTests(unittest.TestCase):
 
         self.assertEqual(route_planner.ball_obstacle_radius_cm(config, geometry), 12.5)
 
+    def test_crowded_target_skips_impossible_hard_avoidance_search(self) -> None:
+        field = FieldConfig(width_cm=120.0, height_cm=80.0)
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        config = HybridPlannerConfig(ball_radius_cm=2.0, non_target_ball_extra_clearance_cm=0.0)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+
+        class CrowdedTargetPlanner(GreedyRoutePlanner):
+            def plan_target_segment(
+                self,
+                grid: np.ndarray,
+                current_pose: HybridPose,
+                target: PlannedBallTarget,
+                geometry: RobotGeometry,
+                config: HybridPlannerConfig,
+            ) -> list[HybridPose]:
+                raise AssertionError("crowded hard-avoidance search should be skipped")
+
+        route_planner = CrowdedTargetPlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        target = PlannedBallTarget(1, "white", 60.0, 40.0, (60, 40))
+        crowded_neighbor = PlannedBallTarget(2, "white", 66.0, 40.0, (66, 40))
+
+        segment, obstacles, mode = route_planner.plan_target_segment_with_ball_avoidance(
+            grid,
+            [target, crowded_neighbor],
+            HybridPose(30.0, 40.0, 0.0),
+            target,
+            geometry,
+            config,
+        )
+
+        self.assertEqual(segment, [])
+        self.assertEqual([obstacle.track_id for obstacle in obstacles], [crowded_neighbor.track_id])
+        self.assertEqual(mode, "crowded")
+
     def test_route_to_orange_avoids_white_ball_when_route_around_exists(self) -> None:
         field = FieldConfig()
         grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
@@ -268,6 +309,68 @@ class BallAwareRoutePlanningTests(unittest.TestCase):
             min(math.hypot(pose.x_cm - obstacle_white.x_cm, pose.y_cm - obstacle_white.y_cm) for pose in segment),
             route_planner.ball_obstacle_radius_cm(config, geometry),
         )
+
+    def test_white_target_falls_back_to_contact_when_ball_avoidance_blocks_all_routes(self) -> None:
+        field = FieldConfig(width_cm=120.0, height_cm=80.0)
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=10.0,
+            front_cm=5.0,
+            rear_cm=5.0,
+            tube_forward_cm=10.0,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        config = HybridPlannerConfig(
+            max_expansions=25000,
+            goal_tolerance_cm=4.0,
+            ball_radius_cm=2.0,
+            non_target_ball_extra_clearance_cm=8.0,
+        )
+
+        class ContactFallbackPlanner(GreedyRoutePlanner):
+            def plan_target_segment_with_ball_avoidance(
+                self,
+                grid: np.ndarray,
+                all_targets: list[PlannedBallTarget],
+                current_pose: HybridPose,
+                target: PlannedBallTarget,
+                geometry: RobotGeometry,
+                config: HybridPlannerConfig,
+            ) -> tuple[list[HybridPose], list[PlannedBallTarget], str]:
+                return [], [candidate for candidate in all_targets if candidate.track_id != target.track_id], "hard"
+
+            def plan_target_segment(
+                self,
+                grid: np.ndarray,
+                current_pose: HybridPose,
+                target: PlannedBallTarget,
+                geometry: RobotGeometry,
+                config: HybridPlannerConfig,
+            ) -> list[HybridPose]:
+                return [current_pose, HybridPose(target.x_cm, target.y_cm, 0.0)]
+
+            def plan_unload_segment(
+                self,
+                grid: np.ndarray,
+                current_pose: HybridPose,
+                geometry: RobotGeometry,
+                config: HybridPlannerConfig,
+            ):
+                return [], None, None
+
+        route_planner = ContactFallbackPlanner(HybridAStarPlanner(field_config=field, config=config), config)
+        target_white = PlannedBallTarget(1, "white", 95.0, 40.0, (95, 40))
+        blocking_white = PlannedBallTarget(2, "white", 60.0, 40.0, (60, 40))
+
+        route = route_planner.plan(grid, [target_white, blocking_white], HybridPose(30.0, 40.0, 0.0), geometry, config)
+
+        self.assertIsNotNone(route.active_target)
+        assert route.active_target is not None
+        self.assertEqual(route.active_target.track_id, blocking_white.track_id)
+        self.assertEqual(route.ball_avoidance_mode, "ball contact fallback")
+        self.assertEqual([target.track_id for target in route.ball_obstacles or []], [target_white.track_id])
+        self.assertTrue(route.points)
 
     def test_ball_avoidance_can_be_disabled_for_debugging(self) -> None:
         field = FieldConfig(width_cm=120.0, height_cm=80.0)

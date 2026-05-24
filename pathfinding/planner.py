@@ -1262,6 +1262,23 @@ class GreedyRoutePlanner:
             cv2.circle(inflated, center, radius_cm, 1, -1, cv2.LINE_AA)
         return (inflated > 0).astype(np.uint8), obstacle_targets
 
+    def target_is_inside_ball_obstacle(
+        self,
+        selected_target: PlannedBallTarget,
+        obstacle_targets: list[PlannedBallTarget],
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig,
+    ) -> bool:
+        """Return true when hard ball avoidance blocks the selected ball itself."""
+        if not obstacle_targets:
+            return False
+        radius_cm = self.ball_obstacle_radius_cm(config, geometry)
+        for obstacle in obstacle_targets:
+            distance_cm = math.hypot(selected_target.x_cm - obstacle.x_cm, selected_target.y_cm - obstacle.y_cm)
+            if distance_cm <= radius_cm + config.goal_tolerance_cm:
+                return True
+        return False
+
     def plan_unload_segment(
         self,
         grid: np.ndarray,
@@ -1341,6 +1358,12 @@ class GreedyRoutePlanner:
         """Plan to ``target`` with all other balls inserted as inflated hard obstacles."""
         obstacle_grid, obstacle_targets = self.grid_with_ball_obstacles(grid, all_targets, target, geometry, config)
         mode = "hard" if obstacle_targets else ("disabled" if not config.avoid_non_target_balls_enabled else "hard")
+        if self.target_is_inside_ball_obstacle(target, obstacle_targets, geometry, config):
+            print(
+                f"Hybrid A* target {target.track_id} ({target.label}) is inside the inflated "
+                "non-target ball obstacle layer; deferring to contact-allowed fallback."
+            )
+            return [], obstacle_targets, "crowded"
         segment = self.plan_target_segment(obstacle_grid, current_pose, target, geometry, config)
         return segment, obstacle_targets, mode
 
@@ -1369,6 +1392,7 @@ class GreedyRoutePlanner:
             [target for target in unvisited if target.label == "orange"],
             key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
         )
+        blocked_orange_targets: list[tuple[PlannedBallTarget, list[PlannedBallTarget]]] = []
         for orange_target in orange_targets:
             orange_segment, orange_obstacles, _orange_mode = self.plan_target_segment_with_ball_avoidance(
                 grid,
@@ -1381,19 +1405,9 @@ class GreedyRoutePlanner:
             if not orange_segment:
                 print(
                     f"Hybrid A* could not route to orange target {orange_target.track_id}; "
-                    "keeping orange first and trying last-resort direct orange route."
+                    "keeping orange first and trying next orange target."
                 )
-                if cfg.allow_last_resort_orange_contact:
-                    orange_segment = self.plan_target_segment(grid, current_pose, orange_target, geometry, cfg)
-                    if orange_segment:
-                        active_target = orange_target
-                        active_ball_obstacles = orange_obstacles
-                        ball_avoidance_mode = "orange forced first"
-                        route.extend(orange_segment[1:])
-                        current_pose = orange_segment[-1]
-                        pickup_poses.append(current_pose)
-                        break
-                print(f"Hybrid A* could not route to orange target {orange_target.track_id} even as last resort.")
+                blocked_orange_targets.append((orange_target, orange_obstacles))
                 continue
             active_target = orange_target
             active_ball_obstacles = orange_obstacles
@@ -1401,6 +1415,23 @@ class GreedyRoutePlanner:
             current_pose = orange_segment[-1]
             pickup_poses.append(current_pose)
             break
+
+        if orange_targets and active_target is None and cfg.allow_last_resort_orange_contact:
+            for orange_target, orange_obstacles in blocked_orange_targets:
+                orange_segment = self.plan_target_segment(grid, current_pose, orange_target, geometry, cfg)
+                if orange_segment:
+                    active_target = orange_target
+                    active_ball_obstacles = orange_obstacles
+                    ball_avoidance_mode = "orange forced first"
+                    route.extend(orange_segment[1:])
+                    current_pose = orange_segment[-1]
+                    pickup_poses.append(current_pose)
+                    print(
+                        f"Hybrid A* routed to orange target {orange_target.track_id} "
+                        "with non-target ball contact allowed."
+                    )
+                    break
+                print(f"Hybrid A* could not route to orange target {orange_target.track_id} even as last resort.")
 
         if orange_targets and active_target is None:
             return RoutePlan(points=[], active_target=None, pickup_poses=[])
@@ -1418,6 +1449,7 @@ class GreedyRoutePlanner:
             chosen_target: PlannedBallTarget | None = None
             chosen_segment: list[HybridPose] = []
             chosen_obstacles: list[PlannedBallTarget] = []
+            blocked_candidates: list[tuple[PlannedBallTarget, list[PlannedBallTarget]]] = []
 
             for candidate in nearest_candidates:
                 segment, obstacle_targets, _mode = self.plan_target_segment_with_ball_avoidance(
@@ -1433,10 +1465,30 @@ class GreedyRoutePlanner:
                     chosen_segment = segment
                     chosen_obstacles = obstacle_targets
                     break
+                blocked_candidates.append((candidate, obstacle_targets))
                 print(
                     f"Hybrid A* could not route to target {candidate.track_id} "
                     f"({candidate.label}); trying next target."
                 )
+
+            if chosen_target is None and cfg.avoid_non_target_balls_enabled:
+                for candidate, obstacle_targets in blocked_candidates:
+                    segment = self.plan_target_segment(grid, current_pose, candidate, geometry, cfg)
+                    if segment:
+                        chosen_target = candidate
+                        chosen_segment = segment
+                        chosen_obstacles = obstacle_targets
+                        if ball_avoidance_mode != "orange forced first":
+                            ball_avoidance_mode = "ball contact fallback"
+                        print(
+                            f"Hybrid A* routed to target {candidate.track_id} ({candidate.label}) "
+                            "with non-target ball contact allowed."
+                        )
+                        break
+                    print(
+                        f"Hybrid A* could not route to target {candidate.track_id} "
+                        f"({candidate.label}) even with non-target ball contact allowed."
+                    )
 
             if chosen_target is None:
                 break

@@ -60,6 +60,18 @@ class PickupExecutionState(Enum):
     REPLAN = "REPLAN"
 
 
+class UnloadExecutionState(Enum):
+    """Minimal terminal unload states for the live drive loop."""
+
+    IDLE = "IDLE"
+    READY = "UNLOAD_READY"
+    UNLOADING_FIRST = "UNLOADING_FIRST"
+    PIPE_SHAKE = "PIPE_SHAKE"
+    UNLOADING_SECOND = "UNLOADING_SECOND"
+    COMPLETE = "UNLOAD_COMPLETE"
+    FAILED = "UNLOAD_FAILED"
+
+
 class CollectorPositionState(Enum):
     """Best-known collector height state for autonomous drive gating."""
 
@@ -95,6 +107,9 @@ class RuntimeState:
     pickup_state_started_s: float = 0.0
     pickup_command_fired: bool = False
     near_zone_move_fired: bool = False
+    unload_state: UnloadExecutionState = UnloadExecutionState.IDLE
+    unload_command_fired: bool = False
+    unload_started_s: float = 0.0
     collector_state: CollectorPositionState = CollectorPositionState.UNKNOWN
     initial_total_balls: int | None = None
     balls_collected: int = 0
@@ -291,6 +306,8 @@ class TopdownDetectorApp:
         self.latest_params: dict[str, object] | None = None
         self.pickup_thread: threading.Thread | None = None
         self.pickup_last_error: str = ""
+        self.unload_thread: threading.Thread | None = None
+        self.unload_last_error: str = ""
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
@@ -601,6 +618,13 @@ class TopdownDetectorApp:
             self.runtime.balls_collected + 1,
         )
 
+    def optimistic_collection_complete(self) -> bool:
+        """Return true when the optimistic pickup count says unloading can begin."""
+        return (
+            self.runtime.initial_total_balls is not None
+            and self.runtime.balls_collected >= self.runtime.initial_total_balls
+        )
+
     def draw_ball_reconciliation_overlay(self, frame: np.ndarray) -> None:
         """Draw global pickup reconciliation counters on the debug frame."""
         initial = "?" if self.runtime.initial_total_balls is None else str(self.runtime.initial_total_balls)
@@ -683,6 +707,8 @@ class TopdownDetectorApp:
 
     def ensure_collector_travel_position(self, drive_runtime: DriveRuntime) -> bool:
         """Ensure the collector is in the raised travel position before wheel motion."""
+        if self.runtime.unload_state != UnloadExecutionState.IDLE:
+            return False
         if drive_runtime.dispatcher is None or self.runtime.collector_state == CollectorPositionState.TRAVEL:
             return False
         self.drive_guard.wheel_controller.reset()
@@ -790,13 +816,119 @@ class TopdownDetectorApp:
             return True
 
         if state == PickupExecutionState.REPLAN:
-            self.runtime.clear_route()
             self.drive_guard.wheel_controller.reset()
+            if self.optimistic_collection_complete() and self.runtime.route_plan.unload_pose is not None:
+                drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; routing to unload")
+                self.runtime.reset_pickup_state()
+                return True
+            self.runtime.clear_route()
             drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; requesting new route")
             self.runtime.reset_pickup_state()
             return True
 
         return False
+
+    def _unload_endpoint_reached(self) -> bool:
+        if (
+            self.runtime.robot_pose is None
+            or self.runtime.route_plan.unload_pose is None
+            or len(self.runtime.route_plan.points) < 2
+            or self.runtime.pickup_state != PickupExecutionState.NAVIGATION
+        ):
+            return False
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+        )
+        if tracking_error is None:
+            return False
+        next_goal = route_goal_pose(
+            self.runtime.route_plan.points,
+            tracking_error,
+            self.runtime.route_plan.pickup_poses,
+            include_final=True,
+        )
+        if next_goal is None:
+            return False
+        unload_pose = self.runtime.route_plan.unload_pose
+        if math.hypot(next_goal.x_cm - unload_pose.x_cm, next_goal.y_cm - unload_pose.y_cm) > self.config.planner.goal_tolerance_cm:
+            return False
+        distance_cm = math.hypot(
+            self.runtime.robot_pose.x_cm - unload_pose.x_cm,
+            self.runtime.robot_pose.y_cm - unload_pose.y_cm,
+        )
+        return distance_cm <= self.config.drive.unload_trigger_distance_cm
+
+    def _start_unload_sequence_thread(self) -> None:
+        if self.unload_thread is not None and self.unload_thread.is_alive():
+            return
+
+        def run_unload_sequence() -> None:
+            controller: RobotController | None = None
+            try:
+                controller = RobotController(self.config.drive.robot_ip)
+                self.runtime.collector_state = CollectorPositionState.UNLOADING
+                self.runtime.unload_state = UnloadExecutionState.UNLOADING_FIRST
+                print("Unload: first unload_full_cycle")
+                controller.unload_full_cycle()
+
+                self.runtime.unload_state = UnloadExecutionState.PIPE_SHAKE
+                shake_cycles = max(0, int(self.config.drive.unload_pipe_shake_cycles))
+                shake_units = float(self.config.drive.unload_pipe_shake_units)
+                shake_speed = int(round(self.config.drive.unload_pipe_shake_speed))
+                for cycle in range(shake_cycles):
+                    print(f"Unload: pipe shake cycle {cycle + 1}/{shake_cycles}")
+                    controller.pipe_down(shake_units, shake_speed)
+                    controller.pipe_up(shake_units, shake_speed)
+
+                self.runtime.unload_state = UnloadExecutionState.UNLOADING_SECOND
+                print("Unload: second unload_full_cycle")
+                controller.unload_full_cycle()
+                controller.pipe_stop()
+                self.runtime.collector_state = CollectorPositionState.UNKNOWN
+                self.runtime.unload_state = UnloadExecutionState.COMPLETE
+                self.unload_last_error = ""
+                print("Unload: complete")
+            except Exception as exc:
+                self.unload_last_error = str(exc)
+                self.runtime.unload_state = UnloadExecutionState.FAILED
+                print(f"Unload: failed: {exc}")
+                if controller is not None:
+                    try:
+                        controller.pipe_stop()
+                    except Exception as stop_exc:
+                        print(f"Unload: pipe_stop after failure also failed: {stop_exc}")
+                self.runtime.collector_state = CollectorPositionState.UNKNOWN
+
+        self.unload_thread = threading.Thread(target=run_unload_sequence, name="ev3-unload-sequence", daemon=True)
+        self.unload_thread.start()
+
+    def update_unload_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
+        """Run the terminal pipe-only unload sequence once the unload endpoint is reached."""
+        if drive_runtime.dispatcher is None:
+            return False
+        state = self.runtime.unload_state
+        if state in (UnloadExecutionState.COMPLETE, UnloadExecutionState.FAILED):
+            self.drive_guard.wheel_controller.reset()
+            message = state.value if state == UnloadExecutionState.COMPLETE else f"{state.value}: {self.unload_last_error}"
+            drive_runtime.stop(DriveControlState.STOPPED, message)
+            return True
+        if self.unload_thread is not None and self.unload_thread.is_alive():
+            drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
+            return True
+        if self.runtime.unload_command_fired:
+            return False
+        if not self._unload_endpoint_reached():
+            return False
+
+        self.runtime.unload_command_fired = True
+        self.runtime.unload_started_s = now_s
+        self.runtime.unload_state = UnloadExecutionState.READY
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
+        print("Unload: endpoint reached; wheels stopped; starting pipe-only unload sequence")
+        self._start_unload_sequence_thread()
+        return True
 
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         return [
@@ -1765,6 +1897,11 @@ class TopdownDetectorApp:
                     collector_owns_control = self.ensure_collector_travel_position(drive_runtime)
                     pickup_state_before = self.runtime.pickup_state
                     pickup_owns_control = False if collector_owns_control else self.update_pickup_state(drive_runtime, now)
+                    unload_owns_control = (
+                        False
+                        if collector_owns_control or pickup_owns_control
+                        else self.update_unload_state(drive_runtime, now)
+                    )
                     pickup_completed = (
                         self.runtime.step_mode_enabled
                         and pickup_state_before == PickupExecutionState.REPLAN
@@ -1773,7 +1910,7 @@ class TopdownDetectorApp:
                     if pickup_completed:
                         self.pause_step_drive_after_target(drive_runtime)
                         pickup_owns_control = True
-                    if not collector_owns_control and not pickup_owns_control:
+                    if not collector_owns_control and not pickup_owns_control and not unload_owns_control:
                         self.drive_guard.enforce_xte_guard_before_replan(
                             self.runtime.robot_pose,
                             self.runtime.route_plan.points,

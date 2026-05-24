@@ -6,7 +6,7 @@ from unittest.mock import patch
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
 from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
-from tools.topdown_object_detector import CollectorPositionState, PickupExecutionState, TopdownDetectorApp
+from tools.topdown_object_detector import CollectorPositionState, PickupExecutionState, TopdownDetectorApp, UnloadExecutionState
 from vision.config import DriveConfig, FieldConfig
 from vision.debug import DebugRenderer
 
@@ -308,6 +308,98 @@ class DriveControlTests(unittest.TestCase):
         owns_control = app.ensure_collector_travel_position(drive_runtime)
 
         self.assertFalse(owns_control)
+
+    def test_unload_endpoint_runs_pipe_only_double_unload_once(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.collector_state = CollectorPositionState.TRAVEL
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        app.runtime.robot_pose = RobotPose(25.0, 60.0, 0.0, 42.1, 60.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(40.0, 60.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+            unload_pose=HybridPose(25.0, 60.0, 0.0),
+            unload_goal_cm=(0.0, 60.0),
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str) -> None:
+                self.robot_ip = robot_ip
+
+            def unload_full_cycle(self) -> str:
+                events.append("unload_full_cycle")
+                return "OK"
+
+            def pipe_down(self, units: float, speed: int) -> str:
+                events.append(f"pipe_down {units} {speed}")
+                return "OK"
+
+            def pipe_up(self, units: float, speed: int) -> str:
+                events.append(f"pipe_up {units} {speed}")
+                return "OK"
+
+            def pipe_stop(self) -> str:
+                events.append("pipe_stop")
+                return "OK"
+
+            def move(self, _distance: float, _speed: int) -> str:
+                events.append("move")
+                return "unexpected"
+
+            def back(self, _distance: float, _speed: int) -> str:
+                events.append("back")
+                return "unexpected"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            owns_control = app.update_unload_state(drive_runtime, now_s=1.0)
+            assert app.unload_thread is not None
+            app.unload_thread.join(timeout=1.0)
+            owns_after_complete = app.update_unload_state(drive_runtime, now_s=1.1)
+
+        self.assertTrue(owns_control)
+        self.assertTrue(owns_after_complete)
+        self.assertEqual(
+            events,
+            ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
+        )
+        self.assertNotIn("move", events)
+        self.assertNotIn("back", events)
+        self.assertEqual(app.runtime.unload_state, UnloadExecutionState.COMPLETE)
+        self.assertEqual(dispatcher.commands[0][:2], (0.0, 0.0))
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            app.update_unload_state(drive_runtime, now_s=2.0)
+
+        self.assertEqual(
+            events,
+            ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
+        )
+
+    def test_final_pickup_preserves_existing_unload_route_when_collection_complete(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(10.0, 0.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
+            active_target=None,
+            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
+            unload_pose=HybridPose(25.0, 60.0, 0.0),
+            unload_goal_cm=(0.0, 60.0),
+        )
+
+        owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
+
+        self.assertTrue(owns_control)
+        self.assertTrue(app.runtime.route_plan.points)
+        self.assertIsNotNone(app.runtime.route_plan.unload_pose)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertEqual(drive_runtime.last_message, "pickup complete; routing to unload")
 
 
 if __name__ == "__main__":

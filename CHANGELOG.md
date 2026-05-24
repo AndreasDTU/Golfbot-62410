@@ -4,6 +4,19 @@ All notable larger additions and behavioral changes to this repository should be
 
 ## 2026-05-24
 
+### Added
+
+- Added a minimal autonomous terminal unload sequence after the robot reaches
+  the planned unload endpoint.
+  - The drive loop stops UDP wheel output, preserves the final unload route
+    after the last optimistic pickup, and runs a pipe-only double unload:
+    `unload_full_cycle`, configurable `pipe_down`/`pipe_up` shake cycles,
+    second `unload_full_cycle`, then `pipe_stop`.
+  - The shake uses only existing pipe motor commands; no wheel `move`/`back`
+    commands are used for shaking.
+  - Added configurable pipe-shake units, speed, cycle count, and unload trigger
+    distance in `DriveConfig`.
+
 ### Changed
 
 - Updated ball-aware route planning so non-target balls are avoided first but no
@@ -23,6 +36,14 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Verified
 
+- Ran:
+
+```text
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_control
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_topdown_detector_app_shell
+```
+
+- Result: both test suites passed.
 - Added a focused regression test for white-target contact fallback when ball
   avoidance blocks every route.
 - Added a focused regression test for crowded targets skipping the impossible

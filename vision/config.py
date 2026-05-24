@@ -333,6 +333,10 @@ class DriveConfig:
     manual_move_speed: int = 40
     manual_turn_degrees: int = 15
     manual_turn_speed: int = 30
+    unload_trigger_distance_cm: float = 8.0
+    unload_pipe_shake_units: float = 2.0
+    unload_pipe_shake_speed: int = 35
+    unload_pipe_shake_cycles: int = 1
     key_left_arrow: set[int] = dataclass_field(default_factory=lambda: {2424832, 65361, 63234, 81})
     key_up_arrow: set[int] = dataclass_field(default_factory=lambda: {2490368, 65362, 63232, 82})
     key_right_arrow: set[int] = dataclass_field(default_factory=lambda: {2555904, 65363, 63235, 83})

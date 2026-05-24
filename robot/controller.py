@@ -1,28 +1,35 @@
 import socket
-import time
 
 class RobotController:
 
-    def __init__(self, robot_ip = "ev3dev", port=5555, timeout=15.0):
+    def __init__(self, robot_ip = "ev3dev", port=5555, timeout=15.0, connect_retries=1):
         self.host = robot_ip
         self.port = port
         self.timeout = timeout
+        self.connect_retries = max(0, int(connect_retries))
         self.sock = self._connect()
 
     def _connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect((self.host, self.port))
-        return self.sock
+        last_error = None
+        for _attempt in range(self.connect_retries + 1):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            try:
+                sock.connect((self.host, self.port))
+                self.sock = sock
+                return sock
+            except OSError as exc:
+                last_error = exc
+                sock.close()
+        raise RuntimeError(f"Could not connect to EV3 controller at {self.host}:{self.port}: {last_error}") from last_error
 
     def _send(self, cmd):
+        payload = (cmd + '\n').encode('utf-8')
         try:
-            self.sock.sendall((cmd + '\n').encode('utf-8'))
+            self.sock.sendall(payload)
             return self.sock.recv(1024).decode('utf-8').strip()
-        except OSError:
-            self._connect()
-            time.sleep(0.5)
-            return self._send(cmd)
+        except OSError as exc:
+            raise RuntimeError(f"EV3 command failed after send attempt ({cmd!r}): {exc}") from exc
     
     def move(self, distance, speedPercent = 100):
         return self._send(f"move {distance} {speedPercent}")

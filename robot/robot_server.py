@@ -89,7 +89,7 @@ def cmd_move(parts, forward=True):
     motor_deg = units_to_degrees(units)
     spd = speed if forward else -speed
     tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(-spd),
-                        degrees=motor_deg, brake=True, block=False)
+                        degrees=motor_deg, brake=True, block=True)
     direction = "forward" if forward else "backward"
     return "ok: moved {} {} units".format(direction, units)
 
@@ -104,11 +104,11 @@ def cmd_turn(parts):
     if angle >= 0:
         # Turn right: left motor forward, right motor backward
         tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(spd),
-                            degrees=motor_deg, brake=True, block=False)
+                            degrees=motor_deg, brake=True, block=True)
     else:
         # Turn left: right motor forward, left motor backward
         tank.on_for_degrees(left_speed=SpeedPercent(spd), right_speed=SpeedPercent(-spd),
-                            degrees=motor_deg, brake=True, block=False)
+                            degrees=motor_deg, brake=True, block=True)
     return "ok: turned {} degrees".format(angle)
 
 

@@ -6,7 +6,14 @@ from unittest.mock import patch
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
 from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
-from tools.topdown_object_detector import CollectorPositionState, PickupExecutionState, TopdownDetectorApp, UnloadExecutionState
+from tools.topdown_object_detector import (
+    CollectorPositionState,
+    PickupExecutionState,
+    RoutePlanningRequest,
+    RoutePlanningResult,
+    TopdownDetectorApp,
+    UnloadExecutionState,
+)
 from vision.config import DriveConfig, FieldConfig
 from vision.debug import DebugRenderer
 
@@ -378,6 +385,72 @@ class DriveControlTests(unittest.TestCase):
             events,
             ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
         )
+
+    def test_unload_endpoint_waits_for_optimistic_collection_complete(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 2
+        app.runtime.balls_collected = 1
+        app.runtime.robot_pose = RobotPose(25.0, 60.0, 0.0, 42.1, 60.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(40.0, 60.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+            unload_pose=HybridPose(25.0, 60.0, 0.0),
+            unload_goal_cm=(0.0, 60.0),
+        )
+
+        owns_control = app.update_unload_state(drive_runtime, now_s=1.0)
+
+        self.assertFalse(owns_control)
+        self.assertFalse(app.runtime.unload_command_fired)
+        self.assertIsNone(app.unload_thread)
+        self.assertEqual(dispatcher.commands, [])
+
+    def test_manual_wheel_keys_are_blocked_during_unload_but_stop_still_works(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.unload_state = UnloadExecutionState.PIPE_SHAKE
+
+        app.handle_manual_robot_key(next(iter(app.config.drive.key_up_arrow)), drive_runtime)
+        app.handle_manual_robot_key(ord(" "), drive_runtime)
+
+        self.assertEqual(len(dispatcher.commands), 1)
+        self.assertEqual(dispatcher.commands[0][:2], (0.0, 0.0))
+        self.assertEqual(drive_runtime.last_message, "manual stop")
+
+    def test_stale_async_route_result_is_rejected_when_start_pose_moves(self) -> None:
+        app = TopdownDetectorApp()
+        ball_signature = ((1, "white", 100, 200),)
+        old_start = HybridPose(10.0, 10.0, 0.0)
+        new_start = HybridPose(40.0, 10.0, 0.0)
+        route_plan = RoutePlan(
+            points=[old_start, HybridPose(20.0, 10.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+        )
+        request = RoutePlanningRequest(
+            request_id=1,
+            grid=SimpleNamespace(copy=lambda: None),
+            ball_targets=[],
+            start_pose=old_start,
+            geometry=RobotGeometry(20.0, 8.0, 10.0, 17.0, 0.0),
+            ball_signature=ball_signature,
+            start_signature=app.route_start_signature(old_start),
+            unload_extension_cm=15.0,
+        )
+        completed = RoutePlanningResult(request=request, route_plan=route_plan, duration_ms=1.0)
+        app.async_route_planner = SimpleNamespace(poll_completed=lambda: completed)
+
+        app.accept_completed_route_if_current(
+            ball_signature,
+            15.0,
+            app.route_start_signature(new_start),
+        )
+
+        self.assertEqual(app.runtime.route_plan.points, [])
 
     def test_final_pickup_preserves_existing_unload_route_when_collection_complete(self) -> None:
         app = TopdownDetectorApp()

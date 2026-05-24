@@ -834,6 +834,7 @@ class TopdownDetectorApp:
             or self.runtime.route_plan.unload_pose is None
             or len(self.runtime.route_plan.points) < 2
             or self.runtime.pickup_state != PickupExecutionState.NAVIGATION
+            or not self.optimistic_collection_complete()
         ):
             return False
         tracking_error = self.route_facade.compute_route_tracking_error(
@@ -1019,6 +1020,7 @@ class TopdownDetectorApp:
         self,
         ball_signature: tuple[tuple[int, str, int, int], ...],
         unload_extension_cm: float,
+        current_start_signature: tuple[int, int, int],
     ) -> None:
         """Install a finished worker route only when it still matches the current scene."""
         completed = self.async_route_planner.poll_completed()
@@ -1026,6 +1028,8 @@ class TopdownDetectorApp:
             return
         request = completed.request
         if request.ball_signature != ball_signature or abs(request.unload_extension_cm - unload_extension_cm) > 1e-6:
+            return
+        if request.start_signature != current_start_signature:
             return
         if completed.error is not None:
             self.robot_runtime.warning = f"Route worker failed: {completed.error}"
@@ -1147,7 +1151,11 @@ class TopdownDetectorApp:
             return
 
         ball_signature = self.ball_cache_signature(result.smoothed_ball_coordinates)
-        self.accept_completed_route_if_current(ball_signature, geometry.unload_extension_cm)
+        self.accept_completed_route_if_current(
+            ball_signature,
+            geometry.unload_extension_cm,
+            self.route_start_signature(start_pose),
+        )
 
         if self.cached_route_is_valid(start_pose, result.smoothed_ball_coordinates, params):
             return
@@ -1610,6 +1618,18 @@ class TopdownDetectorApp:
         """Map arrow/space keys to the legacy direct non-blocking wheel commands."""
         if drive_runtime is None or drive_runtime.dispatcher is None:
             return
+        if (key & 0xFF) == ord(" "):
+            drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
+            return
+        if (
+            self.runtime.pickup_state != PickupExecutionState.NAVIGATION
+            or self.runtime.unload_state != UnloadExecutionState.IDLE
+            or self.runtime.collector_state in (
+                CollectorPositionState.PICKUP_ASSIST,
+                CollectorPositionState.UNLOADING,
+            )
+        ):
+            return
         if key in self.config.drive.key_up_arrow:
             drive_runtime.dispatcher.send_wheel_speeds(
                 self.config.drive.manual_move_speed,
@@ -1634,8 +1654,6 @@ class TopdownDetectorApp:
                 -self.config.drive.manual_turn_speed,
                 force=True,
             )
-        elif (key & 0xFF) == ord(" "):
-            drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
 
     def handle_key(self, key: int, drive_runtime: DriveRuntime | None = None) -> bool:
         if key in (255, -1):

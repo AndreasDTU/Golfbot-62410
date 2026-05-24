@@ -19,6 +19,16 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Changed
 
+- Tightened autonomous drive and unload safety gates before live contest runs.
+  - EV3 TCP `move`/`turn` commands now acknowledge only after motor completion
+    instead of allowing the subsequent TCP command to overlap.
+  - `RobotController` no longer recursively replays actuator commands after a
+    possible send; TCP command failures now surface as bounded `RuntimeError`s.
+  - Manual wheel movement keys are ignored while pickup/unload special actions
+    own control, while the manual stop key remains active.
+  - Terminal unload now requires the optimistic collection count to be complete
+    and async route results are rejected if the robot start pose bucket changed.
+
 - Updated ball-aware route planning so non-target balls are avoided first but no
   longer make white-target routing fail outright.
   - `pathfinding/planner.py` now tries all candidate targets with inflated
@@ -40,6 +50,8 @@ All notable larger additions and behavioral changes to this repository should be
 
 ```text
 env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_control
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_robot_controller_safety
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_robot_server_commands
 env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_topdown_detector_app_shell
 ```
 

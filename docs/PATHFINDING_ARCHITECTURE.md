@@ -65,38 +65,77 @@ This keeps clearance deterministic and orientation-aware without adding runtime
 geometry dependencies beyond OpenCV and NumPy.
 
 Detected balls are also considered during target-specific planning. For each
-selected pickup target, the planner builds a temporary copy of the red-zone
-grid and inserts every other currently unvisited ball as an inflated hard
-obstacle. The selected target ball is explicitly excluded from that temporary
-obstacle layer so its own pickup standoff/final-pickup poses remain reachable.
+selected pickup target, the planner keeps the red-zone grid as the hard
+`uint8` obstacle layer and builds a parallel `float32` ball costmap for every
+other currently unvisited ball. The selected target ball is explicitly excluded
+from that soft-cost layer so its own pickup standoff/final-pickup poses remain
+reachable.
 
-The inflated ball obstacle radius is:
+The core ball-cost radius is:
 
 ```text
 ball_radius_cm + 0.5 * robot_width_cm + non_target_ball_extra_clearance_cm
 ```
 
-These defaults are configured in `vision.config.PlannerConfig` and copied into
+The planner draws three concentric cost bands with OpenCV:
+
+```text
+core radius:        ball_core_cost
+core radius + 5cm:  ball_close_cost
+core radius + 10cm: ball_warning_cost
+```
+
+The default costs are `1000.0`, `200.0`, and `50.0`. These defaults are
+configured in `vision.config.PlannerConfig` and copied into
 `pathfinding.models.HybridPlannerConfig`:
 
 - `avoid_non_target_balls_enabled`
 - `ball_radius_cm`
 - `non_target_ball_extra_clearance_cm`
-- `allow_last_resort_orange_contact`
+- `ball_core_cost`
+- `ball_close_cost`
+- `ball_warning_cost`
+- `ball_close_clearance_cm`
+- `ball_warning_clearance_cm`
 
-This is a conservative first-pass hard-obstacle layer, not a cost-only hint. If
-a white ball lies directly between the robot and the selected target, Hybrid A*
-should route around the inflated ball region whenever the field layout allows
-it. If every candidate target is blocked by that temporary ball-obstacle layer,
-the planner retries those same targets against the real red-zone/wall grid only.
-That last-resort mode may contact non-target balls, but it still requires a
-valid robot-body trajectory and never ignores red zones or field boundaries.
-When balls are crowded tightly enough that another ball's inflated obstacle
-covers the selected target itself, the planner skips the expensive hard-avoidance
-search for that target and defers it directly to the contact-allowed fallback.
-When debugging detection or route geometry, ball avoidance can be disabled
-through configuration, but the default behavior is to avoid non-target balls
-before allowing contact.
+This is a soft traversal-cost layer, not an impassable obstacle layer. Hybrid A*
+adds the costmap value at each candidate robot-center pose into `g(n)`, and the
+2D Dijkstra heuristic adds the same cost layer during node expansion. During
+pickup-standoff planning, that Dijkstra heuristic is seeded from all
+hard-valid standoff grid nodes instead of the ball grid node, so the heuristic
+pulls the body center toward a reachable TCP handoff pose rather than into the
+ball itself. This makes routes through non-target balls very expensive while
+still allowing them if a ball corridor is the only route to the selected target.
+Red zones and field boundaries remain hard constraints.
+
+## Search Cost Tuning
+
+Hybrid A* uses weighted A* for route planning. The priority queue score is:
+
+```text
+f(n) = g(n) + heuristic_weight * h(n)
+```
+
+`heuristic_weight` defaults to `1.5`, which intentionally favors faster,
+greedier route discovery over perfectly minimal path cost. This is useful in the
+live contest loop because route latency matters more than tiny path optimality
+differences.
+
+Motion primitive costs are also tuned to reduce wiggle:
+
+- forward move: `step_cm`
+- reverse move: `step_cm * reverse_cost_multiplier`
+- gear shift: add `gear_shift_penalty` when switching directly between forward
+  and reverse
+- steering change: add `steering_change_penalty` when entering a different
+  in-place turn direction
+- in-place turn: `in_place_rotation_cost + abs(delta_theta) * 0.25`
+
+Current defaults are `reverse_cost_multiplier = 2.5`,
+`gear_shift_penalty = 50.0`, `steering_change_penalty = 3.0`, and
+`in_place_rotation_cost = 2.0`. The previous gear and steering direction are
+tracked internally for the best-known arrival at each `(x, y, theta)` state;
+they are not part of the public route model.
 
 ## Pickup Offset
 
@@ -128,10 +167,45 @@ standoff_theta = theta
 ```
 
 Both poses must be collision-free for the main robot body. The intake tube may
-overhang walls, but the body may not. Hybrid A* targets the set of valid
-standoff poses and appends the paired final pickup pose only after the standoff
-is reached. This guarantees the final TCP straight-line segment is collinear
-with the robot heading and does not require impossible sideways motion.
+overhang walls, but the body may not. Hybrid A* can still target the fixed
+standoff/final-pickup pose pairs, but the near-ball goal condition is flexible:
+if the current pose has the tube within `flexible_standoff_max_cm` of the ball,
+the body heading points at the ball within `flexible_standoff_heading_tolerance_rad`,
+and the straight TCP segment to the final pickup pose is hard-obstacle clear,
+the planner accepts that pose as the handoff point. This lets the robot stop,
+pivot, and start the TCP sneak immediately when it is already close instead of
+backing up to exactly 15 cm.
+
+Before a route segment is returned, Hybrid A* applies a greedy pruning pass. A
+middle node is removed when the anchor node has a sampled collision-free straight
+segment to a later node and that shortcut does not enter a worse soft-cost band
+than the original subpath. This trims grid-search jaggedness while preserving
+hard red-zone/wall safety.
+
+The terminal pickup maneuver is appended only after that pruning pass. This
+protected tail is always represented as:
+
+```text
+standoff pose -> in-place pivot pose -> straight TCP creep final pose
+```
+
+The pivot pose has the same robot-center `(x, y)` as the standoff but faces the
+target ball directly. The final pose is then the straight-line creep endpoint
+whose tube center lands on the ball. This keeps smoothing from removing the
+controlled TCP creep sequence.
+
+Pickup-standoff search uses progressive fallback when the standard soft-cost
+attempt exhausts its expansion budget:
+
+1. Standard weighted A* with normal soft ball costs.
+2. Relaxed soft costs, with the ball costmap scaled to 10% of its original
+   values.
+3. Desperation mode, with no soft ball costs, `heuristic_weight = 1.0`, and the
+   flexible handoff heading tolerance widened to 30 degrees.
+
+These fallbacks never relax hard red-zone, wall, or robot-footprint validity.
+If no hard-valid standoff/final pickup pair exists, the target is still rejected
+before search begins.
 
 ## Route Cache
 
@@ -186,7 +260,8 @@ calibrated TCP position control:
 7. Return the collector state to `TRAVEL`.
 8. Continue to pickup/replan after the assist motion completes.
 
-The near-zone TCP speed and turn speed are configured through `DriveConfig`.
+The near-zone TCP turn speed is configured through `DriveConfig`; the TCP move
+speed defaults to the same low creep speed used in planner segment metadata.
 The collection actuator contract is documented in
 `docs/COLLECTION_MECHANISM.md`: autonomous ball collection, including
 orange-first collection, may use only the small pickup-assist motion. The full
@@ -210,13 +285,22 @@ expensive failure case on every video frame.
 
 ## Route Visualization
 
-The schematic route is a robot body-center preview. Both the UDP path and the
-final TCP near-zone segment are drawn with the same speed heatmap palette.
+The schematic route is a robot body-center preview. Route edges carry semantic
+segment metadata:
 
-At each near-zone handoff, a red marker indicates the `LR 0 0` stop and TCP
-turn point. The line from the standoff center to the final pickup center uses
-the configured TCP move speed for its heatmap color. No route line is drawn to
-the ball coordinate, because the robot center never moves there.
+- `TRANSIT`: normal route-following movement at the configured transit speed
+- `PIVOT`: in-place rotation at the configured pivot speed
+- `CREEP`: final straight TCP pickup movement at the configured creep speed
+
+The OpenCV schematic draws segments from that speed profile: low speed is red,
+medium/pivot speed is yellow-orange, and high transit speed is green. Zero-length
+pivot edges are shown as colored stop markers so the intended in-place alignment
+is still visible.
+
+At each terminal handoff, the pivot marker indicates the `LR 0 0` stop and TCP
+turn point. The line from the pivot center to the final pickup center uses the
+configured creep speed for its heatmap color. No route line is drawn to the ball
+coordinate, because the robot center never moves there.
 
 Every successful planned pickup pose is drawn as a bold magenta footprint. These
 pickup footprints show the base-center offset and intake alignment for each
@@ -228,18 +312,15 @@ orange or white target that the route actually connects.
 
 1. If orange targets exist, they are sorted by distance from the robot.
 2. Hybrid A* tries each orange target in nearest-first order with all
-   non-target balls inserted as inflated hard obstacles.
+   non-target balls represented in the soft ball costmap.
 3. If no valid orange trajectory exists with ball avoidance enabled, the route
    never changes the selected target to a white ball.
-4. Only when `allow_last_resort_orange_contact` is enabled may the planner relax
-   the non-target ball obstacle layer for orange as a last resort. The active
-   target remains orange, and this mode is labelled `orange forced first` and
-   logged so it is visible during contest debugging.
-5. After an orange ball is reached, the same nearest-reachable logic continues
+4. After an orange ball is reached, the same nearest-reachable logic continues
    from the final `HybridPose`.
 
-For normal white-target routing, each candidate is first tried with non-target
-balls inserted as inflated hard obstacles. If no candidate can be reached that
-way, the same candidates are retried with non-target ball contact allowed. The
-fallback never fabricates a route: unreachable targets are skipped, and the
-route contains only validated Hybrid A* segments against walls and red zones.
+For normal white-target routing, each candidate is tried once with the soft
+non-target ball costmap. There is no second contact-fallback route pass; if the
+only feasible trajectory crosses a non-target ball cost band, the same Hybrid A*
+search can still choose it by paying the high traversal cost. Unreachable
+targets are skipped, and the route contains only validated Hybrid A* segments
+against walls and red zones.

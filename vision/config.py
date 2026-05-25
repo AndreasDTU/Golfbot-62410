@@ -280,9 +280,18 @@ class PlannerConfig:
     goal_tolerance_cm: float = 4.0
     max_expansions: int = 36000
     translation_directions: tuple[float, ...] = (1.0, -1.0)
-    reverse_cost_multiplier: float = 1.8
+    reverse_cost_multiplier: float = 2.5
     rotation_deltas_rad: tuple[float, ...] = (math.radians(-10.0), math.radians(10.0))
-    in_place_rotation_cost: float = 1.1
+    in_place_rotation_cost: float = 2.0
+    heuristic_weight: float = 1.5
+    gear_shift_penalty: float = 50.0
+    steering_change_penalty: float = 3.0
+    transit_speed_pct: float = 38.0
+    pivot_speed_pct: float = 30.0
+    creep_speed_pct: float = 7.0
+    flexible_standoff_max_cm: float = 15.0
+    flexible_standoff_min_cm: float = 0.0
+    flexible_standoff_heading_tolerance_rad: float = math.radians(10.0)
     num_intermediate_snapshots: int = 0
     route_heading_marker_interval: int = 20
     route_target_move_invalidate_cm: float = 5.0
@@ -290,7 +299,11 @@ class PlannerConfig:
     avoid_non_target_balls_enabled: bool = True
     ball_radius_cm: float = 2.0
     non_target_ball_extra_clearance_cm: float = 0.0
-    allow_last_resort_orange_contact: bool = True
+    ball_core_cost: float = 1000.0
+    ball_close_cost: float = 200.0
+    ball_warning_cost: float = 50.0
+    ball_close_clearance_cm: float = 5.0
+    ball_warning_clearance_cm: float = 10.0
 
     @property
     def route_target_reached_cm(self) -> float:
@@ -316,7 +329,7 @@ class DriveConfig:
     creep_speed_pct: float = 7.0
     near_zone_cm: float = 15.0
     near_zone_turn_speed_pct: float = 30.0
-    near_zone_move_speed_pct: float = 25.0
+    near_zone_move_speed_pct: float = 7.0
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
     edge_max_gain_scale: float = 1.6

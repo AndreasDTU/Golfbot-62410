@@ -1362,6 +1362,8 @@ class TopdownDetectorApp:
             camera_center_pixels=(float(params["camera_center_x"]), float(params["camera_center_y"])),
             route_points_cm=self.runtime.route_plan.points,
             route_pickup_poses_cm=self.runtime.route_plan.pickup_poses,
+            route_segment_types=self.runtime.route_plan.segment_types,
+            route_segment_speeds_pct=self.runtime.route_plan.segment_speeds_pct,
             route_unload_pose_cm=self.runtime.route_plan.unload_pose,
             route_unload_goal_cm=self.runtime.route_plan.unload_goal_cm,
             selected_start_cm=self.runtime.selected_start_cm,

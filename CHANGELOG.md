@@ -29,20 +29,51 @@ All notable larger additions and behavioral changes to this repository should be
   - Terminal unload now requires the optimistic collection count to be complete
     and async route results are rejected if the robot start pose bucket changed.
 
-- Updated ball-aware route planning so non-target balls are avoided first but no
-  longer make white-target routing fail outright.
-  - `pathfinding/planner.py` now tries all candidate targets with inflated
-    non-target ball obstacles before retrying those same candidates with
-    non-target ball contact allowed.
-  - Orange priority still remains absolute, but orange targets now also try all
-    avoidable orange routes before using the explicit last-resort contact mode.
-  - Crowded targets whose ball position is already covered by another ball's
-    inflated obstacle now skip the impossible hard-avoidance search and go
-    straight to the contact-allowed fallback pass.
-  - Last-resort contact routes still validate robot-body motion against walls
-    and red zones.
-  - `docs/PATHFINDING_ARCHITECTURE.md` documents the avoid-first/contact-fallback
-    behavior.
+- Replaced hard non-target ball obstacles with a soft ball costmap.
+  - `pathfinding/planner.py` now keeps the red-zone grid as the hard `uint8`
+    obstacle layer and builds a parallel `float32` costmap for non-target balls.
+  - Hybrid A* adds the sampled ball-cost value into `g(n)`, and
+    `GridDijkstraHeuristic` includes the same cost layer in its 2D expansion.
+  - Non-target balls now use concentric cost bands: core `1000.0`, close
+    `200.0`, and warning `50.0`.
+  - Removed the old `orange forced first` / `ball contact fallback` replanning
+    pass; a single soft-cost search can still cross a ball region if that is the
+    only validated route through hard obstacles.
+  - `docs/PATHFINDING_ARCHITECTURE.md` documents the costmap behavior.
+
+- Tuned Hybrid A* search to reduce soft-cost planning latency and zigzag routes.
+  - Added `heuristic_weight = 1.5` for weighted A* priority scoring.
+  - Added `gear_shift_penalty = 50.0` when a route switches between forward and
+    reverse motion primitives.
+  - Added `steering_change_penalty = 3.0`, increased
+    `reverse_cost_multiplier` to `2.5`, and set `in_place_rotation_cost` to
+    `2.0` to favor pivot-and-drive paths without making pivots prohibitively
+    expensive.
+  - Pickup standoff planning now accepts already-close, aligned, line-of-sight
+    handoff poses instead of forcing an exact 15 cm standoff point.
+  - Added greedy path pruning for collision-free straight-line shortcuts that do
+    not enter worse soft-cost bands.
+
+- Protected the terminal pickup maneuver from path pruning.
+  - Hybrid A* now appends the final `standoff -> pivot -> creep` pickup tail
+    after pruning, so the route always finishes with an in-place alignment and a
+    straight TCP creep to the ball.
+  - Added route segment metadata (`TRANSIT`, `PIVOT`, `CREEP`) plus intended
+    speed percentages for route rendering and diagnostics.
+  - The schematic route now colors segments by intended speed: green transit,
+    yellow/orange pivot, and red low-speed creep.
+  - Lowered the default TCP near-zone move speed to the configured creep speed
+    so the EV3 command path matches the planned terminal profile.
+
+- Retargeted pickup-standoff search heuristics and added progressive fallback.
+  - `GridDijkstraHeuristic` can now seed from multiple source nodes.
+  - Pickup standoff planning now builds its Dijkstra heuristic from all
+    hard-valid standoff poses instead of the ball grid node.
+  - If the standard attempt exhausts its expansion budget, the planner retries
+    with the ball costmap scaled to 10%, then retries without soft costs using
+    `heuristic_weight = 1.0` and a wider flexible heading tolerance.
+  - Search logs now print the target ball field coordinate and the number of
+    hard-valid standoff candidates.
 
 ### Verified
 
@@ -50,16 +81,20 @@ All notable larger additions and behavioral changes to this repository should be
 
 ```text
 env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_control
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_pathfinding_heuristic
 env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_robot_controller_safety
 env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_robot_server_commands
 env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_topdown_detector_app_shell
 ```
 
-- Result: both test suites passed.
-- Added a focused regression test for white-target contact fallback when ball
-  avoidance blocks every route.
-- Added a focused regression test for crowded targets skipping the impossible
-  hard-avoidance search.
+- Result: all listed test suites passed.
+- Added focused regression coverage for Dijkstra costmap penalties, non-target
+  ball costmap construction, and removal of the old contact-fallback replanning
+  path.
+- Added focused regression coverage for protected terminal pivot/creep route
+  segment classification and speed metadata.
+- Added focused regression coverage for multi-source Dijkstra maps and the
+  pickup-standoff soft-cost fallback path.
 
 ## 2026-05-21
 

@@ -9,7 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from pathfinding.models import HybridPose
+from pathfinding.models import HybridPose, RouteSegmentType
 from pathfinding.planner import HybridAStarPlanner
 from robot.control import WheelCommandController, route_checkpoint_indices
 from robot.localization import RobotPoseEstimator
@@ -65,12 +65,12 @@ class DebugRenderer:
         ratio = float(np.clip((speed_pct - creep) / (cruise - creep), 0.0, 1.0))
         if ratio < 0.5:
             local = ratio / 0.5
-            red = int(round(255 * local))
-            green = 255
+            red = 255
+            green = int(round(255 * local))
         else:
             local = (ratio - 0.5) / 0.5
-            red = 255
-            green = int(round(255 * (1.0 - local)))
+            red = int(round(255 * (1.0 - local)))
+            green = 255
         return (0, green, red)
 
     def route_velocity_color(self, distance_to_goal_cm: float) -> tuple[int, int, int]:
@@ -173,9 +173,29 @@ class DebugRenderer:
         route_points_cm: list[HybridPose],
         route_pickup_poses_cm: list[HybridPose] | None = None,
         geometry: RobotGeometry | None = None,
+        route_segment_types: list[RouteSegmentType] | None = None,
+        route_segment_speeds_pct: list[float] | None = None,
     ) -> None:
         """Draw route heatmap as UDP tracking up to near-zone, then TCP straight pickup."""
         if len(route_points_cm) < 2:
+            return
+        if route_segment_speeds_pct is not None and len(route_segment_speeds_pct) >= len(route_points_cm) - 1:
+            for segment_index, (start, end) in enumerate(zip(route_points_cm[:-1], route_points_cm[1:])):
+                segment_type = (
+                    route_segment_types[segment_index]
+                    if route_segment_types is not None and segment_index < len(route_segment_types)
+                    else RouteSegmentType.TRANSIT
+                )
+                color = self.route_velocity_color_for_speed(route_segment_speeds_pct[segment_index])
+                start_px = self.mapper.field_metric_cm_to_schematic((start.x_cm, start.y_cm))
+                end_px = self.mapper.field_metric_cm_to_schematic((end.x_cm, end.y_cm))
+                if math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm) <= 1e-6:
+                    radius = 7 if segment_type == RouteSegmentType.PIVOT else 5
+                    cv2.circle(schematic, start_px, radius, color, -1, cv2.LINE_AA)
+                    cv2.circle(schematic, start_px, radius + 2, (255, 255, 255), 1, cv2.LINE_AA)
+                    continue
+                thickness = 4 if segment_type == RouteSegmentType.CREEP else 3
+                cv2.line(schematic, start_px, end_px, color, thickness, cv2.LINE_AA)
             return
         robot_geometry = geometry or self.robot_geometry_from_params(None)
         cumulative = self.cumulative_route_lengths(route_points_cm)
@@ -862,6 +882,8 @@ class DebugRenderer:
         camera_center_pixels: tuple[float, float],
         route_points_cm: list[HybridPose] | None = None,
         route_pickup_poses_cm: list[HybridPose] | None = None,
+        route_segment_types: list[RouteSegmentType] | None = None,
+        route_segment_speeds_pct: list[float] | None = None,
         route_unload_pose_cm: HybridPose | None = None,
         route_unload_goal_cm: tuple[float, float] | None = None,
         selected_start_cm: tuple[int, int] | None = None,
@@ -918,7 +940,14 @@ class DebugRenderer:
 
         geometry = self.robot_geometry_from_params(params)
         if route_points_cm:
-            self.draw_velocity_profile_route(schematic, route_points_cm, route_pickup_poses_cm, geometry)
+            self.draw_velocity_profile_route(
+                schematic,
+                route_points_cm,
+                route_pickup_poses_cm,
+                geometry,
+                route_segment_types,
+                route_segment_speeds_pct,
+            )
             self.draw_pickup_footprints(schematic, route_pickup_poses_cm or [], geometry)
             if route_unload_pose_cm is not None:
                 self.draw_robot_footprint_snapshot(

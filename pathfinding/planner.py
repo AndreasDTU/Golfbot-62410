@@ -11,9 +11,25 @@ from typing import Protocol
 import cv2
 import numpy as np
 
-from pathfinding.models import HybridPlannerConfig, HybridPose, PlannedBallTarget, RoutePlan, RouteTrackingError
+from pathfinding.models import (
+    HybridPlannerConfig,
+    HybridPose,
+    PlannedBallTarget,
+    RoutePlan,
+    RouteSegmentType,
+    RouteTrackingError,
+)
 from robot.models import RobotGeometry, RobotPose
 from vision.config import FieldConfig, PlannerConfig, RobotGeometryConfig
+
+SearchKey = tuple[int, int, int]
+FORWARD_GEAR = 1
+REVERSE_GEAR = -1
+NO_GEAR = 0
+NO_STEERING = 0
+STRAIGHT_STEERING = 1
+LEFT_STEERING = 2
+RIGHT_STEERING = 3
 
 
 def normalize_planner_angle(theta_rad: float) -> float:
@@ -155,14 +171,37 @@ class GridDijkstraHeuristic:
         (1, 1, math.sqrt(2.0)),
     )
 
-    def __init__(self, raw_red_grid: np.ndarray, goal_node: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        raw_red_grid: np.ndarray,
+        goal_node: tuple[int, int] | None = None,
+        costmap: np.ndarray | None = None,
+        goal_nodes: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
+    ) -> None:
         self.grid = raw_red_grid
+        self.costmap = self._normalize_costmap(costmap, raw_red_grid.shape)
         self.height = int(raw_red_grid.shape[0])
         self.width = int(raw_red_grid.shape[1])
         self.costs = np.full((self.height, self.width), np.inf, dtype=np.float64)
-        self.goal = self._nearest_free_node(goal_node)
-        if self.goal is not None:
+        source_nodes = list(goal_nodes) if goal_nodes is not None else ([] if goal_node is None else [goal_node])
+        self.goals = self._nearest_free_nodes(source_nodes)
+        self.goal = self.goals[0] if self.goals else None
+        if self.goals:
             self._compute()
+
+    @staticmethod
+    def _normalize_costmap(costmap: np.ndarray | None, grid_shape: tuple[int, ...]) -> np.ndarray | None:
+        if costmap is None:
+            return None
+        if costmap.shape != grid_shape:
+            raise ValueError(f"costmap shape {costmap.shape} does not match grid shape {grid_shape}")
+        return costmap.astype(np.float32, copy=False)
+
+    def _node_cost(self, node: tuple[int, int]) -> float:
+        if self.costmap is None:
+            return 0.0
+        value = float(self.costmap[node[1], node[0]])
+        return value if math.isfinite(value) and value > 0.0 else 0.0
 
     def _in_bounds(self, node: tuple[int, int]) -> bool:
         return 0 <= node[0] < self.width and 0 <= node[1] < self.height
@@ -197,10 +236,24 @@ class GridDijkstraHeuristic:
                 return candidates[0][1]
         return None
 
+    def _nearest_free_nodes(self, nodes: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Return deterministic unique free seed nodes for a multi-goal Dijkstra map."""
+        nearest_nodes: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for node in nodes:
+            nearest = self._nearest_free_node(node)
+            if nearest is None or nearest in seen:
+                continue
+            seen.add(nearest)
+            nearest_nodes.append(nearest)
+        nearest_nodes.sort(key=lambda item: (item[1], item[0]))
+        return nearest_nodes
+
     def _compute(self) -> None:
-        assert self.goal is not None
-        heap: list[tuple[float, tuple[int, int]]] = [(0.0, self.goal)]
-        self.costs[self.goal[1], self.goal[0]] = 0.0
+        heap: list[tuple[float, tuple[int, int]]] = []
+        for goal in self.goals:
+            self.costs[goal[1], goal[0]] = 0.0
+            heapq.heappush(heap, (0.0, goal))
 
         while heap:
             current_cost, current = heapq.heappop(heap)
@@ -210,7 +263,7 @@ class GridDijkstraHeuristic:
                 neighbor = (current[0] + dx, current[1] + dy)
                 if not self._is_free(neighbor):
                     continue
-                next_cost = current_cost + step_cost
+                next_cost = current_cost + step_cost + self._node_cost(neighbor)
                 if next_cost >= float(self.costs[neighbor[1], neighbor[0]]):
                     continue
                 self.costs[neighbor[1], neighbor[0]] = next_cost
@@ -256,6 +309,26 @@ class HybridAStarPlanner:
             int(round(self.field.height_cm - pose.y_cm)),
             self.theta_bin(pose.theta_rad, bins),
         )
+
+    @staticmethod
+    def weighted_heuristic(heuristic: float, config: HybridPlannerConfig) -> float:
+        """Apply weighted A* inflation to finite non-negative heuristic costs."""
+        if not math.isfinite(heuristic):
+            return heuristic
+        return max(0.0, heuristic) * max(1.0, float(config.heuristic_weight))
+
+    def costmap_cost_at_field_point(self, costmap: np.ndarray | None, point_cm: tuple[float, float]) -> float:
+        """Return the soft traversal penalty at a field point."""
+        if costmap is None:
+            return 0.0
+        x_index = int(np.clip(round(point_cm[0]), 0, costmap.shape[1] - 1))
+        y_index = int(np.clip(round(self.field.height_cm - point_cm[1]), 0, costmap.shape[0] - 1))
+        value = float(costmap[y_index, x_index])
+        return value if math.isfinite(value) and value > 0.0 else 0.0
+
+    def costmap_cost_for_pose(self, costmap: np.ndarray | None, pose: HybridPose) -> float:
+        """Return the soft traversal penalty at the robot reference point."""
+        return self.costmap_cost_at_field_point(costmap, (pose.x_cm, pose.y_cm))
 
     @staticmethod
     def tube_center_for_pose(pose: HybridPose, geometry: RobotGeometry) -> tuple[float, float]:
@@ -358,6 +431,7 @@ class HybridAStarPlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig | None = None,
         radius_cm: float = 18.0,
+        costmap: np.ndarray | None = None,
     ) -> list[HybridPose]:
         """Search to a broad robot-origin staging region near the small goal."""
         cfg = config or self.config
@@ -378,18 +452,20 @@ class HybridAStarPlanner:
             int(np.clip(round(goal_x), 0, raw_red_grid.shape[1] - 1)),
             int(np.clip(round(self.field.height_cm - goal_y), 0, raw_red_grid.shape[0] - 1)),
         )
-        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node, costmap)
         start_key = self.state_key(start_pose, cfg.theta_bins)
-        open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+        open_heap: list[tuple[float, float, int, SearchKey]] = []
         counter = 0
         start_h = dijkstra_heuristic.cost_from_field_point((start_pose.x_cm, start_pose.y_cm), self.field)
         if not math.isfinite(start_h):
             start_h = math.hypot(goal_x - start_pose.x_cm, goal_y - start_pose.y_cm)
-        heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+        heapq.heappush(open_heap, (self.weighted_heuristic(max(0.0, start_h - radius_cm), cfg), 0.0, counter, start_key))
 
-        came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-        pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
-        g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+        came_from: dict[SearchKey, SearchKey] = {}
+        pose_by_key: dict[SearchKey, HybridPose] = {start_key: start_pose}
+        g_score: dict[SearchKey, float] = {start_key: 0.0}
+        gear_by_key: dict[SearchKey, int] = {start_key: NO_GEAR}
+        steering_by_key: dict[SearchKey, int] = {start_key: NO_STEERING}
         expansions = 0
 
         while open_heap and expansions < cfg.max_expansions:
@@ -402,10 +478,18 @@ class HybridAStarPlanner:
                 collision_checker.is_pose_valid(current_pose)
                 and math.hypot(goal_x - current_pose.x_cm, goal_y - current_pose.y_cm) <= radius_cm
             ):
-                return self.reconstruct_path(came_from, pose_by_key, current_key)
+                path = self.reconstruct_path(came_from, pose_by_key, current_key)
+                return self.prune_path(path, collision_checker, costmap)
 
             expansions += 1
-            for neighbor_pose, primitive_cost in self.expand_neighbors(current_pose, cfg):
+            current_gear = gear_by_key.get(current_key, NO_GEAR)
+            current_steering = steering_by_key.get(current_key, NO_STEERING)
+            for neighbor_pose, primitive_cost, next_gear, next_steering in self.expand_neighbors(
+                current_pose,
+                cfg,
+                current_gear,
+                current_steering,
+            ):
                 neighbor_pose = HybridPose(
                     x_cm=float(neighbor_pose.x_cm),
                     y_cm=float(neighbor_pose.y_cm),
@@ -420,18 +504,28 @@ class HybridAStarPlanner:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
-                tentative_g = g_score[current_key] + primitive_cost
+                tentative_g = g_score[current_key] + primitive_cost + self.costmap_cost_for_pose(costmap, neighbor_pose)
                 if tentative_g >= g_score.get(neighbor_key, float("inf")):
                     continue
 
                 came_from[neighbor_key] = current_key
                 pose_by_key[neighbor_key] = neighbor_pose
                 g_score[neighbor_key] = tentative_g
+                gear_by_key[neighbor_key] = next_gear
+                steering_by_key[neighbor_key] = next_steering
                 heuristic = dijkstra_heuristic.cost_from_field_point((neighbor_pose.x_cm, neighbor_pose.y_cm), self.field)
                 if not math.isfinite(heuristic):
                     heuristic = math.hypot(goal_x - neighbor_pose.x_cm, goal_y - neighbor_pose.y_cm)
                 counter += 1
-                heapq.heappush(open_heap, (tentative_g + max(0.0, heuristic - radius_cm), tentative_g, counter, neighbor_key))
+                heapq.heappush(
+                    open_heap,
+                    (
+                        tentative_g + self.weighted_heuristic(max(0.0, heuristic - radius_cm), cfg),
+                        tentative_g,
+                        counter,
+                        neighbor_key,
+                    ),
+                )
 
         if expansions >= cfg.max_expansions:
             print(
@@ -447,6 +541,7 @@ class HybridAStarPlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig | None = None,
         timeout_s: float | None = None,
+        costmap: np.ndarray | None = None,
     ) -> list[HybridPose]:
         """Search to any pose whose rear unload tip reaches the small goal opening."""
         cfg = config or self.config
@@ -463,16 +558,18 @@ class HybridAStarPlanner:
             int(np.clip(round(goal_x), 0, raw_red_grid.shape[1] - 1)),
             int(np.clip(round(self.field.height_cm - goal_y), 0, raw_red_grid.shape[0] - 1)),
         )
-        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node, costmap)
         start_key = self.state_key(start_pose, cfg.theta_bins)
-        open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+        open_heap: list[tuple[float, float, int, SearchKey]] = []
         counter = 0
         start_h = self.unload_heuristic_cost(start_pose, geometry, dijkstra_heuristic)
-        heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+        heapq.heappush(open_heap, (self.weighted_heuristic(start_h, cfg), 0.0, counter, start_key))
 
-        came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-        pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
-        g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+        came_from: dict[SearchKey, SearchKey] = {}
+        pose_by_key: dict[SearchKey, HybridPose] = {start_key: start_pose}
+        g_score: dict[SearchKey, float] = {start_key: 0.0}
+        gear_by_key: dict[SearchKey, int] = {start_key: NO_GEAR}
+        steering_by_key: dict[SearchKey, int] = {start_key: NO_STEERING}
         expansions = 0
 
         timed_out = False
@@ -486,10 +583,18 @@ class HybridAStarPlanner:
 
             current_pose = pose_by_key[current_key]
             if collision_checker.is_pose_valid(current_pose) and self.is_unload_goal_reached(current_pose, geometry):
-                return self.reconstruct_path(came_from, pose_by_key, current_key)
+                path = self.reconstruct_path(came_from, pose_by_key, current_key)
+                return self.prune_path(path, collision_checker, costmap)
 
             expansions += 1
-            for neighbor_pose, primitive_cost in self.expand_neighbors(current_pose, cfg):
+            current_gear = gear_by_key.get(current_key, NO_GEAR)
+            current_steering = steering_by_key.get(current_key, NO_STEERING)
+            for neighbor_pose, primitive_cost, next_gear, next_steering in self.expand_neighbors(
+                current_pose,
+                cfg,
+                current_gear,
+                current_steering,
+            ):
                 neighbor_pose = HybridPose(
                     x_cm=float(neighbor_pose.x_cm),
                     y_cm=float(neighbor_pose.y_cm),
@@ -504,20 +609,22 @@ class HybridAStarPlanner:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
-                tentative_g = g_score[current_key] + primitive_cost
+                tentative_g = g_score[current_key] + primitive_cost + self.costmap_cost_for_pose(costmap, neighbor_pose)
                 if tentative_g >= g_score.get(neighbor_key, float("inf")):
                     continue
 
                 came_from[neighbor_key] = current_key
                 pose_by_key[neighbor_key] = neighbor_pose
                 g_score[neighbor_key] = tentative_g
+                gear_by_key[neighbor_key] = next_gear
+                steering_by_key[neighbor_key] = next_steering
                 heuristic = self.unload_heuristic_cost(neighbor_pose, geometry, dijkstra_heuristic)
                 heading_change = abs(normalize_planner_angle(neighbor_pose.theta_rad - current_pose.theta_rad))
                 counter += 1
                 heapq.heappush(
                     open_heap,
                     (
-                        tentative_g + heuristic + heading_change * 0.2,
+                        tentative_g + self.weighted_heuristic(heuristic, cfg) + heading_change * 0.2,
                         tentative_g,
                         counter,
                         neighbor_key,
@@ -680,6 +787,132 @@ class HybridAStarPlanner:
             for goal in self.valid_pickup_standoff_goals(raw_red_grid, goal_node, geometry, goal_point_cm)
         ]
 
+    def hard_line_of_sight(
+        self,
+        start_pose: HybridPose,
+        end_pose: HybridPose,
+        collision_checker: RobotFootprintCollisionChecker,
+        sample_step_cm: float = 2.0,
+    ) -> bool:
+        """Return true when sampled body poses along a straight segment are hard-obstacle free."""
+        distance_cm = math.hypot(end_pose.x_cm - start_pose.x_cm, end_pose.y_cm - start_pose.y_cm)
+        steps = max(1, int(math.ceil(distance_cm / max(0.5, sample_step_cm))))
+        heading = math.atan2(end_pose.y_cm - start_pose.y_cm, end_pose.x_cm - start_pose.x_cm) if distance_cm > 1e-6 else start_pose.theta_rad
+        for index in range(steps + 1):
+            ratio = index / steps
+            pose = HybridPose(
+                x_cm=start_pose.x_cm + (end_pose.x_cm - start_pose.x_cm) * ratio,
+                y_cm=start_pose.y_cm + (end_pose.y_cm - start_pose.y_cm) * ratio,
+                theta_rad=normalize_planner_angle(heading),
+            )
+            if not collision_checker.is_pose_valid(pose):
+                return False
+        return True
+
+    def max_path_soft_cost(self, path: list[HybridPose], costmap: np.ndarray | None) -> float:
+        """Return the maximum sampled soft cost along a path polyline."""
+        if costmap is None or len(path) < 2:
+            return 0.0
+        max_cost = 0.0
+        for start, end in zip(path, path[1:]):
+            distance_cm = math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm)
+            steps = max(1, int(math.ceil(distance_cm / 2.0)))
+            for index in range(steps + 1):
+                ratio = index / steps
+                point = (
+                    start.x_cm + (end.x_cm - start.x_cm) * ratio,
+                    start.y_cm + (end.y_cm - start.y_cm) * ratio,
+                )
+                max_cost = max(max_cost, self.costmap_cost_at_field_point(costmap, point))
+        return max_cost
+
+    def shortcut_is_valid(
+        self,
+        start_pose: HybridPose,
+        end_pose: HybridPose,
+        collision_checker: RobotFootprintCollisionChecker,
+        costmap: np.ndarray | None,
+        allowed_soft_cost: float,
+    ) -> bool:
+        """Return true when a shortcut stays hard-valid and does not enter worse soft cost."""
+        if not self.hard_line_of_sight(start_pose, end_pose, collision_checker):
+            return False
+        if costmap is None:
+            return True
+        return self.max_path_soft_cost([start_pose, end_pose], costmap) <= allowed_soft_cost + 1e-6
+
+    def prune_path(
+        self,
+        path: list[HybridPose],
+        collision_checker: RobotFootprintCollisionChecker,
+        costmap: np.ndarray | None = None,
+    ) -> list[HybridPose]:
+        """Greedily remove intermediate nodes when a direct segment remains valid."""
+        if len(path) <= 2:
+            return path
+        pruned: list[HybridPose] = [path[0]]
+        anchor_index = 0
+        while anchor_index < len(path) - 1:
+            best_index = anchor_index + 1
+            for candidate_index in range(len(path) - 1, anchor_index + 1, -1):
+                allowed_cost = self.max_path_soft_cost(path[anchor_index : candidate_index + 1], costmap)
+                if self.shortcut_is_valid(path[anchor_index], path[candidate_index], collision_checker, costmap, allowed_cost):
+                    best_index = candidate_index
+                    break
+            pruned.append(path[best_index])
+            anchor_index = best_index
+        return pruned
+
+    def flexible_pickup_goal(
+        self,
+        pose: HybridPose,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        config: HybridPlannerConfig,
+        collision_checker: RobotFootprintCollisionChecker,
+        goal_point_cm: tuple[float, float],
+    ) -> PickupStandoffGoal | None:
+        """Return a valid immediate TCP handoff when the tube is already near the ball."""
+        if not collision_checker.is_pose_valid(pose):
+            return None
+        ball_x, ball_y = self.goal_to_field_metric_cm(goal_node, goal_point_cm)
+        tube_x, tube_y = self.tube_center_for_pose(pose, geometry)
+        tube_distance_cm = math.hypot(ball_x - tube_x, ball_y - tube_y)
+        if tube_distance_cm > config.flexible_standoff_max_cm:
+            return None
+        if tube_distance_cm + 1e-6 < config.flexible_standoff_min_cm:
+            return None
+        heading_to_ball = math.atan2(ball_y - pose.y_cm, ball_x - pose.x_cm)
+        heading_error = abs(normalize_planner_angle(heading_to_ball - pose.theta_rad))
+        if heading_error > config.flexible_standoff_heading_tolerance_rad:
+            return None
+        terminal = self.terminal_pickup_sequence(pose, goal_node, geometry, collision_checker, goal_point_cm)
+        if terminal is None:
+            return None
+        return PickupStandoffGoal(standoff_pose=pose, final_pickup_pose=terminal[-1])
+
+    def flexible_pickup_heuristic(
+        self,
+        pose: HybridPose,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        dijkstra_heuristic: GridDijkstraHeuristic,
+        config: HybridPlannerConfig,
+        goal_point_cm: tuple[float, float],
+    ) -> float:
+        """Prefer states whose tube is near the ball and whose body points at it."""
+        ball_x, ball_y = self.goal_to_field_metric_cm(goal_node, goal_point_cm)
+        tube_point = self.tube_center_for_pose(pose, geometry)
+        cost = dijkstra_heuristic.cost_from_field_point(tube_point, self.field)
+        if not math.isfinite(cost):
+            cost = math.hypot(ball_x - tube_point[0], ball_y - tube_point[1])
+        heading_to_ball = math.atan2(ball_y - pose.y_cm, ball_x - pose.x_cm)
+        heading_error = abs(normalize_planner_angle(heading_to_ball - pose.theta_rad))
+        return (
+            max(0.0, cost - config.flexible_standoff_max_cm)
+            + max(0.0, heading_error - config.flexible_standoff_heading_tolerance_rad) * 4.0
+        )
+
     def search_corner_pickup(
         self,
         raw_red_grid: np.ndarray,
@@ -688,6 +921,7 @@ class HybridAStarPlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig | None = None,
         goal_point_cm: tuple[float, float] | None = None,
+        costmap: np.ndarray | None = None,
     ) -> list[HybridPose]:
         """Route to a deterministic diagonal pickup pose for a tightly cornered ball."""
         if goal_point_cm is None:
@@ -697,7 +931,7 @@ class HybridAStarPlanner:
         for pickup_pose in self.corner_pickup_pose_candidates(goal_node, geometry, goal_point_cm):
             if not collision_checker.is_pose_valid(pickup_pose):
                 continue
-            segment = self.search_pose_goal(raw_red_grid, start_pose, pickup_pose, geometry, cfg)
+            segment = self.search_pose_goal(raw_red_grid, start_pose, pickup_pose, geometry, cfg, costmap=costmap)
             if segment:
                 return segment
         return []
@@ -733,9 +967,9 @@ class HybridAStarPlanner:
 
     @staticmethod
     def reconstruct_path(
-        came_from: dict[tuple[int, int, int], tuple[int, int, int]],
-        pose_by_key: dict[tuple[int, int, int], HybridPose],
-        goal_key: tuple[int, int, int],
+        came_from: dict[SearchKey, SearchKey],
+        pose_by_key: dict[SearchKey, HybridPose],
+        goal_key: SearchKey,
     ) -> list[HybridPose]:
         """Rebuild the continuous trajectory from search parents."""
         key = goal_key
@@ -745,6 +979,56 @@ class HybridAStarPlanner:
             path.append(pose_by_key[key])
         path.reverse()
         return path
+
+    @staticmethod
+    def default_segment_types(path: list[HybridPose], segment_type: RouteSegmentType = RouteSegmentType.TRANSIT) -> list[RouteSegmentType]:
+        """Return one segment type per route edge."""
+        return [segment_type for _ in range(max(0, len(path) - 1))]
+
+    @staticmethod
+    def segment_speeds_for_types(segment_types: list[RouteSegmentType], config: HybridPlannerConfig) -> list[float]:
+        """Map semantic segment types to intended speed percentages."""
+        speeds = {
+            RouteSegmentType.TRANSIT: config.transit_speed_pct,
+            RouteSegmentType.PIVOT: config.pivot_speed_pct,
+            RouteSegmentType.CREEP: config.creep_speed_pct,
+        }
+        return [float(speeds.get(segment_type, config.transit_speed_pct)) for segment_type in segment_types]
+
+    def terminal_pickup_sequence(
+        self,
+        standoff_pose: HybridPose,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        collision_checker: RobotFootprintCollisionChecker,
+        goal_point_cm: tuple[float, float],
+    ) -> list[HybridPose] | None:
+        """Return immutable pivot -> straight TCP creep nodes for final pickup."""
+        ball_x, ball_y = self.goal_to_field_metric_cm(goal_node, goal_point_cm)
+        heading_to_ball = normalize_planner_angle(math.atan2(ball_y - standoff_pose.y_cm, ball_x - standoff_pose.x_cm))
+        pivot_pose = HybridPose(standoff_pose.x_cm, standoff_pose.y_cm, heading_to_ball)
+        final_pose = self.pickup_aligned_pose_for_theta(goal_node, heading_to_ball, geometry, goal_point_cm)
+        if not collision_checker.is_pose_valid(pivot_pose) or not collision_checker.is_pose_valid(final_pose):
+            return None
+        if not self.hard_line_of_sight(pivot_pose, final_pose, collision_checker):
+            return None
+        if (
+            math.hypot(final_pose.x_cm - pivot_pose.x_cm, final_pose.y_cm - pivot_pose.y_cm)
+            > self.MIN_STANDOFF_BODY_DISTANCE_CM + 1e-6
+        ):
+            return None
+        if math.hypot(final_pose.x_cm - pivot_pose.x_cm, final_pose.y_cm - pivot_pose.y_cm) <= 1e-6:
+            return [pivot_pose]
+        return [pivot_pose, final_pose]
+
+    @staticmethod
+    def append_terminal_pickup_sequence(path: list[HybridPose], terminal: list[HybridPose]) -> list[HybridPose]:
+        """Append protected pivot/creep nodes after pruning has finished."""
+        if not path:
+            return list(terminal)
+        appended = list(path)
+        appended.extend(terminal)
+        return appended
 
     @staticmethod
     def allows_start_escape_transition(
@@ -766,27 +1050,46 @@ class HybridAStarPlanner:
         self,
         pose: HybridPose,
         config: HybridPlannerConfig | None = None,
-    ) -> list[tuple[HybridPose, float]]:
+        previous_gear: int = NO_GEAR,
+        previous_steering: int = NO_STEERING,
+    ) -> list[tuple[HybridPose, float, int, int]]:
         """Generate deterministic differential-drive motion primitives."""
         cfg = config or self.config
-        neighbors: list[tuple[HybridPose, float]] = []
+        neighbors: list[tuple[HybridPose, float, int, int]] = []
 
         for direction in cfg.translation_directions:
+            next_gear = FORWARD_GEAR if direction > 0.0 else REVERSE_GEAR
             next_pose = HybridPose(
                 x_cm=pose.x_cm + math.cos(pose.theta_rad) * cfg.step_cm * direction,
                 y_cm=pose.y_cm + math.sin(pose.theta_rad) * cfg.step_cm * direction,
                 theta_rad=pose.theta_rad,
             )
             reverse_penalty = cfg.reverse_cost_multiplier if direction < 0.0 else 1.0
-            neighbors.append((next_pose, cfg.step_cm * reverse_penalty))
+            shift_penalty = (
+                cfg.gear_shift_penalty
+                if previous_gear in (FORWARD_GEAR, REVERSE_GEAR) and previous_gear != next_gear
+                else 0.0
+            )
+            neighbors.append((next_pose, cfg.step_cm * reverse_penalty + shift_penalty, next_gear, STRAIGHT_STEERING))
 
         for delta_theta in cfg.rotation_deltas_rad:
+            next_steering = LEFT_STEERING if delta_theta > 0.0 else RIGHT_STEERING
             next_pose = HybridPose(
                 x_cm=pose.x_cm,
                 y_cm=pose.y_cm,
                 theta_rad=normalize_planner_angle(pose.theta_rad + delta_theta),
             )
-            neighbors.append((next_pose, cfg.in_place_rotation_cost + abs(delta_theta) * 0.25))
+            steering_penalty = (
+                cfg.steering_change_penalty
+                if previous_steering not in (NO_STEERING, next_steering)
+                else 0.0
+            )
+            neighbors.append((
+                next_pose,
+                cfg.in_place_rotation_cost + abs(delta_theta) * 0.25 + steering_penalty,
+                previous_gear,
+                next_steering,
+            ))
 
         return neighbors
 
@@ -798,6 +1101,7 @@ class HybridAStarPlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig | None = None,
         goal_point_cm: tuple[float, float] | None = None,
+        costmap: np.ndarray | None = None,
     ) -> list[HybridPose]:
         """Search a kinematically valid trajectory."""
         cfg = config or self.config
@@ -808,16 +1112,18 @@ class HybridAStarPlanner:
             theta_rad=normalize_planner_angle(start_pose.theta_rad),
         )
 
-        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node, costmap)
         start_key = self.state_key(start_pose, cfg.theta_bins)
-        open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+        open_heap: list[tuple[float, float, int, SearchKey]] = []
         counter = 0
         start_h = self.heuristic_cost(start_pose, goal_node, geometry, dijkstra_heuristic, cfg, goal_point_cm)
-        heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+        heapq.heappush(open_heap, (self.weighted_heuristic(start_h, cfg), 0.0, counter, start_key))
 
-        came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-        pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
-        g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+        came_from: dict[SearchKey, SearchKey] = {}
+        pose_by_key: dict[SearchKey, HybridPose] = {start_key: start_pose}
+        g_score: dict[SearchKey, float] = {start_key: 0.0}
+        gear_by_key: dict[SearchKey, int] = {start_key: NO_GEAR}
+        steering_by_key: dict[SearchKey, int] = {start_key: NO_STEERING}
         expansions = 0
 
         while open_heap and expansions < cfg.max_expansions:
@@ -833,6 +1139,7 @@ class HybridAStarPlanner:
                 path = self.reconstruct_path(came_from, pose_by_key, current_key)
                 final_pose = self.pickup_aligned_pose_for_theta(goal_node, current_pose.theta_rad, geometry, goal_point_cm)
                 if collision_checker.is_pose_valid(final_pose):
+                    path = self.prune_path(path, collision_checker, costmap)
                     if math.hypot(final_pose.x_cm - current_pose.x_cm, final_pose.y_cm - current_pose.y_cm) > 1e-6:
                         path.append(final_pose)
                     else:
@@ -840,7 +1147,14 @@ class HybridAStarPlanner:
                     return path
 
             expansions += 1
-            for neighbor_pose, primitive_cost in self.expand_neighbors(current_pose, cfg):
+            current_gear = gear_by_key.get(current_key, NO_GEAR)
+            current_steering = steering_by_key.get(current_key, NO_STEERING)
+            for neighbor_pose, primitive_cost, next_gear, next_steering in self.expand_neighbors(
+                current_pose,
+                cfg,
+                current_gear,
+                current_steering,
+            ):
                 neighbor_pose = HybridPose(
                     x_cm=float(neighbor_pose.x_cm),
                     y_cm=float(neighbor_pose.y_cm),
@@ -855,20 +1169,22 @@ class HybridAStarPlanner:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
-                tentative_g = g_score[current_key] + primitive_cost
+                tentative_g = g_score[current_key] + primitive_cost + self.costmap_cost_for_pose(costmap, neighbor_pose)
                 if tentative_g >= g_score.get(neighbor_key, float("inf")):
                     continue
 
                 came_from[neighbor_key] = current_key
                 pose_by_key[neighbor_key] = neighbor_pose
                 g_score[neighbor_key] = tentative_g
+                gear_by_key[neighbor_key] = next_gear
+                steering_by_key[neighbor_key] = next_steering
                 heuristic = self.heuristic_cost(neighbor_pose, goal_node, geometry, dijkstra_heuristic, cfg, goal_point_cm)
                 heading_change = abs(normalize_planner_angle(neighbor_pose.theta_rad - current_pose.theta_rad))
                 counter += 1
                 heapq.heappush(
                     open_heap,
                     (
-                        tentative_g + heuristic + heading_change * 0.1,
+                        tentative_g + self.weighted_heuristic(heuristic, cfg) + heading_change * 0.1,
                         tentative_g,
                         counter,
                         neighbor_key,
@@ -889,6 +1205,7 @@ class HybridAStarPlanner:
         goal_pose: HybridPose,
         geometry: RobotGeometry,
         config: HybridPlannerConfig | None = None,
+        costmap: np.ndarray | None = None,
     ) -> list[HybridPose]:
         """Search a kinematically valid trajectory to a robot-origin pose."""
         cfg = config or self.config
@@ -911,20 +1228,25 @@ class HybridAStarPlanner:
             int(np.clip(round(goal_pose.x_cm), 0, raw_red_grid.shape[1] - 1)),
             int(np.clip(round(self.field.height_cm - goal_pose.y_cm), 0, raw_red_grid.shape[0] - 1)),
         )
-        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node, costmap)
         heading_tolerance_rad = max(math.pi / float(cfg.theta_bins), math.radians(8.0))
 
         start_key = self.state_key(start_pose, cfg.theta_bins)
-        open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+        open_heap: list[tuple[float, float, int, SearchKey]] = []
         counter = 0
         start_h = dijkstra_heuristic.cost_from_field_point((start_pose.x_cm, start_pose.y_cm), self.field)
         if not math.isfinite(start_h):
             start_h = math.hypot(goal_pose.x_cm - start_pose.x_cm, goal_pose.y_cm - start_pose.y_cm)
-        heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+        heapq.heappush(
+            open_heap,
+            (self.weighted_heuristic(max(0.0, start_h - cfg.goal_tolerance_cm), cfg), 0.0, counter, start_key),
+        )
 
-        came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-        pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
-        g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+        came_from: dict[SearchKey, SearchKey] = {}
+        pose_by_key: dict[SearchKey, HybridPose] = {start_key: start_pose}
+        g_score: dict[SearchKey, float] = {start_key: 0.0}
+        gear_by_key: dict[SearchKey, int] = {start_key: NO_GEAR}
+        steering_by_key: dict[SearchKey, int] = {start_key: NO_STEERING}
         expansions = 0
 
         while open_heap and expansions < cfg.max_expansions:
@@ -941,6 +1263,7 @@ class HybridAStarPlanner:
                 and heading_error <= heading_tolerance_rad
             ):
                 path = self.reconstruct_path(came_from, pose_by_key, current_key)
+                path = self.prune_path(path, collision_checker, costmap)
                 if math.hypot(goal_pose.x_cm - current_pose.x_cm, goal_pose.y_cm - current_pose.y_cm) > 1e-6:
                     path.append(goal_pose)
                 else:
@@ -948,7 +1271,14 @@ class HybridAStarPlanner:
                 return path
 
             expansions += 1
-            for neighbor_pose, primitive_cost in self.expand_neighbors(current_pose, cfg):
+            current_gear = gear_by_key.get(current_key, NO_GEAR)
+            current_steering = steering_by_key.get(current_key, NO_STEERING)
+            for neighbor_pose, primitive_cost, next_gear, next_steering in self.expand_neighbors(
+                current_pose,
+                cfg,
+                current_gear,
+                current_steering,
+            ):
                 neighbor_pose = HybridPose(
                     x_cm=float(neighbor_pose.x_cm),
                     y_cm=float(neighbor_pose.y_cm),
@@ -963,13 +1293,15 @@ class HybridAStarPlanner:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
-                tentative_g = g_score[current_key] + primitive_cost
+                tentative_g = g_score[current_key] + primitive_cost + self.costmap_cost_for_pose(costmap, neighbor_pose)
                 if tentative_g >= g_score.get(neighbor_key, float("inf")):
                     continue
 
                 came_from[neighbor_key] = current_key
                 pose_by_key[neighbor_key] = neighbor_pose
                 g_score[neighbor_key] = tentative_g
+                gear_by_key[neighbor_key] = next_gear
+                steering_by_key[neighbor_key] = next_steering
                 heuristic = dijkstra_heuristic.cost_from_field_point((neighbor_pose.x_cm, neighbor_pose.y_cm), self.field)
                 if not math.isfinite(heuristic):
                     heuristic = math.hypot(goal_pose.x_cm - neighbor_pose.x_cm, goal_pose.y_cm - neighbor_pose.y_cm)
@@ -978,7 +1310,8 @@ class HybridAStarPlanner:
                 heapq.heappush(
                     open_heap,
                     (
-                        tentative_g + max(0.0, heuristic - cfg.goal_tolerance_cm) + heading_error * 3.0,
+                        tentative_g
+                        + self.weighted_heuristic(max(0.0, heuristic - cfg.goal_tolerance_cm) + heading_error * 3.0, cfg),
                         tentative_g,
                         counter,
                         neighbor_key,
@@ -1031,6 +1364,34 @@ class HybridAStarPlanner:
                 best_heading_error = heading_error
         return best_goal, best_distance, best_heading_error
 
+    def standoff_goal_nodes(self, goals: list[PickupStandoffGoal], raw_red_grid: np.ndarray) -> list[tuple[int, int]]:
+        """Return grid nodes for valid standoff poses using top-left grid coordinates."""
+        nodes: list[tuple[int, int]] = []
+        for goal in goals:
+            standoff = goal.standoff_pose
+            nodes.append(
+                (
+                    int(np.clip(round(standoff.x_cm), 0, raw_red_grid.shape[1] - 1)),
+                    int(np.clip(round(self.field.height_cm - standoff.y_cm), 0, raw_red_grid.shape[0] - 1)),
+                )
+            )
+        return nodes
+
+    def standoff_heuristic_cost(
+        self,
+        pose: HybridPose,
+        standoff_goals: list[PickupStandoffGoal],
+        dijkstra_heuristic: GridDijkstraHeuristic,
+        config: HybridPlannerConfig,
+    ) -> float:
+        """Return obstacle-aware cost to the nearest valid standoff pose."""
+        cost = dijkstra_heuristic.cost_from_field_point((pose.x_cm, pose.y_cm), self.field)
+        closest_goal, distance_cm, heading_error = self.closest_pickup_standoff_goal(pose, standoff_goals)
+        del closest_goal
+        if not math.isfinite(cost):
+            cost = distance_cm
+        return max(0.0, cost - config.goal_tolerance_cm) + max(0.0, heading_error) * 3.0
+
     def search_pickup_standoff_goal(
         self,
         raw_red_grid: np.ndarray,
@@ -1039,6 +1400,7 @@ class HybridAStarPlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig | None = None,
         goal_point_cm: tuple[float, float] | None = None,
+        costmap: np.ndarray | None = None,
     ) -> list[HybridPose]:
         """Search to any valid pickup standoff pose around a ball."""
         if goal_point_cm is None:
@@ -1049,24 +1411,86 @@ class HybridAStarPlanner:
         if not standoff_goals:
             return []
 
+        attempts: tuple[tuple[str, HybridPlannerConfig, np.ndarray | None], ...] = (
+            ("standard", cfg, costmap),
+            (
+                "relaxed soft costs",
+                cfg,
+                None if costmap is None else costmap.astype(np.float32, copy=False) * 0.1,
+            ),
+            (
+                "desperation",
+                replace(
+                    cfg,
+                    heuristic_weight=1.0,
+                    flexible_standoff_heading_tolerance_rad=max(
+                        cfg.flexible_standoff_heading_tolerance_rad,
+                        math.radians(30.0),
+                    ),
+                ),
+                None,
+            ),
+        )
+        ball_x, ball_y = self.goal_to_field_metric_cm(goal_node, goal_point_cm)
+        print(
+            "Hybrid A* searching for valid standoff poses "
+            f"targeting ball at ({ball_x:.1f}, {ball_y:.1f}); "
+            f"{len(standoff_goals)} hard-valid standoff candidates."
+        )
+        for attempt_index, (attempt_name, attempt_config, attempt_costmap) in enumerate(attempts, start=1):
+            segment = self._search_pickup_standoff_goal_once(
+                raw_red_grid,
+                start_pose,
+                goal_node,
+                geometry,
+                attempt_config,
+                goal_point_cm,
+                attempt_costmap,
+                collision_checker,
+                standoff_goals,
+                attempt_name,
+            )
+            if segment:
+                if attempt_index > 1:
+                    print(f"Hybrid A* pickup standoff succeeded in fallback attempt {attempt_index}: {attempt_name}.")
+                return segment
+        return []
+
+    def _search_pickup_standoff_goal_once(
+        self,
+        raw_red_grid: np.ndarray,
+        start_pose: HybridPose,
+        goal_node: tuple[int, int],
+        geometry: RobotGeometry,
+        cfg: HybridPlannerConfig,
+        goal_point_cm: tuple[float, float],
+        costmap: np.ndarray | None,
+        collision_checker: RobotFootprintCollisionChecker,
+        standoff_goals: list[PickupStandoffGoal],
+        attempt_name: str,
+    ) -> list[HybridPose]:
+        """Run one pickup-standoff Hybrid A* attempt with a prepared heuristic/costmap."""
+
         start_pose = HybridPose(
             x_cm=float(start_pose.x_cm),
             y_cm=float(start_pose.y_cm),
             theta_rad=normalize_planner_angle(start_pose.theta_rad),
         )
-        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, goal_node)
+        standoff_nodes = self.standoff_goal_nodes(standoff_goals, raw_red_grid)
+        dijkstra_heuristic = GridDijkstraHeuristic(raw_red_grid, costmap=costmap, goal_nodes=standoff_nodes)
         heading_tolerance_rad = max(math.pi / float(cfg.theta_bins), math.radians(8.0))
 
         start_key = self.state_key(start_pose, cfg.theta_bins)
-        open_heap: list[tuple[float, float, int, tuple[int, int, int]]] = []
+        open_heap: list[tuple[float, float, int, SearchKey]] = []
         counter = 0
-        _start_goal, start_distance, start_heading_error = self.closest_pickup_standoff_goal(start_pose, standoff_goals)
-        start_h = max(0.0, start_distance - cfg.goal_tolerance_cm) + start_heading_error * 3.0
-        heapq.heappush(open_heap, (start_h, 0.0, counter, start_key))
+        start_h = self.standoff_heuristic_cost(start_pose, standoff_goals, dijkstra_heuristic, cfg)
+        heapq.heappush(open_heap, (self.weighted_heuristic(start_h, cfg), 0.0, counter, start_key))
 
-        came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-        pose_by_key: dict[tuple[int, int, int], HybridPose] = {start_key: start_pose}
-        g_score: dict[tuple[int, int, int], float] = {start_key: 0.0}
+        came_from: dict[SearchKey, SearchKey] = {}
+        pose_by_key: dict[SearchKey, HybridPose] = {start_key: start_pose}
+        g_score: dict[SearchKey, float] = {start_key: 0.0}
+        gear_by_key: dict[SearchKey, int] = {start_key: NO_GEAR}
+        steering_by_key: dict[SearchKey, int] = {start_key: NO_STEERING}
         expansions = 0
 
         while open_heap and expansions < cfg.max_expansions:
@@ -1075,6 +1499,14 @@ class HybridAStarPlanner:
                 continue
 
             current_pose = pose_by_key[current_key]
+            flexible_goal = self.flexible_pickup_goal(current_pose, goal_node, geometry, cfg, collision_checker, goal_point_cm)
+            if flexible_goal is not None:
+                path = self.reconstruct_path(came_from, pose_by_key, current_key)
+                path = self.prune_path(path, collision_checker, costmap)
+                terminal = self.terminal_pickup_sequence(path[-1], goal_node, geometry, collision_checker, goal_point_cm)
+                if terminal is None:
+                    continue
+                return self.append_terminal_pickup_sequence(path, terminal)
             closest_goal, distance_cm, heading_error = self.closest_pickup_standoff_goal(current_pose, standoff_goals)
             if (
                 collision_checker.is_pose_valid(current_pose)
@@ -1082,16 +1514,26 @@ class HybridAStarPlanner:
                 and heading_error <= heading_tolerance_rad
             ):
                 path = self.reconstruct_path(came_from, pose_by_key, current_key)
+                path = self.prune_path(path, collision_checker, costmap)
                 standoff_pose = closest_goal.standoff_pose
                 if math.hypot(standoff_pose.x_cm - current_pose.x_cm, standoff_pose.y_cm - current_pose.y_cm) > 1e-6:
                     path.append(standoff_pose)
                 else:
                     path[-1] = standoff_pose
-                path.append(closest_goal.final_pickup_pose)
-                return path
+                terminal = self.terminal_pickup_sequence(path[-1], goal_node, geometry, collision_checker, goal_point_cm)
+                if terminal is None:
+                    terminal = [closest_goal.final_pickup_pose]
+                return self.append_terminal_pickup_sequence(path, terminal)
 
             expansions += 1
-            for neighbor_pose, primitive_cost in self.expand_neighbors(current_pose, cfg):
+            current_gear = gear_by_key.get(current_key, NO_GEAR)
+            current_steering = steering_by_key.get(current_key, NO_STEERING)
+            for neighbor_pose, primitive_cost, next_gear, next_steering in self.expand_neighbors(
+                current_pose,
+                cfg,
+                current_gear,
+                current_steering,
+            ):
                 neighbor_pose = HybridPose(
                     x_cm=float(neighbor_pose.x_cm),
                     y_cm=float(neighbor_pose.y_cm),
@@ -1106,27 +1548,26 @@ class HybridAStarPlanner:
                     continue
 
                 neighbor_key = self.state_key(neighbor_pose, cfg.theta_bins)
-                tentative_g = g_score[current_key] + primitive_cost
+                tentative_g = g_score[current_key] + primitive_cost + self.costmap_cost_for_pose(costmap, neighbor_pose)
                 if tentative_g >= g_score.get(neighbor_key, float("inf")):
                     continue
 
                 came_from[neighbor_key] = current_key
                 pose_by_key[neighbor_key] = neighbor_pose
                 g_score[neighbor_key] = tentative_g
-                tube_point = self.tube_center_for_pose(neighbor_pose, geometry)
-                heuristic = dijkstra_heuristic.cost_from_field_point(tube_point, self.field)
-                _nearest_goal, pose_distance, pose_heading_error = self.closest_pickup_standoff_goal(neighbor_pose, standoff_goals)
-                if not math.isfinite(heuristic):
-                    heuristic = pose_distance
+                gear_by_key[neighbor_key] = next_gear
+                steering_by_key[neighbor_key] = next_steering
+                heuristic = self.standoff_heuristic_cost(neighbor_pose, standoff_goals, dijkstra_heuristic, cfg)
                 heading_change = abs(normalize_planner_angle(neighbor_pose.theta_rad - current_pose.theta_rad))
                 counter += 1
                 heapq.heappush(
                     open_heap,
                     (
                         tentative_g
-                        + max(0.0, heuristic - cfg.goal_tolerance_cm)
-                        + max(0.0, pose_distance - cfg.goal_tolerance_cm) * 0.25
-                        + pose_heading_error * 1.5
+                        + self.weighted_heuristic(
+                            heuristic,
+                            cfg,
+                        )
                         + heading_change * 0.1,
                         tentative_g,
                         counter,
@@ -1137,7 +1578,8 @@ class HybridAStarPlanner:
         if expansions >= cfg.max_expansions:
             print(
                 f"Hybrid A* search exhausted max nodes ({cfg.max_expansions}) "
-                f"for pickup standoff goal {goal_node} after {expansions} expansions."
+                f"for pickup standoff attempt '{attempt_name}' targeting ball node {goal_node} "
+                f"after {expansions} expansions."
             )
         return []
 
@@ -1228,6 +1670,16 @@ class GreedyRoutePlanner:
         """Return non-target ball clearance for the robot reference point."""
         return max(0.0, config.ball_radius_cm + geometry.width_cm * 0.5 + config.non_target_ball_extra_clearance_cm)
 
+    @staticmethod
+    def ball_cost_bands(config: HybridPlannerConfig, geometry: RobotGeometry) -> tuple[tuple[float, float], ...]:
+        """Return soft ball-cost bands as ``(radius_cm, cost)`` pairs from outside in."""
+        core_radius = GreedyRoutePlanner.ball_obstacle_radius_cm(config, geometry)
+        return (
+            (core_radius + max(0.0, config.ball_warning_clearance_cm), max(0.0, config.ball_warning_cost)),
+            (core_radius + max(0.0, config.ball_close_clearance_cm), max(0.0, config.ball_close_cost)),
+            (core_radius, max(0.0, config.ball_core_cost)),
+        )
+
     def ball_obstacle_targets(
         self,
         ball_targets: list[PlannedBallTarget],
@@ -1239,45 +1691,33 @@ class GreedyRoutePlanner:
             return []
         return [target for target in ball_targets if target.track_id != selected_target.track_id]
 
-    def grid_with_ball_obstacles(
+    def ball_costmap_for_target(
         self,
         grid: np.ndarray,
         ball_targets: list[PlannedBallTarget],
         selected_target: PlannedBallTarget,
         geometry: RobotGeometry,
         config: HybridPlannerConfig,
-    ) -> tuple[np.ndarray, list[PlannedBallTarget]]:
-        """Add inflated non-target ball obstacles while leaving the selected ball reachable."""
+    ) -> tuple[np.ndarray | None, list[PlannedBallTarget]]:
+        """Build a soft non-target ball costmap while leaving hard obstacles unchanged."""
         obstacle_targets = self.ball_obstacle_targets(ball_targets, selected_target, config)
         if not obstacle_targets:
-            return grid, []
+            return None, []
 
-        inflated = grid.copy()
-        radius_cm = int(math.ceil(self.ball_obstacle_radius_cm(config, geometry)))
+        costmap = np.zeros(grid.shape, dtype=np.float32)
+        bands = self.ball_cost_bands(config, geometry)
         for obstacle in obstacle_targets:
             center = (
-                int(np.clip(round(obstacle.x_cm), 0, inflated.shape[1] - 1)),
-                int(np.clip(round(self.hybrid_planner.field.height_cm - obstacle.y_cm), 0, inflated.shape[0] - 1)),
+                int(np.clip(round(obstacle.x_cm), 0, grid.shape[1] - 1)),
+                int(np.clip(round(self.hybrid_planner.field.height_cm - obstacle.y_cm), 0, grid.shape[0] - 1)),
             )
-            cv2.circle(inflated, center, radius_cm, 1, -1, cv2.LINE_AA)
-        return (inflated > 0).astype(np.uint8), obstacle_targets
-
-    def target_is_inside_ball_obstacle(
-        self,
-        selected_target: PlannedBallTarget,
-        obstacle_targets: list[PlannedBallTarget],
-        geometry: RobotGeometry,
-        config: HybridPlannerConfig,
-    ) -> bool:
-        """Return true when hard ball avoidance blocks the selected ball itself."""
-        if not obstacle_targets:
-            return False
-        radius_cm = self.ball_obstacle_radius_cm(config, geometry)
-        for obstacle in obstacle_targets:
-            distance_cm = math.hypot(selected_target.x_cm - obstacle.x_cm, selected_target.y_cm - obstacle.y_cm)
-            if distance_cm <= radius_cm + config.goal_tolerance_cm:
-                return True
-        return False
+            for radius_cm, cost in bands:
+                if radius_cm <= 0.0 or cost <= 0.0:
+                    continue
+                layer = np.zeros_like(costmap)
+                cv2.circle(layer, center, int(math.ceil(radius_cm)), float(cost), -1, cv2.LINE_AA)
+                np.maximum(costmap, layer, out=costmap)
+        return costmap, obstacle_targets
 
     def plan_unload_segment(
         self,
@@ -1314,6 +1754,7 @@ class GreedyRoutePlanner:
         target: PlannedBallTarget,
         geometry: RobotGeometry,
         config: HybridPlannerConfig,
+        costmap: np.ndarray | None = None,
     ) -> list[HybridPose]:
         """Plan to one ball, using deterministic diagonal pickup for tight corners."""
         goal_point_cm = (target.x_cm, target.y_cm)
@@ -1324,6 +1765,7 @@ class GreedyRoutePlanner:
             geometry,
             config,
             goal_point_cm=goal_point_cm,
+            costmap=costmap,
         )
         if corner_segment:
             return corner_segment
@@ -1334,6 +1776,7 @@ class GreedyRoutePlanner:
             geometry,
             config,
             goal_point_cm=goal_point_cm,
+            costmap=costmap,
         )
         if standoff_segment:
             return standoff_segment
@@ -1344,6 +1787,7 @@ class GreedyRoutePlanner:
             geometry,
             config,
             goal_point_cm=goal_point_cm,
+            costmap=costmap,
         )
 
     def plan_target_segment_with_ball_avoidance(
@@ -1355,17 +1799,51 @@ class GreedyRoutePlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig,
     ) -> tuple[list[HybridPose], list[PlannedBallTarget], str]:
-        """Plan to ``target`` with all other balls inserted as inflated hard obstacles."""
-        obstacle_grid, obstacle_targets = self.grid_with_ball_obstacles(grid, all_targets, target, geometry, config)
-        mode = "hard" if obstacle_targets else ("disabled" if not config.avoid_non_target_balls_enabled else "hard")
-        if self.target_is_inside_ball_obstacle(target, obstacle_targets, geometry, config):
-            print(
-                f"Hybrid A* target {target.track_id} ({target.label}) is inside the inflated "
-                "non-target ball obstacle layer; deferring to contact-allowed fallback."
-            )
-            return [], obstacle_targets, "crowded"
-        segment = self.plan_target_segment(obstacle_grid, current_pose, target, geometry, config)
+        """Plan to ``target`` with all other balls represented as soft traversal costs."""
+        ball_costmap, obstacle_targets = self.ball_costmap_for_target(grid, all_targets, target, geometry, config)
+        mode = "soft" if obstacle_targets else ("disabled" if not config.avoid_non_target_balls_enabled else "soft")
+        segment = self.plan_target_segment(grid, current_pose, target, geometry, config, costmap=ball_costmap)
         return segment, obstacle_targets, mode
+
+    @staticmethod
+    def closest_route_index(route: list[HybridPose], pose: HybridPose) -> int | None:
+        """Return the closest route node index for a planned semantic checkpoint."""
+        if not route:
+            return None
+        best_index = 0
+        best_distance = float("inf")
+        for index, point in enumerate(route):
+            distance = math.hypot(point.x_cm - pose.x_cm, point.y_cm - pose.y_cm)
+            if distance < best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def classify_route_segments(
+        self,
+        route: list[HybridPose],
+        pickup_poses: list[HybridPose],
+    ) -> list[RouteSegmentType]:
+        """Classify route edges for velocity profiling and terminal pickup rendering."""
+        segment_types = self.hybrid_planner.default_segment_types(route)
+        if not segment_types:
+            return segment_types
+
+        for index, (start, end) in enumerate(zip(route[:-1], route[1:])):
+            if math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm) <= 1e-6:
+                segment_types[index] = RouteSegmentType.PIVOT
+
+        for pickup_pose in pickup_poses:
+            pickup_index = self.closest_route_index(route, pickup_pose)
+            if pickup_index is None or pickup_index <= 0:
+                continue
+            segment_types[pickup_index - 1] = RouteSegmentType.CREEP
+            if pickup_index >= 2:
+                pivot_start = route[pickup_index - 2]
+                pivot_end = route[pickup_index - 1]
+                if math.hypot(pivot_end.x_cm - pivot_start.x_cm, pivot_end.y_cm - pivot_start.y_cm) <= 1e-6:
+                    segment_types[pickup_index - 2] = RouteSegmentType.PIVOT
+        return segment_types
 
     def plan(
         self,
@@ -1386,15 +1864,14 @@ class GreedyRoutePlanner:
         pickup_poses: list[HybridPose] = []
         active_target: PlannedBallTarget | None = None
         active_ball_obstacles: list[PlannedBallTarget] = []
-        ball_avoidance_mode = "disabled" if not cfg.avoid_non_target_balls_enabled else "hard"
+        ball_avoidance_mode = "disabled" if not cfg.avoid_non_target_balls_enabled else "soft"
 
         orange_targets = sorted(
             [target for target in unvisited if target.label == "orange"],
             key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
         )
-        blocked_orange_targets: list[tuple[PlannedBallTarget, list[PlannedBallTarget]]] = []
         for orange_target in orange_targets:
-            orange_segment, orange_obstacles, _orange_mode = self.plan_target_segment_with_ball_avoidance(
+            orange_segment, orange_obstacles, orange_mode = self.plan_target_segment_with_ball_avoidance(
                 grid,
                 unvisited,
                 current_pose,
@@ -1407,31 +1884,14 @@ class GreedyRoutePlanner:
                     f"Hybrid A* could not route to orange target {orange_target.track_id}; "
                     "keeping orange first and trying next orange target."
                 )
-                blocked_orange_targets.append((orange_target, orange_obstacles))
                 continue
             active_target = orange_target
             active_ball_obstacles = orange_obstacles
+            ball_avoidance_mode = orange_mode
             route.extend(orange_segment[1:])
             current_pose = orange_segment[-1]
             pickup_poses.append(current_pose)
             break
-
-        if orange_targets and active_target is None and cfg.allow_last_resort_orange_contact:
-            for orange_target, orange_obstacles in blocked_orange_targets:
-                orange_segment = self.plan_target_segment(grid, current_pose, orange_target, geometry, cfg)
-                if orange_segment:
-                    active_target = orange_target
-                    active_ball_obstacles = orange_obstacles
-                    ball_avoidance_mode = "orange forced first"
-                    route.extend(orange_segment[1:])
-                    current_pose = orange_segment[-1]
-                    pickup_poses.append(current_pose)
-                    print(
-                        f"Hybrid A* routed to orange target {orange_target.track_id} "
-                        "with non-target ball contact allowed."
-                    )
-                    break
-                print(f"Hybrid A* could not route to orange target {orange_target.track_id} even as last resort.")
 
         if orange_targets and active_target is None:
             return RoutePlan(points=[], active_target=None, pickup_poses=[])
@@ -1452,7 +1912,7 @@ class GreedyRoutePlanner:
             blocked_candidates: list[tuple[PlannedBallTarget, list[PlannedBallTarget]]] = []
 
             for candidate in nearest_candidates:
-                segment, obstacle_targets, _mode = self.plan_target_segment_with_ball_avoidance(
+                segment, obstacle_targets, mode = self.plan_target_segment_with_ball_avoidance(
                     grid,
                     unvisited,
                     current_pose,
@@ -1464,31 +1924,14 @@ class GreedyRoutePlanner:
                     chosen_target = candidate
                     chosen_segment = segment
                     chosen_obstacles = obstacle_targets
+                    if ball_avoidance_mode != "soft":
+                        ball_avoidance_mode = mode
                     break
                 blocked_candidates.append((candidate, obstacle_targets))
                 print(
                     f"Hybrid A* could not route to target {candidate.track_id} "
                     f"({candidate.label}); trying next target."
                 )
-
-            if chosen_target is None and cfg.avoid_non_target_balls_enabled:
-                for candidate, obstacle_targets in blocked_candidates:
-                    segment = self.plan_target_segment(grid, current_pose, candidate, geometry, cfg)
-                    if segment:
-                        chosen_target = candidate
-                        chosen_segment = segment
-                        chosen_obstacles = obstacle_targets
-                        if ball_avoidance_mode != "orange forced first":
-                            ball_avoidance_mode = "ball contact fallback"
-                        print(
-                            f"Hybrid A* routed to target {candidate.track_id} ({candidate.label}) "
-                            "with non-target ball contact allowed."
-                        )
-                        break
-                    print(
-                        f"Hybrid A* could not route to target {candidate.track_id} "
-                        f"({candidate.label}) even with non-target ball contact allowed."
-                    )
 
             if chosen_target is None:
                 break
@@ -1510,6 +1953,9 @@ class GreedyRoutePlanner:
         else:
             route = []
 
+        segment_types = self.classify_route_segments(route, pickup_poses)
+        segment_speeds_pct = self.hybrid_planner.segment_speeds_for_types(segment_types, cfg)
+
         return RoutePlan(
             points=route,
             active_target=active_target,
@@ -1519,6 +1965,8 @@ class GreedyRoutePlanner:
             ball_obstacles=active_ball_obstacles,
             ball_obstacle_radius_cm=self.ball_obstacle_radius_cm(cfg, geometry) if cfg.avoid_non_target_balls_enabled else 0.0,
             ball_avoidance_mode=ball_avoidance_mode,
+            segment_types=segment_types,
+            segment_speeds_pct=segment_speeds_pct,
         )
 
 
@@ -1559,10 +2007,23 @@ class RoutePlanningFacade:
             rotation_deltas_rad=self.planner_config.rotation_deltas_rad,
             reverse_cost_multiplier=self.planner_config.reverse_cost_multiplier,
             in_place_rotation_cost=self.planner_config.in_place_rotation_cost,
+            heuristic_weight=self.planner_config.heuristic_weight,
+            gear_shift_penalty=self.planner_config.gear_shift_penalty,
+            steering_change_penalty=self.planner_config.steering_change_penalty,
+            transit_speed_pct=self.planner_config.transit_speed_pct,
+            pivot_speed_pct=self.planner_config.pivot_speed_pct,
+            creep_speed_pct=self.planner_config.creep_speed_pct,
+            flexible_standoff_max_cm=self.planner_config.flexible_standoff_max_cm,
+            flexible_standoff_min_cm=self.planner_config.flexible_standoff_min_cm,
+            flexible_standoff_heading_tolerance_rad=self.planner_config.flexible_standoff_heading_tolerance_rad,
             avoid_non_target_balls_enabled=self.planner_config.avoid_non_target_balls_enabled,
             ball_radius_cm=self.planner_config.ball_radius_cm,
             non_target_ball_extra_clearance_cm=self.planner_config.non_target_ball_extra_clearance_cm,
-            allow_last_resort_orange_contact=self.planner_config.allow_last_resort_orange_contact,
+            ball_core_cost=self.planner_config.ball_core_cost,
+            ball_close_cost=self.planner_config.ball_close_cost,
+            ball_warning_cost=self.planner_config.ball_warning_cost,
+            ball_close_clearance_cm=self.planner_config.ball_close_clearance_cm,
+            ball_warning_clearance_cm=self.planner_config.ball_warning_clearance_cm,
         )
         self.hybrid_planner = HybridAStarPlanner(self.field, self.robot_config, self.hybrid_config)
         self.legacy_planner = LegacyAStarPlanner()

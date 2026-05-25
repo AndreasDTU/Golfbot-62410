@@ -512,6 +512,8 @@ def render_sandbox(state: SandboxState, route_plan: RoutePlan | None) -> np.ndar
     red_zones = build_red_zones(state)
     route_points = None if route_plan is None else route_plan.points
     pickup_poses = None if route_plan is None else route_plan.pickup_poses
+    segment_types = None if route_plan is None else route_plan.segment_types
+    segment_speeds = None if route_plan is None else route_plan.segment_speeds_pct
     unload_pose = None if route_plan is None else route_plan.unload_pose
     unload_goal = None if route_plan is None else route_plan.unload_goal_cm
     camera_center = (
@@ -526,6 +528,8 @@ def render_sandbox(state: SandboxState, route_plan: RoutePlan | None) -> np.ndar
         camera_center_pixels=camera_center,
         route_points_cm=route_points,
         route_pickup_poses_cm=pickup_poses,
+        route_segment_types=segment_types,
+        route_segment_speeds_pct=segment_speeds,
         route_unload_pose_cm=unload_pose,
         route_unload_goal_cm=unload_goal,
         robot_pose=state.robot_pose,

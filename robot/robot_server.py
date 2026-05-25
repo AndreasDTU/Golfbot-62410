@@ -15,8 +15,11 @@ Commands:
   pipe up <units> [speed] - Raise the pipe N units
   pipe down <units> [speed] - Lower the pipe N units
   pipe stop               - Stop pipe motor immediately
-  pickup                  - Pickup a ball
-  dropoff                 - Dropoff all balls
+  collector_travel_position - Raise collector to safe driving position
+  pickup_assist           - Small pipe jiggle for collecting one ball
+  unload_full_cycle       - Full pipe cycle for unloading balls at the goal
+  pickup                  - Compatibility alias for pickup_assist
+  dropoff                 - Compatibility alias for unload_full_cycle
   stop                    - Stop all drive motors
   ping                    - Health check, returns 'pong'
 """
@@ -41,6 +44,12 @@ MM_PER_UNIT = 9.9664                 # 1 unit = 10mm (1cm). Adjust to recalibrat
 # Pipe motor: degrees of motor rotation per unit of pipe travel
 # Tune this based on your pipe mechanism's gear ratio / spool size
 PIPE_DEGREES_PER_UNIT = 45.0
+COLLECTOR_TRAVEL_UNITS = 22
+COLLECTOR_TRAVEL_SPEED = 50
+PICKUP_ASSIST_UNITS = 2
+PICKUP_ASSIST_SPEED = 35
+UNLOAD_FULL_CYCLE_UNITS = 22
+UNLOAD_FULL_CYCLE_SPEED = 75
 
 # --- Motor setup ---
 tank         = MoveTank(OUTPUT_B, OUTPUT_C)
@@ -80,7 +89,7 @@ def cmd_move(parts, forward=True):
     motor_deg = units_to_degrees(units)
     spd = speed if forward else -speed
     tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(-spd),
-                        degrees=motor_deg, brake=True, block=False)
+                        degrees=motor_deg, brake=True, block=True)
     direction = "forward" if forward else "backward"
     return "ok: moved {} {} units".format(direction, units)
 
@@ -95,11 +104,11 @@ def cmd_turn(parts):
     if angle >= 0:
         # Turn right: left motor forward, right motor backward
         tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(spd),
-                            degrees=motor_deg, brake=True, block=False)
+                            degrees=motor_deg, brake=True, block=True)
     else:
         # Turn left: right motor forward, left motor backward
         tank.on_for_degrees(left_speed=SpeedPercent(spd), right_speed=SpeedPercent(-spd),
-                            degrees=motor_deg, brake=True, block=False)
+                            degrees=motor_deg, brake=True, block=True)
     return "ok: turned {} degrees".format(angle)
 
 
@@ -139,9 +148,21 @@ def cmd_pipe(parts):
     )
     return "ok: pipe {} {} units".format(subaction, units)
 
-def cmd_pickup():
-    units = 20
-    speed = 35
+def cmd_collector_travel_position():
+    """Move collector toward its raised travel position before route following."""
+    motor_deg = COLLECTOR_TRAVEL_UNITS * PIPE_DEGREES_PER_UNIT
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(-COLLECTOR_TRAVEL_SPEED),
+        degrees=motor_deg,
+        brake=True,
+        block=True
+    )
+    return "ok: collector travel position"
+
+def cmd_pickup_assist():
+    """Small local pipe motion for collection; never a full unload stroke."""
+    units = PICKUP_ASSIST_UNITS
+    speed = PICKUP_ASSIST_SPEED
     motor_deg = units * PIPE_DEGREES_PER_UNIT
 
     pipe_motor.on_for_degrees(
@@ -152,17 +173,18 @@ def cmd_pickup():
     )
 
     pipe_motor.on_for_degrees(
-        speed=SpeedPercent(-100),
+        speed=SpeedPercent(-speed),
         degrees=motor_deg,
         brake=True,
         block=True
     )
 
-    return "ok: pipe pickup completed"
+    return "ok: pipe pickup assist completed"
 
-def cmd_dropoff():
-    units = 22
-    speed = 75
+def cmd_unload_full_cycle():
+    """Full pipe motion for unloading at the goal only."""
+    units = UNLOAD_FULL_CYCLE_UNITS
+    speed = UNLOAD_FULL_CYCLE_SPEED
     motor_deg = units * PIPE_DEGREES_PER_UNIT
 
     pipe_motor.on_for_degrees(
@@ -181,7 +203,7 @@ def cmd_dropoff():
         block=True
     )
     
-    return "ok: pipe pickup completed"
+    return "ok: pipe unload full cycle completed"
 
 
 def cmd_stop():
@@ -213,10 +235,12 @@ def handle_command(cmd):
             return cmd_pipe(parts)
         elif action == "stop":
             return cmd_stop()
-        elif action == "pickup":
-            return cmd_pickup()
-        elif action == "dropoff":
-            return cmd_dropoff()
+        elif action == "collector_travel_position":
+            return cmd_collector_travel_position()
+        elif action in ("pickup_assist", "pickup"):
+            return cmd_pickup_assist()
+        elif action in ("unload_full_cycle", "dropoff"):
+            return cmd_unload_full_cycle()
         else:
             return "error: unknown command '{}'".format(action)
     except Exception as e:

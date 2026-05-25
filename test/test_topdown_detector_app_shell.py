@@ -56,6 +56,18 @@ class TopdownDetectorAppShellTests(unittest.TestCase):
         self.assertEqual(args.image, Path(__file__).resolve().parents[1] / "Bane_undistorted_transformed_close_balls.png")
         self.assertIsNone(args.video)
         self.assertFalse(args.drive)
+        self.assertFalse(args.step)
+
+    def test_parse_args_accepts_step_flag_without_enabling_drive(self) -> None:
+        original_argv = __import__("sys").argv
+        try:
+            __import__("sys").argv = ["topdown_object_detector.py", "--step"]
+            args = TopdownDetectorApp.parse_args()
+        finally:
+            __import__("sys").argv = original_argv
+
+        self.assertTrue(args.step)
+        self.assertFalse(args.drive)
 
 
 if __name__ == "__main__":

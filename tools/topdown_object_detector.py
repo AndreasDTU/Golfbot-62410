@@ -10,6 +10,7 @@ dispatch.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import multiprocessing as mp
@@ -31,11 +32,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from pathfinding.planner import RoutePlanningFacade
-from robot.control import DriveSafetyGuard, WheelCommandController, distance_to_route_goal_cm
+from robot.control import DriveSafetyGuard, distance_to_route_goal_cm, route_goal_pose
 from robot.controller import RobotController
 from robot.io import UdpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
-from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose, WheelCommand
+from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose
 from vision.calibration import HomographyCalibrator
 from vision.config import AppConfig
 from vision.debug import DebugRenderer
@@ -55,8 +56,33 @@ class PickupExecutionState(Enum):
 
     NAVIGATION = "NAVIGATION"
     BLIND_APPROACH = "BLIND_APPROACH"
-    PICKUP = "PICKUP"
+    PICKUP_ASSIST = "PICKUP_ASSIST"
     REPLAN = "REPLAN"
+
+
+class UnloadExecutionState(Enum):
+    """Minimal terminal unload states for the live drive loop."""
+
+    IDLE = "IDLE"
+    READY = "UNLOAD_READY"
+    UNLOADING_FIRST = "UNLOADING_FIRST"
+    PIPE_SHAKE = "PIPE_SHAKE"
+    UNLOADING_SECOND = "UNLOADING_SECOND"
+    COMPLETE = "UNLOAD_COMPLETE"
+    FAILED = "UNLOAD_FAILED"
+
+
+class CollectorPositionState(Enum):
+    """Best-known collector height state for autonomous drive gating."""
+
+    UNKNOWN = "UNKNOWN"
+    TRAVEL = "TRAVEL"
+    PICKUP_ASSIST = "PICKUP_ASSIST"
+    UNLOADING = "UNLOADING"
+
+
+BALL_COUNT_HISTORY_FRAMES = 15
+INITIAL_BALL_COUNT_STABLE_S = 0.75
 
 
 @dataclass
@@ -80,6 +106,19 @@ class RuntimeState:
     pickup_state: PickupExecutionState = PickupExecutionState.NAVIGATION
     pickup_state_started_s: float = 0.0
     pickup_command_fired: bool = False
+    near_zone_move_fired: bool = False
+    unload_state: UnloadExecutionState = UnloadExecutionState.IDLE
+    unload_command_fired: bool = False
+    unload_started_s: float = 0.0
+    collector_state: CollectorPositionState = CollectorPositionState.UNKNOWN
+    initial_total_balls: int | None = None
+    balls_collected: int = 0
+    stable_visible_balls: int | None = None
+    step_mode_enabled: bool = False
+    step_drive_paused: bool = False
+    visible_ball_count_history: deque[tuple[float, int]] = field(
+        default_factory=lambda: deque(maxlen=BALL_COUNT_HISTORY_FRAMES)
+    )
 
     def clear_route(self) -> None:
         self.route_plan = RoutePlan(points=[], active_target=None, pickup_poses=[])
@@ -96,6 +135,7 @@ class RuntimeState:
         self.pickup_state = PickupExecutionState.NAVIGATION
         self.pickup_state_started_s = 0.0
         self.pickup_command_fired = False
+        self.near_zone_move_fired = False
 
 
 @dataclass(frozen=True)
@@ -266,6 +306,8 @@ class TopdownDetectorApp:
         self.latest_params: dict[str, object] | None = None
         self.pickup_thread: threading.Thread | None = None
         self.pickup_last_error: str = ""
+        self.unload_thread: threading.Thread | None = None
+        self.unload_last_error: str = ""
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
@@ -329,6 +371,11 @@ class TopdownDetectorApp:
             "--drive",
             action="store_true",
             help="Enable non-blocking UDP dispatch of autonomous left/right wheel speeds.",
+        )
+        parser.add_argument(
+            "--step",
+            action="store_true",
+            help="With --drive, pause before each autonomous target and advance on the 'n' key.",
         )
         return parser.parse_args()
 
@@ -512,72 +559,377 @@ class TopdownDetectorApp:
             include_final=False,
         )
 
-    def _start_pickup_command_thread(self) -> None:
+    def _pickup_goal_pose(self) -> HybridPose | None:
+        if self.runtime.robot_pose is None or len(self.runtime.route_plan.points) < 2:
+            return None
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+        )
+        if tracking_error is None:
+            return None
+        return route_goal_pose(
+            self.runtime.route_plan.points,
+            tracking_error,
+            self.runtime.route_plan.pickup_poses,
+            include_final=False,
+        )
+
+    def current_visible_ball_count(self, result: VisionFrameResult) -> int:
+        """Return current raw detector ball count before smoothing/tracking persistence."""
+        return len(result.white_balls) + len(result.orange_balls)
+
+    def update_ball_count_reconciliation(self, result: VisionFrameResult, now_s: float) -> None:
+        """Track global visible ball count and correct optimistic pickup misses."""
+        current_visible_balls = self.current_visible_ball_count(result)
+        self.runtime.visible_ball_count_history.append((now_s, current_visible_balls))
+        history = list(self.runtime.visible_ball_count_history)
+        if len(history) < BALL_COUNT_HISTORY_FRAMES:
+            return
+        counts = [count for _timestamp, count in history]
+        if len(set(counts)) != 1:
+            return
+
+        stable_count = counts[-1]
+        stable_duration_s = history[-1][0] - history[0][0]
+        if stable_duration_s < INITIAL_BALL_COUNT_STABLE_S:
+            return
+
+        self.runtime.stable_visible_balls = stable_count
+        if self.runtime.initial_total_balls is None:
+            self.runtime.initial_total_balls = stable_count
+            self.runtime.balls_collected = 0
+            return
+
+        expected_visible_balls = max(0, self.runtime.initial_total_balls - self.runtime.balls_collected)
+        if stable_count > expected_visible_balls and self.runtime.balls_collected > 0:
+            self.runtime.balls_collected -= 1
+
+    def ball_count_initialized(self) -> bool:
+        """Return true when the global ball baseline is ready for autonomous drive."""
+        return self.runtime.initial_total_balls is not None
+
+    def mark_optimistic_pickup_complete(self) -> None:
+        """Optimistically count a completed TCP pickup so the route can move on."""
+        if self.runtime.initial_total_balls is None:
+            return
+        self.runtime.balls_collected = min(
+            self.runtime.initial_total_balls,
+            self.runtime.balls_collected + 1,
+        )
+
+    def optimistic_collection_complete(self) -> bool:
+        """Return true when the optimistic pickup count says unloading can begin."""
+        return (
+            self.runtime.initial_total_balls is not None
+            and self.runtime.balls_collected >= self.runtime.initial_total_balls
+        )
+
+    def draw_ball_reconciliation_overlay(self, frame: np.ndarray) -> None:
+        """Draw global pickup reconciliation counters on the debug frame."""
+        initial = "?" if self.runtime.initial_total_balls is None else str(self.runtime.initial_total_balls)
+        stable = "?" if self.runtime.stable_visible_balls is None else str(self.runtime.stable_visible_balls)
+        text = f"Balls initial:{initial}  collected:{self.runtime.balls_collected}  visible stable:{stable}"
+        cv2.putText(
+            frame,
+            text,
+            (20, 92),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    def draw_step_pause_overlay(self, frame: np.ndarray) -> None:
+        """Draw a high-visibility operator prompt when step drive is paused."""
+        if not (self.runtime.step_mode_enabled and self.runtime.step_drive_paused):
+            return
+        text = "PAUSED - PRESS 'N' TO CONTINUE"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.1
+        thickness = 3
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        x = max(20, (frame.shape[1] - text_width) // 2)
+        y = max(60, text_height + 28)
+        cv2.rectangle(
+            frame,
+            (x - 18, y - text_height - 18),
+            (x + text_width + 18, y + baseline + 18),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.rectangle(
+            frame,
+            (x - 18, y - text_height - 18),
+            (x + text_width + 18, y + baseline + 18),
+            (0, 255, 255),
+            3,
+        )
+        cv2.putText(
+            frame,
+            text,
+            (x, y),
+            font,
+            font_scale,
+            (0, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    def release_step_drive_pause(self, drive_runtime: DriveRuntime | None) -> None:
+        """Allow one step-mode target run after the operator presses next."""
+        if not self.runtime.step_mode_enabled:
+            return
+        if not self.ball_count_initialized():
+            if drive_runtime is not None:
+                drive_runtime.last_message = "step waiting for stable ball count"
+            return
+        if self.runtime.robot_pose is None:
+            if drive_runtime is not None:
+                drive_runtime.last_message = "step waiting for robot pose"
+            return
+        if len(self.runtime.route_plan.points) < 2:
+            if drive_runtime is not None:
+                drive_runtime.last_message = "step waiting for route"
+            return
+        self.runtime.step_drive_paused = False
+        if drive_runtime is not None:
+            drive_runtime.last_message = "step released"
+
+    def pause_step_drive_after_target(self, drive_runtime: DriveRuntime) -> None:
+        """Return step-mode drive to its safe waiting state after pickup completion."""
+        if not self.runtime.step_mode_enabled:
+            return
+        self.runtime.step_drive_paused = True
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.STOPPED, "step target complete; press n")
+
+    def ensure_collector_travel_position(self, drive_runtime: DriveRuntime) -> bool:
+        """Ensure the collector is in the raised travel position before wheel motion."""
+        if self.runtime.unload_state != UnloadExecutionState.IDLE:
+            return False
+        if drive_runtime.dispatcher is None or self.runtime.collector_state == CollectorPositionState.TRAVEL:
+            return False
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.STOPPED, "collector travel position")
+        try:
+            RobotController(self.config.drive.robot_ip).collector_travel_position()
+            self.runtime.collector_state = CollectorPositionState.TRAVEL
+        except Exception as exc:
+            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"collector travel failed: {exc}")
+        return True
+
+    def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
+        """Stop UDP tracking, align with TCP turn, then finish with TCP encoder move."""
+        if self.runtime.near_zone_move_fired:
+            return True
+        distance_cm = self._pickup_distance_to_goal_cm()
+        if not math.isfinite(distance_cm) or distance_cm > self.config.drive.near_zone_cm:
+            return False
+
+        self.runtime.near_zone_move_fired = True
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.PRECISE_MOVE, "near-zone TCP align")
+        goal = self._pickup_goal_pose()
+        if goal is None:
+            drive_runtime.stop(DriveControlState.NO_ROUTE, "near-zone goal missing")
+            self.runtime.pickup_state = PickupExecutionState.REPLAN
+            self.runtime.pickup_state_started_s = time.perf_counter()
+            return True
+        remaining_cm = math.hypot(
+            float(goal.x_cm) - float(self.runtime.robot_pose.x_cm),
+            float(goal.y_cm) - float(self.runtime.robot_pose.y_cm),
+        )
+        if not math.isfinite(remaining_cm):
+            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, "near-zone distance invalid")
+            return True
+
+        target_heading_rad = math.atan2(
+            float(goal.y_cm) - float(self.runtime.robot_pose.y_cm),
+            float(goal.x_cm) - float(self.runtime.robot_pose.x_cm),
+        )
+        heading_error_deg = math.degrees(normalize_angle(target_heading_rad - float(self.runtime.robot_pose.heading_rad)))
+        tcp_turn_deg = -heading_error_deg
+
+        if remaining_cm <= 0.5:
+            self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
+            self.runtime.pickup_state_started_s = time.perf_counter()
+            return True
+
+        try:
+            controller = RobotController(self.config.drive.robot_ip)
+            if abs(tcp_turn_deg) > 0.5:
+                drive_runtime.last_message = f"TCP turn {tcp_turn_deg:.1f}deg"
+                controller.turn(
+                    round(tcp_turn_deg, 1),
+                    int(round(self.config.drive.near_zone_turn_speed_pct)),
+                )
+            drive_runtime.last_message = f"TCP move {remaining_cm:.1f}cm"
+            controller.move(
+                round(remaining_cm, 1),
+                int(round(self.config.drive.near_zone_move_speed_pct)),
+            )
+            self.mark_optimistic_pickup_complete()
+            drive_runtime.stop(DriveControlState.PICKUP, "TCP align/move complete")
+            self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
+            self.runtime.pickup_state_started_s = time.perf_counter()
+        except Exception as exc:
+            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"TCP align/move failed: {exc}")
+            self.runtime.pickup_state = PickupExecutionState.REPLAN
+            self.runtime.pickup_state_started_s = time.perf_counter()
+        return True
+
+    def _start_pickup_assist_command_thread(self) -> None:
         if self.pickup_thread is not None and self.pickup_thread.is_alive():
             return
 
-        def run_pickup() -> None:
+        def run_pickup_assist() -> None:
             try:
-                RobotController(self.config.drive.robot_ip).pickup()
+                RobotController(self.config.drive.robot_ip).pickup_assist()
                 self.pickup_last_error = ""
             except Exception as exc:
                 self.pickup_last_error = str(exc)
 
-        self.pickup_thread = threading.Thread(target=run_pickup, name="ev3-pickup-command", daemon=True)
+        self.pickup_thread = threading.Thread(target=run_pickup_assist, name="ev3-pickup-assist-command", daemon=True)
         self.pickup_thread.start()
 
     def update_pickup_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
-        """Run the blind-spot pickup handoff and return True when it owns motor output."""
+        """Run the near-zone TCP pickup handoff and return True when it owns motor output."""
         state = self.runtime.pickup_state
         if state == PickupExecutionState.NAVIGATION and drive_runtime.dispatcher is None:
             return False
         if state == PickupExecutionState.NAVIGATION:
-            if self._pickup_distance_to_goal_cm() >= self.config.drive.blind_approach_trigger_cm:
-                return False
-            self.runtime.pickup_state = PickupExecutionState.BLIND_APPROACH
-            self.runtime.pickup_state_started_s = now_s
-            self.runtime.pickup_command_fired = False
-            self.drive_guard.wheel_controller.reset()
-            state = self.runtime.pickup_state
+            return self._run_near_zone_precise_move(drive_runtime)
 
-        if state == PickupExecutionState.BLIND_APPROACH:
-            elapsed_s = now_s - self.runtime.pickup_state_started_s
-            if elapsed_s < self.config.drive.blind_approach_duration_s:
-                creep_speed = WheelCommandController.target_speed_for_distance(0.0, self.config.drive)
-                drive_runtime.last_command = WheelCommand(creep_speed, creep_speed)
-                drive_runtime.state = DriveControlState.BLIND_APPROACH
-                drive_runtime.last_message = "open-loop creep"
-                if drive_runtime.dispatcher is None:
-                    drive_runtime.last_message = "blind approach: no dispatcher"
-                    return True
-                if not drive_runtime.dispatcher.send_wheel_speeds(creep_speed, creep_speed, force=True):
-                    drive_runtime.state = DriveControlState.DISPATCH_ERROR
-                    drive_runtime.last_message = drive_runtime.dispatcher.last_error
-                    drive_runtime.last_command = WheelCommand(0.0, 0.0)
-                return True
-
-            drive_runtime.stop(DriveControlState.PICKUP, "pickup actuator")
-            self.runtime.pickup_state = PickupExecutionState.PICKUP
-            self.runtime.pickup_state_started_s = now_s
-            state = self.runtime.pickup_state
-
-        if state == PickupExecutionState.PICKUP:
-            drive_runtime.stop(DriveControlState.PICKUP, "pickup actuator")
+        if state == PickupExecutionState.PICKUP_ASSIST:
+            drive_runtime.stop(DriveControlState.PICKUP, "pickup assist")
             if not self.runtime.pickup_command_fired:
-                self._start_pickup_command_thread()
+                self.runtime.collector_state = CollectorPositionState.PICKUP_ASSIST
+                self._start_pickup_assist_command_thread()
                 self.runtime.pickup_command_fired = True
+            if self.pickup_thread is not None and self.pickup_thread.is_alive():
+                return True
+            self.runtime.collector_state = CollectorPositionState.TRAVEL
             self.runtime.pickup_state = PickupExecutionState.REPLAN
             self.runtime.pickup_state_started_s = now_s
             return True
 
         if state == PickupExecutionState.REPLAN:
-            self.runtime.clear_route()
             self.drive_guard.wheel_controller.reset()
+            if self.optimistic_collection_complete() and self.runtime.route_plan.unload_pose is not None:
+                drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; routing to unload")
+                self.runtime.reset_pickup_state()
+                return True
+            self.runtime.clear_route()
             drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; requesting new route")
             self.runtime.reset_pickup_state()
             return True
 
         return False
+
+    def _unload_endpoint_reached(self) -> bool:
+        if (
+            self.runtime.robot_pose is None
+            or self.runtime.route_plan.unload_pose is None
+            or len(self.runtime.route_plan.points) < 2
+            or self.runtime.pickup_state != PickupExecutionState.NAVIGATION
+            or not self.optimistic_collection_complete()
+        ):
+            return False
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+        )
+        if tracking_error is None:
+            return False
+        next_goal = route_goal_pose(
+            self.runtime.route_plan.points,
+            tracking_error,
+            self.runtime.route_plan.pickup_poses,
+            include_final=True,
+        )
+        if next_goal is None:
+            return False
+        unload_pose = self.runtime.route_plan.unload_pose
+        if math.hypot(next_goal.x_cm - unload_pose.x_cm, next_goal.y_cm - unload_pose.y_cm) > self.config.planner.goal_tolerance_cm:
+            return False
+        distance_cm = math.hypot(
+            self.runtime.robot_pose.x_cm - unload_pose.x_cm,
+            self.runtime.robot_pose.y_cm - unload_pose.y_cm,
+        )
+        return distance_cm <= self.config.drive.unload_trigger_distance_cm
+
+    def _start_unload_sequence_thread(self) -> None:
+        if self.unload_thread is not None and self.unload_thread.is_alive():
+            return
+
+        def run_unload_sequence() -> None:
+            controller: RobotController | None = None
+            try:
+                controller = RobotController(self.config.drive.robot_ip)
+                self.runtime.collector_state = CollectorPositionState.UNLOADING
+                self.runtime.unload_state = UnloadExecutionState.UNLOADING_FIRST
+                print("Unload: first unload_full_cycle")
+                controller.unload_full_cycle()
+
+                self.runtime.unload_state = UnloadExecutionState.PIPE_SHAKE
+                shake_cycles = max(0, int(self.config.drive.unload_pipe_shake_cycles))
+                shake_units = float(self.config.drive.unload_pipe_shake_units)
+                shake_speed = int(round(self.config.drive.unload_pipe_shake_speed))
+                for cycle in range(shake_cycles):
+                    print(f"Unload: pipe shake cycle {cycle + 1}/{shake_cycles}")
+                    controller.pipe_down(shake_units, shake_speed)
+                    controller.pipe_up(shake_units, shake_speed)
+
+                self.runtime.unload_state = UnloadExecutionState.UNLOADING_SECOND
+                print("Unload: second unload_full_cycle")
+                controller.unload_full_cycle()
+                controller.pipe_stop()
+                self.runtime.collector_state = CollectorPositionState.UNKNOWN
+                self.runtime.unload_state = UnloadExecutionState.COMPLETE
+                self.unload_last_error = ""
+                print("Unload: complete")
+            except Exception as exc:
+                self.unload_last_error = str(exc)
+                self.runtime.unload_state = UnloadExecutionState.FAILED
+                print(f"Unload: failed: {exc}")
+                if controller is not None:
+                    try:
+                        controller.pipe_stop()
+                    except Exception as stop_exc:
+                        print(f"Unload: pipe_stop after failure also failed: {stop_exc}")
+                self.runtime.collector_state = CollectorPositionState.UNKNOWN
+
+        self.unload_thread = threading.Thread(target=run_unload_sequence, name="ev3-unload-sequence", daemon=True)
+        self.unload_thread.start()
+
+    def update_unload_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
+        """Run the terminal pipe-only unload sequence once the unload endpoint is reached."""
+        if drive_runtime.dispatcher is None:
+            return False
+        state = self.runtime.unload_state
+        if state in (UnloadExecutionState.COMPLETE, UnloadExecutionState.FAILED):
+            self.drive_guard.wheel_controller.reset()
+            message = state.value if state == UnloadExecutionState.COMPLETE else f"{state.value}: {self.unload_last_error}"
+            drive_runtime.stop(DriveControlState.STOPPED, message)
+            return True
+        if self.unload_thread is not None and self.unload_thread.is_alive():
+            drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
+            return True
+        if self.runtime.unload_command_fired:
+            return False
+        if not self._unload_endpoint_reached():
+            return False
+
+        self.runtime.unload_command_fired = True
+        self.runtime.unload_started_s = now_s
+        self.runtime.unload_state = UnloadExecutionState.READY
+        self.drive_guard.wheel_controller.reset()
+        drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
+        print("Unload: endpoint reached; wheels stopped; starting pipe-only unload sequence")
+        self._start_unload_sequence_thread()
+        return True
 
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         return [
@@ -668,6 +1020,7 @@ class TopdownDetectorApp:
         self,
         ball_signature: tuple[tuple[int, str, int, int], ...],
         unload_extension_cm: float,
+        current_start_signature: tuple[int, int, int],
     ) -> None:
         """Install a finished worker route only when it still matches the current scene."""
         completed = self.async_route_planner.poll_completed()
@@ -675,6 +1028,8 @@ class TopdownDetectorApp:
             return
         request = completed.request
         if request.ball_signature != ball_signature or abs(request.unload_extension_cm - unload_extension_cm) > 1e-6:
+            return
+        if request.start_signature != current_start_signature:
             return
         if completed.error is not None:
             self.robot_runtime.warning = f"Route worker failed: {completed.error}"
@@ -796,7 +1151,11 @@ class TopdownDetectorApp:
             return
 
         ball_signature = self.ball_cache_signature(result.smoothed_ball_coordinates)
-        self.accept_completed_route_if_current(ball_signature, geometry.unload_extension_cm)
+        self.accept_completed_route_if_current(
+            ball_signature,
+            geometry.unload_extension_cm,
+            self.route_start_signature(start_pose),
+        )
 
         if self.cached_route_is_valid(start_pose, result.smoothed_ball_coordinates, params):
             return
@@ -950,6 +1309,8 @@ class TopdownDetectorApp:
             )
             combined = np.hstack(self.renderer.resize_to_match_height(placeholder, schematic))
             self.renderer.draw_drive_status(combined, drive_runtime)
+            self.draw_ball_reconciliation_overlay(combined)
+            self.draw_step_pause_overlay(combined)
             waiting_text = (
                 "Waiting for manual top-down selection"
                 if self.homography_calibrator is not None
@@ -1001,6 +1362,8 @@ class TopdownDetectorApp:
             camera_center_pixels=(float(params["camera_center_x"]), float(params["camera_center_y"])),
             route_points_cm=self.runtime.route_plan.points,
             route_pickup_poses_cm=self.runtime.route_plan.pickup_poses,
+            route_segment_types=self.runtime.route_plan.segment_types,
+            route_segment_speeds_pct=self.runtime.route_plan.segment_speeds_pct,
             route_unload_pose_cm=self.runtime.route_plan.unload_pose,
             route_unload_goal_cm=self.runtime.route_plan.unload_goal_cm,
             selected_start_cm=self.runtime.selected_start_cm,
@@ -1018,6 +1381,8 @@ class TopdownDetectorApp:
         )
         combined = np.hstack(self.renderer.resize_to_match_height(annotated, schematic))
         self.renderer.draw_drive_status(combined, drive_runtime)
+        self.draw_ball_reconciliation_overlay(combined)
+        self.draw_step_pause_overlay(combined)
         if video_paused:
             self.renderer.draw_video_pause_overlay(combined)
         return combined, masks, schematic
@@ -1255,6 +1620,18 @@ class TopdownDetectorApp:
         """Map arrow/space keys to the legacy direct non-blocking wheel commands."""
         if drive_runtime is None or drive_runtime.dispatcher is None:
             return
+        if (key & 0xFF) == ord(" "):
+            drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
+            return
+        if (
+            self.runtime.pickup_state != PickupExecutionState.NAVIGATION
+            or self.runtime.unload_state != UnloadExecutionState.IDLE
+            or self.runtime.collector_state in (
+                CollectorPositionState.PICKUP_ASSIST,
+                CollectorPositionState.UNLOADING,
+            )
+        ):
+            return
         if key in self.config.drive.key_up_arrow:
             drive_runtime.dispatcher.send_wheel_speeds(
                 self.config.drive.manual_move_speed,
@@ -1279,8 +1656,6 @@ class TopdownDetectorApp:
                 -self.config.drive.manual_turn_speed,
                 force=True,
             )
-        elif (key & 0xFF) == ord(" "):
-            drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
 
     def handle_key(self, key: int, drive_runtime: DriveRuntime | None = None) -> bool:
         if key in (255, -1):
@@ -1299,6 +1674,8 @@ class TopdownDetectorApp:
                 self.homography_calibrator.start_manual_calibration()
                 self.reset_detection_state()
         self.handle_robot_calibration_key(ascii_key)
+        if ascii_key == ord("n"):
+            self.release_step_drive_pause(drive_runtime)
         if ascii_key == ord("w"):
             self.save_heading_tuning_to_robot_calibration(float(self.read_params()["heading_tuning_rad"]))
         self.handle_manual_robot_key(key, drive_runtime)
@@ -1368,6 +1745,7 @@ class TopdownDetectorApp:
         mode_label: str,
         frame_delay_ms: int,
         drive_enabled: bool,
+        step_enabled: bool = False,
         resize_to_size: tuple[int, int] | None = None,
     ) -> int:
         if not self.config.paths.calibration_file.exists():
@@ -1384,11 +1762,15 @@ class TopdownDetectorApp:
             self.config.camera.topdown_warp_size,
         )
         drive_runtime, dispatcher = self._make_drive_runtime(drive_enabled)
+        self.runtime.step_mode_enabled = bool(drive_enabled and step_enabled)
+        self.runtime.step_drive_paused = self.runtime.step_mode_enabled
         if drive_enabled:
             print(
                 f"Integrated drive dispatch enabled: UDP "
                 f"{self.config.drive.robot_ip}:{self.config.drive.robot_udp_port}"
             )
+            if self.runtime.step_mode_enabled:
+                print("Step drive mode enabled: press 'n' to release each target run.")
         else:
             print("Integrated drive controller running with dispatch disabled; motors stay halted.")
         self.create_trackbars(self.config.camera.topdown_warp_size)
@@ -1476,6 +1858,8 @@ class TopdownDetectorApp:
                 if preprocessed.transform_matrix is None or preprocessed.normalized is None:
                     self.reset_detection_state()
                     result = self.build_missing_transform_result(raw_frame, preprocessed, params)
+                    if self.runtime.step_mode_enabled:
+                        self.runtime.step_drive_paused = True
                     drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for top-down calibration")
                     combined, masks, schematic = self.render(result, params, fps=0.0, drive_runtime=drive_runtime)
                     processing_ms = (time.perf_counter() - start) * 1000.0
@@ -1512,25 +1896,56 @@ class TopdownDetectorApp:
 
                 self.update_robot_pose(preprocessed.normalized, params)
                 result = self.process_preprocessed_topdown(pipeline, raw_frame, preprocessed, params)
-                self.update_route(result, params)
                 now = time.perf_counter()
+                self.update_ball_count_reconciliation(result, now)
+                self.update_route(result, params)
                 frame_dt_s = max(1e-6, now - last_tick)
-                pickup_owns_control = self.update_pickup_state(drive_runtime, now)
-                if not pickup_owns_control:
-                    self.drive_guard.enforce_xte_guard_before_replan(
-                        self.runtime.robot_pose,
-                        self.runtime.route_plan.points,
-                        drive_runtime,
-                        clear_route_cache=self.runtime.clear_route,
+                robot_geometry = self.robot_estimator.robot_geometry_from_params(params)
+                drive_waiting_for_ball_count = (
+                    drive_runtime.dispatcher is not None
+                    and not self.ball_count_initialized()
+                )
+                if drive_waiting_for_ball_count:
+                    if self.runtime.step_mode_enabled:
+                        self.runtime.step_drive_paused = True
+                    self.drive_guard.wheel_controller.reset()
+                    drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for stable ball count")
+                elif self.runtime.step_mode_enabled and self.runtime.step_drive_paused:
+                    self.drive_guard.wheel_controller.reset()
+                    drive_runtime.stop(DriveControlState.STOPPED, "step paused; press n")
+                else:
+                    collector_owns_control = self.ensure_collector_travel_position(drive_runtime)
+                    pickup_state_before = self.runtime.pickup_state
+                    pickup_owns_control = False if collector_owns_control else self.update_pickup_state(drive_runtime, now)
+                    unload_owns_control = (
+                        False
+                        if collector_owns_control or pickup_owns_control
+                        else self.update_unload_state(drive_runtime, now)
                     )
-                    self.drive_guard.update_drive_control(
-                        self.runtime.robot_pose,
-                        self.runtime.route_plan.points,
-                        drive_runtime,
-                        clear_route_cache=self.runtime.clear_route,
-                        local_goal_poses=self.runtime.route_plan.pickup_poses,
-                        dt_s=frame_dt_s,
+                    pickup_completed = (
+                        self.runtime.step_mode_enabled
+                        and pickup_state_before == PickupExecutionState.REPLAN
+                        and self.runtime.pickup_state == PickupExecutionState.NAVIGATION
                     )
+                    if pickup_completed:
+                        self.pause_step_drive_after_target(drive_runtime)
+                        pickup_owns_control = True
+                    if not collector_owns_control and not pickup_owns_control and not unload_owns_control:
+                        self.drive_guard.enforce_xte_guard_before_replan(
+                            self.runtime.robot_pose,
+                            self.runtime.route_plan.points,
+                            drive_runtime,
+                            clear_route_cache=self.runtime.clear_route,
+                        )
+                        self.drive_guard.update_drive_control(
+                            self.runtime.robot_pose,
+                            self.runtime.route_plan.points,
+                            drive_runtime,
+                            clear_route_cache=self.runtime.clear_route,
+                            local_goal_poses=self.runtime.route_plan.pickup_poses,
+                            dt_s=frame_dt_s,
+                            robot_geometry=robot_geometry,
+                        )
                 fps = 1.0 / frame_dt_s
                 last_tick = now
                 combined, masks, schematic = self.render(result, params, fps=fps, drive_runtime=drive_runtime)
@@ -1573,7 +1988,15 @@ class TopdownDetectorApp:
             self.async_route_planner.close()
         return 0
 
-    def run_live_mode(self, camera_index: int, balance: float, width: int, height: int, drive_enabled: bool) -> int:
+    def run_live_mode(
+        self,
+        camera_index: int,
+        balance: float,
+        width: int,
+        height: int,
+        drive_enabled: bool,
+        step_enabled: bool = False,
+    ) -> int:
         if not self.config.paths.calibration_file.exists():
             print(f"Calibration file not found: {self.config.paths.calibration_file}", file=sys.stderr)
             return 1
@@ -1589,11 +2012,18 @@ class TopdownDetectorApp:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width if width > 0 else calibration_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height if height > 0 else calibration_height)
         try:
-            return self.run_stream(cap, f"camera {camera_index}", balance, "Live", 1, drive_enabled)
+            return self.run_stream(cap, f"camera {camera_index}", balance, "Live", 1, drive_enabled, step_enabled)
         finally:
             cap.release()
 
-    def run_video_mode(self, video_path: Path, balance: float, resize_to_calibration: bool, drive_enabled: bool) -> int:
+    def run_video_mode(
+        self,
+        video_path: Path,
+        balance: float,
+        resize_to_calibration: bool,
+        drive_enabled: bool,
+        step_enabled: bool = False,
+    ) -> int:
         if not video_path.exists():
             print(f"Video file not found: {video_path}", file=sys.stderr)
             return 1
@@ -1613,7 +2043,16 @@ class TopdownDetectorApp:
 
             resize_to_size = UndistortionProvider.load_calibration_image_size(self.config.paths.calibration_file)
         try:
-            return self.run_stream(cap, str(video_path), balance, "Video", frame_delay_ms, drive_enabled, resize_to_size)
+            return self.run_stream(
+                cap,
+                str(video_path),
+                balance,
+                "Video",
+                frame_delay_ms,
+                drive_enabled,
+                step_enabled,
+                resize_to_size,
+            )
         finally:
             cap.release()
 
@@ -1622,9 +2061,22 @@ class TopdownDetectorApp:
         image_path = args.image or self.config.paths.default_image
         try:
             if args.live or self.config.camera.use_live_feed:
-                return self.run_live_mode(args.camera_index, args.balance, args.width, args.height, bool(args.drive))
+                return self.run_live_mode(
+                    args.camera_index,
+                    args.balance,
+                    args.width,
+                    args.height,
+                    bool(args.drive),
+                    bool(args.step),
+                )
             if args.video is not None:
-                return self.run_video_mode(args.video, args.balance, args.resize_video_to_calibration, bool(args.drive))
+                return self.run_video_mode(
+                    args.video,
+                    args.balance,
+                    args.resize_video_to_calibration,
+                    bool(args.drive),
+                    bool(args.step),
+                )
             return self.run_image_mode(image_path)
         finally:
             cv2.destroyAllWindows()

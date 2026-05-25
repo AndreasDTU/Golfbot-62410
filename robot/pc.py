@@ -35,14 +35,13 @@ def main():
         cmd = parts[0].lower()
 
         # --- Local commands ---
-        match cmd:
-            case 'quit':
-                print("\nExiting...")
-                break
-            case _:
+        if cmd == 'quit':
+            print("\nExiting...")
+            break
+
         # --- Robot commands (forwarded over socket) ---
-                response = send(sock, raw)
-                print(response)
+        response = send(sock, raw)
+        print(response)
 
     sock.close()
 

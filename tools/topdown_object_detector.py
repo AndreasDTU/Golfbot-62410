@@ -1366,6 +1366,8 @@ class TopdownDetectorApp:
             route_segment_speeds_pct=self.runtime.route_plan.segment_speeds_pct,
             route_unload_pose_cm=self.runtime.route_plan.unload_pose,
             route_unload_goal_cm=self.runtime.route_plan.unload_goal_cm,
+            route_ball_obstacles=self.runtime.route_plan.ball_obstacles,
+            route_ball_obstacle_radius_cm=self.runtime.route_plan.ball_obstacle_radius_cm,
             selected_start_cm=self.runtime.selected_start_cm,
             selected_ball_track_id=self.runtime.selected_ball_track_id,
             robot_pose=self.runtime.robot_pose,

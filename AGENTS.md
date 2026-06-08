@@ -327,6 +327,36 @@ Agents SHOULD also update relevant docs when architecture or behavior changes:
 - `docs/CAMERA_WORKFLOW_OVERVIEW.md` for calibration/camera workflow.
 - `docs/TEST_OVERVIEW.md` for test workflow changes.
 
+## Graphify workflow
+
+This repository uses Graphify for codebase navigation. Graphify output lives in
+`graphify-out/`, especially:
+
+- `graphify-out/GRAPH_REPORT.md`
+- `graphify-out/graph.json`
+- `graphify-out/graph.html`
+
+Before answering architecture questions, planning larger changes, or tracing
+dependencies, read `graphify-out/GRAPH_REPORT.md` and use
+`graphify-out/graph.json` as a navigation/context aid.
+
+Run:
+
+```bash
+graphify update .
+```
+
+after major structural changes, such as:
+
+- adding, removing, or moving files,
+- larger refactors,
+- changes to central classes or modules,
+- after `git pull`, merge, or branch switching when the graph may be stale.
+
+Do not run `graphify update .` after every tiny edit or one-line change.
+Graphify output is a navigation aid, not absolute truth; verify important
+conclusions against the actual source files.
+
 ---
 
 # Safety & Failure Handling

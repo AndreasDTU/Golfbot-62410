@@ -2,6 +2,24 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-05-28
+
+### Added
+
+- Added schematic debug overlays for soft non-target ball avoidance.
+  - `vision/debug.py` now draws faint yellow avoidance halos from
+    `RoutePlan.ball_obstacles` and `ball_obstacle_radius_cm`.
+  - Planned route samples that enter a ball avoidance radius mark that ball with
+    a red warning ring and `COLLISION` label.
+  - Collision checks now evaluate the route chronologically and remove
+    intentional pickup balls only after their own tube-center pickup segment is
+    reached, so future targets remain active obstacles until their segment.
+  - Collision detection checks full route line segments against avoidance
+    circles instead of only sampled route points, catching sparse-waypoint
+    drive-throughs.
+  - The live detector and pathfinding sandbox now pass route ball-avoidance
+    metadata into the schematic renderer.
+
 ## 2026-05-24
 
 ### Added

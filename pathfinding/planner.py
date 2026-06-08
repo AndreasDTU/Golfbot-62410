@@ -1854,10 +1854,22 @@ class GreedyRoutePlanner:
         config: HybridPlannerConfig | None = None,
     ) -> RoutePlan:
         """Build an orange-first Hybrid A* collection route."""
-        if not ball_targets:
-            return RoutePlan(points=[], active_target=None, pickup_poses=[])
-
         cfg = config or self.config
+        if not ball_targets:
+            unload_segment, unload_pose, unload_goal_cm = self.plan_unload_segment(grid, start_pose, geometry, cfg)
+            segment_types = self.classify_route_segments(unload_segment, [])
+            segment_speeds_pct = self.hybrid_planner.segment_speeds_for_types(segment_types, cfg)
+            return RoutePlan(
+                points=unload_segment,
+                active_target=None,
+                pickup_poses=[],
+                unload_pose=unload_pose,
+                unload_goal_cm=unload_goal_cm,
+                ball_avoidance_mode="disabled" if not cfg.avoid_non_target_balls_enabled else "soft",
+                segment_types=segment_types,
+                segment_speeds_pct=segment_speeds_pct,
+            )
+
         unvisited = list(ball_targets)
         current_pose = start_pose
         route: list[HybridPose] = [current_pose]

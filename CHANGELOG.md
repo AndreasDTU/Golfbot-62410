@@ -6,6 +6,23 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Added
 
+- Added state-driven route continuation and unload routing for autonomous
+  collection.
+  - Pickup completion now keeps the cached global route when the visible
+    remaining balls are still a stationary subset of the original plan.
+  - Cached routes are invalidated only when remaining balls move across the
+    configured target bucket, a new/hidden ball appears, robot drift exceeds
+    route tolerance, or geometry metadata changes.
+  - Empty visible-ball frames with `balls_collected > 0` now submit an explicit
+    direct-to-unload route instead of waiting for ball targets.
+  - The route planner treats an empty target list as a direct unload request
+    when invoked by that state.
+
+- Added a two-frame near-zone TCP pickup handoff.
+  - The robot now performs the initial TCP turn, lets the next camera frame
+    refresh pose/ball coordinates, applies a `>1 cm` lateral micro-turn
+    correction if needed, and only then executes the final TCP move.
+
 - Added schematic debug overlays for soft non-target ball avoidance.
   - `vision/debug.py` now draws faint yellow avoidance halos from
     `RoutePlan.ball_obstacles` and `ball_obstacle_radius_cm`.
@@ -36,6 +53,10 @@ All notable larger additions and behavioral changes to this repository should be
     distance in `DriveConfig`.
 
 ### Changed
+
+- Removed automatic autonomous `collector_travel_position()` gating from the
+  live drive loop. The collector safe position is now an operator precondition;
+  the command remains available for manual use.
 
 - Switched the autonomous `--drive` command transport to TCP-only.
   - Replaced the PC-side wheel dispatcher with a TCP wheel dispatcher that

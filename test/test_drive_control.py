@@ -17,6 +17,7 @@ from tools.topdown_object_detector import (
 )
 from vision.config import DriveConfig, FieldConfig
 from vision.debug import DebugRenderer
+from vision.models import SmoothedBallCoordinate
 
 
 class FakeDispatcher:
@@ -253,12 +254,21 @@ class DriveControlTests(unittest.TestCase):
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
             owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
+            app.runtime.robot_pose = RobotPose(
+                x_cm=6.0,
+                y_cm=0.0,
+                heading_rad=0.0,
+                tube_x_cm=0.0,
+                tube_y_cm=0.0,
+            )
+            owns_control_after_vision = app.update_pickup_state(drive_runtime, now_s=1.1)
 
         self.assertTrue(owns_control)
+        self.assertTrue(owns_control_after_vision)
         self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
         self.assertEqual(events[0], ("tcp_lr", 0.0, None))
         self.assertEqual(events[1], ("turn", 10.0, int(round(app.config.drive.near_zone_turn_speed_pct))))
-        self.assertEqual(events[2], ("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))))
+        self.assertIn(("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
         self.assertEqual(app.runtime.balls_collected, 1)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
 
@@ -329,36 +339,37 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(events, ["pickup_assist"])
         self.assertEqual(app.runtime.collector_state, CollectorPositionState.TRAVEL)
 
-    def test_drive_start_requires_collector_travel_position_before_route_following(self) -> None:
-        app = TopdownDetectorApp()
-        dispatcher = FakeDispatcher()
-        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
-        events = []
-
-        class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
-                self.robot_ip = robot_ip
-
-            def collector_travel_position(self) -> str:
-                events.append("collector_travel_position")
-                return "OK"
-
-        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
-            owns_control = app.ensure_collector_travel_position(drive_runtime)
-
-        self.assertTrue(owns_control)
-        self.assertEqual(events, ["collector_travel_position"])
-        self.assertEqual(app.runtime.collector_state, CollectorPositionState.TRAVEL)
-        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
-
-    def test_route_following_not_blocked_after_collector_travel_confirmed(self) -> None:
+    def test_pickup_replan_state_keeps_cached_route_when_remaining_balls_match_plan(self) -> None:
         app = TopdownDetectorApp()
         drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
-        app.runtime.collector_state = CollectorPositionState.TRAVEL
+        app.runtime.initial_total_balls = 2
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(20.0, 0.0, 0.0),
+            ],
+            active_target=SimpleNamespace(track_id=1),
+            pickup_poses=[HybridPose(10.0, 0.0, 0.0), HybridPose(20.0, 0.0, 0.0)],
+        )
+        app.runtime.route_cache_ball_signature = (
+            (1, "white", 2, 0),
+            (2, "white", 4, 0),
+        )
+        app.runtime.route_cache_unload_extension_cm = 15.0
+        app.runtime.route_cache_target_id = 1
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(2, "white", (0, 0), (0, 0), 4, 20.0, 0.0),
+        ]
 
-        owns_control = app.ensure_collector_travel_position(drive_runtime)
+        owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
 
-        self.assertFalse(owns_control)
+        self.assertTrue(owns_control)
+        self.assertTrue(app.runtime.route_plan.points)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertEqual(drive_runtime.last_message, "pickup complete; continuing cached route")
 
     def test_unload_endpoint_runs_pipe_only_double_unload_once(self) -> None:
         app = TopdownDetectorApp()

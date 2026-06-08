@@ -10,7 +10,7 @@ dispatch.
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 import json
 import math
 import multiprocessing as mp
@@ -107,6 +107,8 @@ class RuntimeState:
     pickup_state_started_s: float = 0.0
     pickup_command_fired: bool = False
     near_zone_move_fired: bool = False
+    near_zone_turn_fired: bool = False
+    near_zone_correction_fired: bool = False
     unload_state: UnloadExecutionState = UnloadExecutionState.IDLE
     unload_command_fired: bool = False
     unload_started_s: float = 0.0
@@ -136,6 +138,8 @@ class RuntimeState:
         self.pickup_state_started_s = 0.0
         self.pickup_command_fired = False
         self.near_zone_move_fired = False
+        self.near_zone_turn_fired = False
+        self.near_zone_correction_fired = False
 
 
 @dataclass(frozen=True)
@@ -705,52 +709,60 @@ class TopdownDetectorApp:
         self.drive_guard.wheel_controller.reset()
         drive_runtime.stop(DriveControlState.STOPPED, "step target complete; press n")
 
-    def ensure_collector_travel_position(self, drive_runtime: DriveRuntime) -> bool:
-        """Ensure the collector is in the raised travel position before wheel motion."""
-        if self.runtime.unload_state != UnloadExecutionState.IDLE:
-            return False
-        if drive_runtime.dispatcher is None or self.runtime.collector_state == CollectorPositionState.TRAVEL:
-            return False
-        self.drive_guard.wheel_controller.reset()
-        drive_runtime.stop(DriveControlState.STOPPED, "collector travel position")
-        try:
-            RobotController(self.config.drive.robot_ip).collector_travel_position()
-            self.runtime.collector_state = CollectorPositionState.TRAVEL
-        except Exception as exc:
-            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"collector travel failed: {exc}")
-        return True
+    def _pickup_target_body_pose(self, goal: HybridPose, params: dict[str, object] | None = None) -> tuple[float, float]:
+        """Return the current best body-center target for the next pickup."""
+        if not self.runtime.latest_smoothed_balls:
+            return float(goal.x_cm), float(goal.y_cm)
+        params = params or self.latest_params
+        if params is None:
+            return float(goal.x_cm), float(goal.y_cm)
+        geometry = self.robot_estimator.robot_geometry_from_params(params)
+        planned_ball_x, planned_ball_y = self.route_facade.hybrid_planner.tube_center_for_pose(goal, geometry)
+        nearest = min(
+            self.runtime.latest_smoothed_balls,
+            key=lambda ball: math.hypot(ball.cm_x - planned_ball_x, ball.cm_y - planned_ball_y),
+        )
+        if math.hypot(nearest.cm_x - planned_ball_x, nearest.cm_y - planned_ball_y) > (
+            self.config.planner.route_target_move_invalidate_cm * 2.0
+        ):
+            return float(goal.x_cm), float(goal.y_cm)
+        heading = self.runtime.robot_pose.heading_rad if self.runtime.robot_pose is not None else goal.theta_rad
+        forward = (math.cos(heading), math.sin(heading))
+        right = (math.sin(heading), -math.cos(heading))
+        return (
+            nearest.cm_x - forward[0] * geometry.tube_forward_cm - right[0] * geometry.tube_right_cm,
+            nearest.cm_y - forward[1] * geometry.tube_forward_cm - right[1] * geometry.tube_right_cm,
+        )
+
+    @staticmethod
+    def _target_offset_in_robot_frame(robot_pose: RobotPose, target_x_cm: float, target_y_cm: float) -> tuple[float, float]:
+        dx = target_x_cm - robot_pose.x_cm
+        dy = target_y_cm - robot_pose.y_cm
+        forward_cm = dx * math.cos(robot_pose.heading_rad) + dy * math.sin(robot_pose.heading_rad)
+        lateral_cm = dx * math.sin(robot_pose.heading_rad) - dy * math.cos(robot_pose.heading_rad)
+        return forward_cm, lateral_cm
 
     def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
-        """Stop TCP route tracking, align with TCP turn, then finish with TCP encoder move."""
+        """Stop TCP route tracking, then run turn -> vision correction -> final encoder move."""
         if self.runtime.near_zone_move_fired:
             return True
         distance_cm = self._pickup_distance_to_goal_cm()
         if not math.isfinite(distance_cm) or distance_cm > self.config.drive.near_zone_cm:
             return False
 
-        self.runtime.near_zone_move_fired = True
         self.drive_guard.wheel_controller.reset()
         drive_runtime.stop(DriveControlState.PRECISE_MOVE, "near-zone TCP align")
         goal = self._pickup_goal_pose()
-        if goal is None:
+        if goal is None or self.runtime.robot_pose is None:
             drive_runtime.stop(DriveControlState.NO_ROUTE, "near-zone goal missing")
             self.runtime.pickup_state = PickupExecutionState.REPLAN
             self.runtime.pickup_state_started_s = time.perf_counter()
             return True
-        remaining_cm = math.hypot(
-            float(goal.x_cm) - float(self.runtime.robot_pose.x_cm),
-            float(goal.y_cm) - float(self.runtime.robot_pose.y_cm),
-        )
+        target_x_cm, target_y_cm = self._pickup_target_body_pose(goal)
+        remaining_cm = math.hypot(target_x_cm - self.runtime.robot_pose.x_cm, target_y_cm - self.runtime.robot_pose.y_cm)
         if not math.isfinite(remaining_cm):
             drive_runtime.stop(DriveControlState.DISPATCH_ERROR, "near-zone distance invalid")
             return True
-
-        target_heading_rad = math.atan2(
-            float(goal.y_cm) - float(self.runtime.robot_pose.y_cm),
-            float(goal.x_cm) - float(self.runtime.robot_pose.x_cm),
-        )
-        heading_error_deg = math.degrees(normalize_angle(target_heading_rad - float(self.runtime.robot_pose.heading_rad)))
-        tcp_turn_deg = -heading_error_deg
 
         if remaining_cm <= 0.5:
             self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
@@ -759,17 +771,54 @@ class TopdownDetectorApp:
 
         try:
             controller = RobotController(self.config.drive.robot_ip)
-            if abs(tcp_turn_deg) > 0.5:
-                drive_runtime.last_message = f"TCP turn {tcp_turn_deg:.1f}deg"
-                controller.turn(
-                    round(tcp_turn_deg, 1),
-                    int(round(self.config.drive.near_zone_turn_speed_pct)),
+            if not self.runtime.near_zone_turn_fired:
+                target_heading_rad = math.atan2(
+                    target_y_cm - float(self.runtime.robot_pose.y_cm),
+                    target_x_cm - float(self.runtime.robot_pose.x_cm),
                 )
+                heading_error_deg = math.degrees(normalize_angle(target_heading_rad - float(self.runtime.robot_pose.heading_rad)))
+                tcp_turn_deg = -heading_error_deg
+                if abs(tcp_turn_deg) > 0.5:
+                    drive_runtime.last_message = f"TCP turn {tcp_turn_deg:.1f}deg"
+                    controller.turn(
+                        round(tcp_turn_deg, 1),
+                        int(round(self.config.drive.near_zone_turn_speed_pct)),
+                    )
+                self.runtime.near_zone_turn_fired = True
+                drive_runtime.last_message = "TCP turn complete; waiting for vision correction"
+                return True
+
+            if not self.runtime.near_zone_correction_fired:
+                forward_cm, lateral_cm = self._target_offset_in_robot_frame(
+                    self.runtime.robot_pose,
+                    target_x_cm,
+                    target_y_cm,
+                )
+                if abs(lateral_cm) > 1.0 and abs(forward_cm) > 1e-6:
+                    correction_rad = math.atan2(-lateral_cm, forward_cm)
+                    tcp_turn_deg = -math.degrees(correction_rad)
+                    drive_runtime.last_message = f"TCP micro-turn {tcp_turn_deg:.1f}deg"
+                    controller.turn(
+                        round(tcp_turn_deg, 1),
+                        int(round(self.config.drive.near_zone_turn_speed_pct)),
+                    )
+                self.runtime.near_zone_correction_fired = True
+                target_x_cm, target_y_cm = self._pickup_target_body_pose(goal)
+                remaining_cm = math.hypot(
+                    target_x_cm - self.runtime.robot_pose.x_cm,
+                    target_y_cm - self.runtime.robot_pose.y_cm,
+                )
+                if remaining_cm <= 0.5:
+                    self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
+                    self.runtime.pickup_state_started_s = time.perf_counter()
+                    return True
+
             drive_runtime.last_message = f"TCP move {remaining_cm:.1f}cm"
             controller.move(
                 round(remaining_cm, 1),
                 int(round(self.config.drive.near_zone_move_speed_pct)),
             )
+            self.runtime.near_zone_move_fired = True
             self.mark_optimistic_pickup_complete()
             drive_runtime.stop(DriveControlState.PICKUP, "TCP align/move complete")
             self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
@@ -779,6 +828,35 @@ class TopdownDetectorApp:
             self.runtime.pickup_state = PickupExecutionState.REPLAN
             self.runtime.pickup_state_started_s = time.perf_counter()
         return True
+
+    def cached_balls_match_current_scene(self, smoothed_balls: list[SmoothedBallCoordinate]) -> bool:
+        """Return true when current visible balls are a stationary subset of the cached plan."""
+        if not self.runtime.route_cache_ball_signature:
+            return not smoothed_balls
+        bucket = max(1.0, self.config.planner.route_target_move_invalidate_cm)
+        current = Counter(
+            (
+                ball.label,
+                int(round(ball.cm_x / bucket)),
+                int(round(ball.cm_y / bucket)),
+            )
+            for ball in smoothed_balls
+        )
+        cached = Counter(
+            (label, bucket_x, bucket_y)
+            for _track_id, label, bucket_x, bucket_y in self.runtime.route_cache_ball_signature
+        )
+        return all(count <= cached[key] for key, count in current.items())
+
+    def should_route_directly_to_unload(self, smoothed_balls: list[SmoothedBallCoordinate]) -> bool:
+        """Return true for the collected-something / now-empty-field unload case."""
+        return self.runtime.balls_collected > 0 and not smoothed_balls and self.runtime.robot_pose is not None
+
+    def should_keep_cached_route_after_pickup(self) -> bool:
+        """Continue a global route after pickup unless vision shows a changed ball scene."""
+        return bool(self.runtime.route_plan.points) and self.cached_balls_match_current_scene(
+            self.runtime.latest_smoothed_balls
+        )
 
     def _start_pickup_assist_command_thread(self) -> None:
         if self.pickup_thread is not None and self.pickup_thread.is_alive():
@@ -819,6 +897,10 @@ class TopdownDetectorApp:
             self.drive_guard.wheel_controller.reset()
             if self.optimistic_collection_complete() and self.runtime.route_plan.unload_pose is not None:
                 drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; routing to unload")
+                self.runtime.reset_pickup_state()
+                return True
+            if self.should_keep_cached_route_after_pickup():
+                drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; continuing cached route")
                 self.runtime.reset_pickup_state()
                 return True
             self.runtime.clear_route()
@@ -1074,7 +1156,7 @@ class TopdownDetectorApp:
     ) -> bool:
         if not self.runtime.route_plan.points or self.runtime.route_cache_target_id is None:
             return False
-        if self.runtime.route_cache_ball_signature != self.ball_cache_signature(smoothed_balls):
+        if not self.cached_balls_match_current_scene(smoothed_balls):
             return False
         if self.runtime.route_cache_unload_extension_cm is None:
             return False
@@ -1088,7 +1170,10 @@ class TopdownDetectorApp:
 
         target = next((ball for ball in smoothed_balls if ball.track_id == self.runtime.route_cache_target_id), None)
         if target is None or self.runtime.route_cache_target_cm is None:
-            return False
+            return (
+                self.route_facade.nearest_route_distance_cm(current_pose, self.runtime.route_plan.points)
+                <= self.config.planner.route_crosstrack_invalidate_cm
+            )
         if (
             math.hypot(target.cm_x - self.runtime.route_cache_target_cm[0], target.cm_y - self.runtime.route_cache_target_cm[1])
             > self.config.planner.route_target_move_invalidate_cm
@@ -1141,28 +1226,31 @@ class TopdownDetectorApp:
             self.runtime.clear_route()
             return
 
-        if not result.smoothed_ball_coordinates and self.runtime.robot_pose is None:
+        smoothed_balls = result.smoothed_ball_coordinates
+        route_to_unload_without_visible_balls = self.should_route_directly_to_unload(smoothed_balls)
+
+        if not smoothed_balls and self.runtime.robot_pose is None:
             self.runtime.selected_start_cm = None
             self.runtime.clear_route()
             return
-        if not result.smoothed_ball_coordinates:
+        if not smoothed_balls and not route_to_unload_without_visible_balls:
             if not self.runtime.route_plan.points:
                 self.runtime.clear_route()
             return
 
-        ball_signature = self.ball_cache_signature(result.smoothed_ball_coordinates)
+        ball_signature = self.ball_cache_signature(smoothed_balls)
         self.accept_completed_route_if_current(
             ball_signature,
             geometry.unload_extension_cm,
             self.route_start_signature(start_pose),
         )
 
-        if self.cached_route_is_valid(start_pose, result.smoothed_ball_coordinates, params):
+        if self.cached_route_is_valid(start_pose, smoothed_balls, params):
             return
 
         self.submit_route_plan_if_needed(
             result.occupancy_grid,
-            self._ball_targets(result.smoothed_ball_coordinates),
+            self._ball_targets(smoothed_balls),
             start_pose,
             geometry,
             ball_signature,
@@ -1916,15 +2004,9 @@ class TopdownDetectorApp:
                     self.drive_guard.wheel_controller.reset()
                     drive_runtime.stop(DriveControlState.STOPPED, "step paused; press n")
                 else:
-                    collector_owns_control = False # self.ensure_collector_travel_position(drive_runtime)
-                    self.runtime.collector_state = CollectorPositionState.TRAVEL
                     pickup_state_before = self.runtime.pickup_state
-                    pickup_owns_control = False if collector_owns_control else self.update_pickup_state(drive_runtime, now)
-                    unload_owns_control = (
-                        False
-                        if collector_owns_control or pickup_owns_control
-                        else self.update_unload_state(drive_runtime, now)
-                    )
+                    pickup_owns_control = self.update_pickup_state(drive_runtime, now)
+                    unload_owns_control = False if pickup_owns_control else self.update_unload_state(drive_runtime, now)
                     pickup_completed = (
                         self.runtime.step_mode_enabled
                         and pickup_state_before == PickupExecutionState.REPLAN
@@ -1933,7 +2015,7 @@ class TopdownDetectorApp:
                     if pickup_completed:
                         self.pause_step_drive_after_target(drive_runtime)
                         pickup_owns_control = True
-                    if not collector_owns_control and not pickup_owns_control and not unload_owns_control:
+                    if not pickup_owns_control and not unload_owns_control:
                         self.drive_guard.enforce_xte_guard_before_replan(
                             self.runtime.robot_pose,
                             self.runtime.route_plan.points,

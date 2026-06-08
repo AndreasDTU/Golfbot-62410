@@ -71,6 +71,29 @@ class GridDijkstraHeuristicTests(unittest.TestCase):
 
 
 class SmallGoalUnloadRouteTests(unittest.TestCase):
+    def test_route_can_drive_directly_to_unload_when_no_ball_targets_remain(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=10.0,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        planner = HybridAStarPlanner(field_config=field)
+        route_planner = GreedyRoutePlanner(planner)
+        start_pose = HybridPose(40.0, field.height_cm * 0.5, 0.0)
+
+        route = route_planner.plan(grid, [], start_pose, geometry)
+
+        self.assertGreaterEqual(len(route.points), 2)
+        self.assertIsNone(route.active_target)
+        self.assertEqual(route.pickup_poses, [])
+        self.assertIsNotNone(route.unload_pose)
+        self.assertEqual(route.unload_goal_cm, (0.0, field.height_cm * 0.5))
+
     def test_route_appends_small_goal_unload_after_pickup(self) -> None:
         field = FieldConfig()
         grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)

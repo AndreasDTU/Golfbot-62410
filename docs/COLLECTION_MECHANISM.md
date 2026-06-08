@@ -25,11 +25,11 @@ field surface that the robot can drive, turn, and position the tube over a ball
 without scraping the field, pushing balls unintentionally, or colliding with
 obstacles.
 
-The detector drive loop treats the collector position as a safety gate. Before
-wheel route-following is allowed, `tools/topdown_object_detector.py` sends
-`collector_travel_position()` when the collector state is unknown. After
-`pickup_assist()` completes, the software returns the collector state to
-`TRAVEL` before route following continues.
+The detector drive loop no longer commands the collector travel position before
+route following. The operator is responsible for placing the collector in its
+safe travel position before starting autonomous drive. After `pickup_assist()`
+completes, the software still records the collector state as `TRAVEL` for local
+state bookkeeping.
 
 Autonomous route-following wheel commands and near-zone pickup actions all use
 the EV3 TCP command server. The drive loop does not use UDP transport.
@@ -39,8 +39,8 @@ the EV3 TCP command server. The drive loop does not use UDP transport.
 The pipe motor has three distinct software commands:
 
 - `collector_travel_position()`: raises or keeps the collector in its safe
-  driving position. Autonomous driving should assert this state before sending
-  route-following wheel commands.
+  driving position. This remains available for manual/operator use, but the
+  autonomous drive loop does not call it.
 - `pickup_assist()`: a small local back-and-forth pipe motion used during
   autonomous ball collection. This assists engagement with the retaining
   mechanism and must not run a full pipe stroke or leave the collector fully

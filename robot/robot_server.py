@@ -46,9 +46,9 @@ MM_PER_UNIT = 9.9664                 # 1 unit = 10mm (1cm). Adjust to recalibrat
 # Pipe motor: degrees of motor rotation per unit of pipe travel
 # Tune this based on your pipe mechanism's gear ratio / spool size
 PIPE_DEGREES_PER_UNIT = 45.0
-COLLECTOR_TRAVEL_UNITS = 22
+COLLECTOR_TRAVEL_UNITS = 5
 COLLECTOR_TRAVEL_SPEED = 50
-PICKUP_ASSIST_UNITS = 2
+PICKUP_ASSIST_UNITS = 20
 PICKUP_ASSIST_SPEED = 35
 UNLOAD_FULL_CYCLE_UNITS = 22
 UNLOAD_FULL_CYCLE_SPEED = 75

@@ -1914,7 +1914,8 @@ class TopdownDetectorApp:
                     self.drive_guard.wheel_controller.reset()
                     drive_runtime.stop(DriveControlState.STOPPED, "step paused; press n")
                 else:
-                    collector_owns_control = self.ensure_collector_travel_position(drive_runtime)
+                    collector_owns_control = False # self.ensure_collector_travel_position(drive_runtime)
+                    self.runtime.collector_state = CollectorPositionState.TRAVEL
                     pickup_state_before = self.runtime.pickup_state
                     pickup_owns_control = False if collector_owns_control else self.update_pickup_state(drive_runtime, now)
                     unload_owns_control = (
@@ -2006,6 +2007,7 @@ class TopdownDetectorApp:
             self.config.paths.calibration_file
         )
         cap = cv2.VideoCapture(camera_index)
+        print("Found camera")
         if not cap.isOpened():
             print(f"Could not open camera {camera_index}", file=sys.stderr)
             return 1

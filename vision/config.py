@@ -314,7 +314,7 @@ class PlannerConfig:
 class DriveConfig:
     """Integrated drive-control and TCP dispatch tuning."""
 
-    robot_ip: str = "169.254.154.221"
+    robot_ip: str = "172.20.10.8"
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     max_cross_track_error_cm: float = 8.0

@@ -30,6 +30,15 @@ class RobotController:
             return self.sock.recv(1024).decode('utf-8').strip()
         except OSError as exc:
             raise RuntimeError(f"EV3 command failed after send attempt ({cmd!r}): {exc}") from exc
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def send_wheel_speeds(self, left_pct, right_pct):
+        return self._send(f"LR {left_pct} {right_pct}")
     
     def move(self, distance, speedPercent = 100):
         return self._send(f"move {distance} {speedPercent}")

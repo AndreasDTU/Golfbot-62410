@@ -51,6 +51,16 @@ class RobotControllerSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "EV3 command failed"):
                 controller.unload_full_cycle()
 
+    def test_wheel_speed_command_uses_tcp_lr_protocol(self) -> None:
+        fake_socket = FakeSocket()
+
+        with patch("robot.controller.socket.socket", return_value=fake_socket):
+            controller = RobotController("robot.local", timeout=0.1)
+            response = controller.send_wheel_speeds(12.5, -7.0)
+
+        self.assertEqual(response, "OK")
+        self.assertEqual(fake_socket.sent_payloads, [b"LR 12.5 -7.0\n"])
+
 
 if __name__ == "__main__":
     unittest.main()

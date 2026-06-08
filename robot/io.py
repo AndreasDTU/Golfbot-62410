@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import math
-import socket
 import time
 from typing import Callable
 
 import numpy as np
 
+from robot.controller import RobotController
 from vision.config import DriveConfig
 
 
-class UdpWheelDispatcher:
-    """Non-blocking UDP wheel-speed dispatcher for the robot microcontroller."""
+class TcpWheelDispatcher:
+    """TCP wheel-speed dispatcher for the EV3 command server."""
 
     def __init__(
         self,
@@ -23,12 +23,13 @@ class UdpWheelDispatcher:
         min_send_interval_s: float | None = None,
         max_speed_pct: float | None = None,
         command_deadband_pct: float | None = None,
-        socket_factory: Callable[..., socket.socket] | None = None,
         time_fn: Callable[[], float] | None = None,
+        controller_factory: Callable[..., RobotController] | None = None,
         drive_config: DriveConfig | None = None,
     ) -> None:
         config = drive_config or DriveConfig()
-        self.address = (host or config.robot_ip, port if port is not None else config.robot_udp_port)
+        self.host = host or config.robot_ip
+        self.port = port if port is not None else config.robot_tcp_port
         self.command_format = command_format or config.robot_command_format
         self.min_send_interval_s = (
             min_send_interval_s if min_send_interval_s is not None else config.min_send_interval_s
@@ -41,16 +42,22 @@ class UdpWheelDispatcher:
         self.last_sent: tuple[float, float] | None = None
         self.last_error = ""
         self.time_fn = time_fn or time.perf_counter
-        factory = socket_factory or socket.socket
-        self.sock = factory(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setblocking(False)
+        self.controller_factory = controller_factory or RobotController
+        self.controller: RobotController | None = None
+
+    def _controller(self) -> RobotController:
+        if self.controller is None:
+            self.controller = self.controller_factory(self.host, port=self.port)
+        return self.controller
 
     def close(self) -> None:
-        """Close the UDP socket after sending the final stop command."""
-        self.sock.close()
+        """Close the TCP command connection."""
+        if self.controller is not None:
+            self.controller.close()
+            self.controller = None
 
     def send_wheel_speeds(self, left_pct: float, right_pct: float, force: bool = False) -> bool:
-        """Validate and dispatch one left/right wheel command without blocking."""
+        """Validate and dispatch one left/right wheel command over TCP."""
         if not (math.isfinite(left_pct) and math.isfinite(right_pct)):
             self.last_error = "non-finite wheel command rejected"
             return False
@@ -67,13 +74,15 @@ class UdpWheelDispatcher:
         ):
             return True
 
-        payload = self.command_format.format(left=left, right=right).encode("ascii")
+        command = self.command_format.format(left=left, right=right)
         try:
-            self.sock.sendto(payload, self.address)
-        except (BlockingIOError, InterruptedError):
-            return True
-        except OSError as exc:
+            response = self._controller()._send(command)
+        except RuntimeError as exc:
             self.last_error = str(exc)
+            self.close()
+            return False
+        if response.lower().startswith("error"):
+            self.last_error = response
             return False
 
         self.last_send_time = now

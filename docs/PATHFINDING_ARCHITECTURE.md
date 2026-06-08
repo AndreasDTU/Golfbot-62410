@@ -142,7 +142,7 @@ they are not part of the public route model.
 The route is expressed in robot body-center coordinates. Ball pickup goals are
 generated as paired poses:
 
-- a standoff pose where UDP route tracking stops
+- a standoff pose where TCP route tracking stops
 - a final pickup pose where the TCP encoder move ends and the tube center is on
   the ball
 
@@ -230,29 +230,30 @@ After the required vision pipeline and Hybrid A* route update, the detector:
 - converts those errors into bounded left/right differential-drive speeds
 - dispatches the wheel-speed command directly to the robot microcontroller
 
-Dispatch uses best-effort non-blocking UDP so the OpenCV frame loop never waits
-for robot acknowledgements. The default command payload is:
+Dispatch uses the EV3 TCP command server for the entire `--drive` scenario,
+including continuous route-following wheel speeds and calibrated pickup moves.
+The default route-following command payload is:
 
 ```text
 LR <left_speed_pct> <right_speed_pct>
 ```
 
-The robot endpoint is configured in `topdown_object_detector.py` with
-`ROBOT_IP`, `ROBOT_UDP_PORT`, and `ROBOT_COMMAND_FORMAT`. The `--drive` flag is
-the only runtime switch for hardware dispatch. Without `--drive`, the controller
-still computes and visualizes XTE and motor commands, but no hardware packets
-are sent.
+The robot endpoint is configured through `DriveConfig.robot_ip`,
+`DriveConfig.robot_tcp_port`, and `DriveConfig.robot_command_format`. The
+`--drive` flag is the only runtime switch for hardware dispatch. Without
+`--drive`, the controller still computes and visualizes XTE and motor commands,
+but no hardware commands are sent.
 
 If XTE exceeds `MAX_CROSS_TRACK_ERROR_CM` (8 cm by default), the detector sends
 a zero-speed STOP command, invalidates the cached route, and immediately runs a
 fresh Hybrid A* search from the deviated robot pose. Motor output resumes only
 after a valid route is cached again.
 
-Near pickup targets, the drive loop switches from UDP velocity control to
-calibrated TCP position control:
+Near pickup targets, the drive loop switches from TCP wheel-speed tracking to
+calibrated TCP position control on the same command server:
 
 1. Confirm or command `collector_travel_position()` before route following.
-2. Stop UDP wheel output with `LR 0 0`.
+2. Stop TCP wheel output with `LR 0 0`.
 3. Compute the current heading error to the final pickup pose.
 4. Execute blocking TCP `turn(degrees, speedPercent)`.
 5. Execute blocking TCP `move(distance, speedPercent)`.

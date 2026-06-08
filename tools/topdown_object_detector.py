@@ -34,7 +34,7 @@ from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from pathfinding.planner import RoutePlanningFacade
 from robot.control import DriveSafetyGuard, distance_to_route_goal_cm, route_goal_pose
 from robot.controller import RobotController
-from robot.io import UdpWheelDispatcher
+from robot.io import TcpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
 from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose
 from vision.calibration import HomographyCalibrator
@@ -370,7 +370,7 @@ class TopdownDetectorApp:
         parser.add_argument(
             "--drive",
             action="store_true",
-            help="Enable non-blocking UDP dispatch of autonomous left/right wheel speeds.",
+            help="Enable TCP dispatch of autonomous left/right wheel speeds.",
         )
         parser.add_argument(
             "--step",
@@ -534,9 +534,9 @@ class TopdownDetectorApp:
         self.active_pipeline = pipeline
         return pipeline
 
-    def _make_drive_runtime(self, drive_enabled: bool) -> tuple[DriveRuntime, UdpWheelDispatcher | None]:
+    def _make_drive_runtime(self, drive_enabled: bool) -> tuple[DriveRuntime, TcpWheelDispatcher | None]:
         dispatcher = (
-            UdpWheelDispatcher(drive_config=self.config.drive)
+            TcpWheelDispatcher(drive_config=self.config.drive)
             if drive_enabled
             else None
         )
@@ -721,7 +721,7 @@ class TopdownDetectorApp:
         return True
 
     def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
-        """Stop UDP tracking, align with TCP turn, then finish with TCP encoder move."""
+        """Stop TCP route tracking, align with TCP turn, then finish with TCP encoder move."""
         if self.runtime.near_zone_move_fired:
             return True
         distance_cm = self._pickup_distance_to_goal_cm()
@@ -1766,8 +1766,8 @@ class TopdownDetectorApp:
         self.runtime.step_drive_paused = self.runtime.step_mode_enabled
         if drive_enabled:
             print(
-                f"Integrated drive dispatch enabled: UDP "
-                f"{self.config.drive.robot_ip}:{self.config.drive.robot_udp_port}"
+                f"Integrated drive dispatch enabled: TCP "
+                f"{self.config.drive.robot_ip}:{self.config.drive.robot_tcp_port}"
             )
             if self.runtime.step_mode_enabled:
                 print("Step drive mode enabled: press 'n' to release each target run.")

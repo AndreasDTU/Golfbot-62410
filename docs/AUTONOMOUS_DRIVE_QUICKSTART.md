@@ -19,6 +19,9 @@ cd <repo-on-ev3>
 python3 robot/robot_server.py
 ```
 
+The `--drive` path uses this TCP server for all autonomous wheel and collector
+commands; no UDP wheel server is required.
+
 3. On the laptop, start live vision without motors first:
 
 ```bash

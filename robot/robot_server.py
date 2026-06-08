@@ -15,6 +15,7 @@ Commands:
   pipe up <units> [speed] - Raise the pipe N units
   pipe down <units> [speed] - Lower the pipe N units
   pipe stop               - Stop pipe motor immediately
+  LR <left> <right>       - Set continuous left/right wheel speeds
   collector_travel_position - Raise collector to safe driving position
   pickup_assist           - Small pipe jiggle for collecting one ball
   unload_full_cycle       - Full pipe cycle for unloading balls at the goal
@@ -27,6 +28,7 @@ Commands:
 import socket
 import threading
 import time
+import math
 from ev3dev2.motor import (
     LargeMotor, MoveTank,
     OUTPUT_B, OUTPUT_C, OUTPUT_D,
@@ -211,6 +213,20 @@ def cmd_stop():
     return "ok: drive stopped"
 
 
+def cmd_lr(parts):
+    if len(parts) < 3:
+        return "error: LR requires <left_speed_pct> <right_speed_pct>"
+    left = float(parts[1])
+    right = float(parts[2])
+    if not (math.isfinite(left) and math.isfinite(right)):
+        return "error: non-finite wheel speed"
+    if abs(left) < 1e-6 and abs(right) < 1e-6:
+        tank.off()
+        return "ok: wheel speeds 0.0 0.0"
+    tank.on(left_speed=SpeedPercent(-left), right_speed=SpeedPercent(-right))
+    return "ok: wheel speeds {} {}".format(left, right)
+
+
 # ---------------------------------------------------------------------------
 # Command dispatcher
 # ---------------------------------------------------------------------------
@@ -225,6 +241,8 @@ def handle_command(cmd):
     try:
         if action == "ping":
             return "pong"
+        elif action == "lr":
+            return cmd_lr(parts)
         elif action == "move":
             return cmd_move(parts, forward=True)
         elif action == "back":

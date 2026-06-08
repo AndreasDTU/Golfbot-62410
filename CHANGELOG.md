@@ -8,7 +8,7 @@ All notable larger additions and behavioral changes to this repository should be
 
 - Added a minimal autonomous terminal unload sequence after the robot reaches
   the planned unload endpoint.
-  - The drive loop stops UDP wheel output, preserves the final unload route
+  - The drive loop stops wheel output, preserves the final unload route
     after the last optimistic pickup, and runs a pipe-only double unload:
     `unload_full_cycle`, configurable `pipe_down`/`pipe_up` shake cycles,
     second `unload_full_cycle`, then `pipe_stop`.
@@ -18,6 +18,16 @@ All notable larger additions and behavioral changes to this repository should be
     distance in `DriveConfig`.
 
 ### Changed
+
+- Switched the autonomous `--drive` command transport to TCP-only.
+  - Replaced the PC-side wheel dispatcher with a TCP wheel dispatcher that
+    preserves finite-command validation, clipping, send interval/deadband
+    filtering, forced stops, and dispatch error reporting.
+  - Added TCP `LR <left> <right>` handling to `robot/robot_server.py` for
+    continuous route-following wheel speeds on the same command server used by
+    `move`, `turn`, and collector commands.
+  - Updated drive wiring, operator docs, and tests so the old hybrid transport
+    scenario is no longer part of `--drive`.
 
 - Tightened autonomous drive and unload safety gates before live contest runs.
   - EV3 TCP `move`/`turn` commands now acknowledge only after motor completion
@@ -176,8 +186,8 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
   - Hybrid A* now targets the standoff goal set dynamically instead of a single preselected pose.
 - Added near-zone route visualization in `vision/debug.py`.
   - Route heatmap stops at the near-zone handoff point.
-  - Red markers show UDP halt / TCP turn locations.
-  - Final TCP center-to-center approach segment is drawn using the same speed heatmap palette as the UDP route.
+  - Red markers show route-tracking halt / TCP turn locations.
+  - Final TCP center-to-center approach segment is drawn using the same speed heatmap palette as the tracked route.
   - Intermediate robot footprint clutter was removed; pickup footprints are shown only at collection poses.
 - Added global ball-count reconciliation in `tools/topdown_object_detector.py`.
   - Drive dispatch waits for a stable initial YOLO ball count.
@@ -187,8 +197,8 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
 
 ### Changed
 
-- Rewrote `AGENTS.md` to match the current top-down object detection,
-  Hybrid A*, and hybrid UDP/TCP robot-control architecture.
+- Rewrote `AGENTS.md` to match the top-down object detection, Hybrid A*, and
+  robot-control architecture active at that time.
   - Updated the expected file structure.
   - Replaced outdated vision-system assumptions with the current
     `vision/`, `pathfinding/`, `robot/`, `tools/`, `docs/`, and `test/`
@@ -200,7 +210,7 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
 - Replaced the old blind open-loop pickup creep behavior with deterministic align-then-move TCP execution.
 - Updated the closed-loop controller tests to cover:
   - edge slowdown/gain scaling,
-  - near-zone UDP stop and TCP turn/move ordering,
+  - near-zone route-tracking stop and TCP turn/move ordering,
   - route heatmap near-zone breaks,
   - pickup standoff geometry,
   - global ball-count reconciliation and debounce behavior.

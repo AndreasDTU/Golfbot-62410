@@ -11,12 +11,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class FakeTank:
     def __init__(self, *_args, **_kwargs) -> None:
         self.calls: list[dict[str, object]] = []
+        self.on_calls: list[dict[str, object]] = []
+        self.off_calls = 0
 
     def on_for_degrees(self, **kwargs) -> None:
         self.calls.append(kwargs)
 
+    def on(self, **kwargs) -> None:
+        self.on_calls.append(kwargs)
+
     def off(self) -> None:
-        pass
+        self.off_calls += 1
 
 
 class FakeMotor:
@@ -69,6 +74,22 @@ class RobotServerCommandTests(unittest.TestCase):
         self.assertEqual(len(robot_server.tank.calls), 2)
         self.assertTrue(robot_server.tank.calls[0]["block"])
         self.assertTrue(robot_server.tank.calls[1]["block"])
+
+    def test_lr_tcp_command_sets_continuous_wheel_speeds(self) -> None:
+        robot_server = load_robot_server_with_fake_ev3()
+
+        response = robot_server.handle_command("LR 12.5 -7.0")
+
+        self.assertTrue(response.startswith("ok: wheel speeds"))
+        self.assertEqual(robot_server.tank.on_calls, [{"left_speed": -12.5, "right_speed": 7.0}])
+
+    def test_lr_tcp_zero_command_stops_drive_motors(self) -> None:
+        robot_server = load_robot_server_with_fake_ev3()
+
+        response = robot_server.handle_command("LR 0 0")
+
+        self.assertEqual(response, "ok: wheel speeds 0.0 0.0")
+        self.assertEqual(robot_server.tank.off_calls, 1)
 
 
 if __name__ == "__main__":

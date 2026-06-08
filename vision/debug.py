@@ -28,7 +28,7 @@ from vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinat
 
 @dataclass(frozen=True)
 class NearZoneVisualBreak:
-    """Rendered handoff point between UDP route tracking and TCP pickup motion."""
+    """Rendered handoff point between TCP route tracking and TCP pickup motion."""
 
     checkpoint_index: int
     segment_index: int
@@ -176,7 +176,7 @@ class DebugRenderer:
         route_segment_types: list[RouteSegmentType] | None = None,
         route_segment_speeds_pct: list[float] | None = None,
     ) -> None:
-        """Draw route heatmap as UDP tracking up to near-zone, then TCP straight pickup."""
+        """Draw route heatmap as TCP route tracking up to near-zone, then TCP straight pickup."""
         if len(route_points_cm) < 2:
             return
         if route_segment_speeds_pct is not None and len(route_segment_speeds_pct) >= len(route_points_cm) - 1:

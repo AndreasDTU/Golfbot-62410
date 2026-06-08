@@ -165,7 +165,7 @@ class CollectorPlaygroundTests(unittest.TestCase):
             "VisionPipeline",
             "RoutePlanningFacade",
             "TopDownDetectorApp",
-            "UdpWheelDispatcher",
+            "TcpWheelDispatcher",
         )
         for name in forbidden:
             self.assertFalse(hasattr(collector_playground, name), name)

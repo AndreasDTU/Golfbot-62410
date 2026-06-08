@@ -312,10 +312,10 @@ class PlannerConfig:
 
 @dataclass(frozen=True)
 class DriveConfig:
-    """Integrated drive-control and UDP dispatch tuning."""
+    """Integrated drive-control and TCP dispatch tuning."""
 
     robot_ip: str = "192.168.1.42"
-    robot_udp_port: int = 5556
+    robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     max_cross_track_error_cm: float = 8.0
     base_speed_pct: float = 38.0

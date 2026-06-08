@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
 from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
+from robot.io import TcpWheelDispatcher
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
 from tools.topdown_object_detector import (
     CollectorPositionState,
@@ -28,7 +29,50 @@ class FakeDispatcher:
         return True
 
 
+class FakeTcpController:
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.commands: list[str] = []
+        self.closed = False
+
+    def _send(self, command: str) -> str:
+        self.commands.append(command)
+        return "ok"
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class DriveControlTests(unittest.TestCase):
+    def test_tcp_wheel_dispatcher_sends_lr_commands_and_deadbands_repeats(self) -> None:
+        controllers: list[FakeTcpController] = []
+
+        def make_controller(host: str, port: int) -> FakeTcpController:
+            controller = FakeTcpController(host, port)
+            controllers.append(controller)
+            return controller
+
+        now = [10.0]
+        dispatcher = TcpWheelDispatcher(
+            host="robot.local",
+            port=5555,
+            max_speed_pct=50.0,
+            min_send_interval_s=0.1,
+            command_deadband_pct=1.0,
+            time_fn=lambda: now[0],
+            controller_factory=make_controller,
+        )
+
+        self.assertTrue(dispatcher.send_wheel_speeds(80.0, -80.0))
+        self.assertTrue(dispatcher.send_wheel_speeds(50.2, -49.8))
+        now[0] += 0.2
+        self.assertTrue(dispatcher.send_wheel_speeds(25.0, 20.0))
+        dispatcher.close()
+
+        self.assertEqual(controllers[0].commands, ["LR 50.0 -50.0", "LR 25.0 20.0"])
+        self.assertTrue(controllers[0].closed)
+
     def test_body_edge_clearance_uses_main_body_footprint(self) -> None:
         pose = RobotPose(x_cm=20.0, y_cm=20.0, heading_rad=0.0, tube_x_cm=35.0, tube_y_cm=20.0)
         geometry = RobotGeometry(width_cm=20.0, front_cm=8.0, rear_cm=10.0, tube_forward_cm=18.0, tube_right_cm=0.0)
@@ -168,7 +212,7 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(drive_runtime.last_message, "step target complete; press n")
         self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
 
-    def test_near_zone_handoff_stops_udp_then_turns_and_runs_tcp_move(self) -> None:
+    def test_near_zone_handoff_stops_tcp_tracking_then_turns_and_runs_tcp_move(self) -> None:
         app = TopdownDetectorApp()
         dispatcher = FakeDispatcher()
         drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
@@ -190,7 +234,7 @@ class DriveControlTests(unittest.TestCase):
 
         def record_stop(left_pct: float, right_pct: float, force: bool = False) -> bool:
             dispatcher.commands.append((left_pct, right_pct, force))
-            events.append(("udp", left_pct, None))
+            events.append(("tcp_lr", left_pct, None))
             return True
 
         dispatcher.send_wheel_speeds = record_stop
@@ -212,7 +256,7 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertTrue(owns_control)
         self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
-        self.assertEqual(events[0], ("udp", 0.0, None))
+        self.assertEqual(events[0], ("tcp_lr", 0.0, None))
         self.assertEqual(events[1], ("turn", 10.0, int(round(app.config.drive.near_zone_turn_speed_pct))))
         self.assertEqual(events[2], ("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))))
         self.assertEqual(app.runtime.balls_collected, 1)

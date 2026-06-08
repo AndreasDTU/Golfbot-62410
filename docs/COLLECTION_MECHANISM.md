@@ -31,6 +31,9 @@ wheel route-following is allowed, `tools/topdown_object_detector.py` sends
 `pickup_assist()` completes, the software returns the collector state to
 `TRAVEL` before route following continues.
 
+Autonomous route-following wheel commands and near-zone pickup actions all use
+the EV3 TCP command server. The drive loop does not use UDP transport.
+
 ## Motor Commands
 
 The pipe motor has three distinct software commands:

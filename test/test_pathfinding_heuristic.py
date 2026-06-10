@@ -93,6 +93,10 @@ class SmallGoalUnloadRouteTests(unittest.TestCase):
         self.assertEqual(route.pickup_poses, [])
         self.assertIsNotNone(route.unload_pose)
         self.assertEqual(route.unload_goal_cm, (0.0, field.height_cm * 0.5))
+        assert route.unload_pose is not None
+        self.assertAlmostEqual(route.unload_pose.x_cm, geometry.rear_cm + geometry.unload_extension_cm + 2.0)
+        self.assertAlmostEqual(route.unload_pose.y_cm, field.height_cm * 0.5)
+        self.assertAlmostEqual(route.unload_pose.theta_rad, 0.0)
 
     def test_route_appends_small_goal_unload_after_pickup(self) -> None:
         field = FieldConfig()
@@ -121,6 +125,9 @@ class SmallGoalUnloadRouteTests(unittest.TestCase):
         self.assertIsNotNone(route.unload_pose)
         self.assertEqual(route.unload_goal_cm, (0.0, field.height_cm * 0.5))
         assert route.unload_pose is not None
+        self.assertAlmostEqual(route.unload_pose.x_cm, geometry.rear_cm + geometry.unload_extension_cm + 2.0)
+        self.assertAlmostEqual(route.unload_pose.y_cm, field.height_cm * 0.5)
+        self.assertAlmostEqual(route.unload_pose.theta_rad, 0.0)
         self.assertTrue(planner.is_unload_goal_reached(route.unload_pose, geometry))
 
 

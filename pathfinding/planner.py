@@ -354,12 +354,16 @@ class HybridAStarPlanner:
         """Return the fixed small-goal center on the left side of the field."""
         return 0.0, self.field.height_cm * 0.5
 
-    def small_goal_unload_pose(self, geometry: RobotGeometry) -> HybridPose:
-        """Return the base pose whose rear unload tip reaches the small goal."""
+    def small_goal_unload_pose(
+        self,
+        geometry: RobotGeometry,
+        margin_cm: float = 0.0,
+    ) -> HybridPose:
+        """Return the fixed perpendicular body-center pose for small-goal unloading."""
         goal_x, goal_y = self.small_goal_center_cm()
         reach_cm = geometry.rear_cm + geometry.unload_extension_cm
         return HybridPose(
-            x_cm=goal_x + reach_cm,
+            x_cm=goal_x + reach_cm + max(0.0, margin_cm),
             y_cm=goal_y,
             theta_rad=0.0,
         )
@@ -420,9 +424,9 @@ class HybridAStarPlanner:
         return max(0.0, cost - 3.0) + y_error_cm * 2.0 + heading_error_rad * 6.0
 
     def small_goal_staging_center_cm(self, geometry: RobotGeometry) -> tuple[float, float]:
-        """Return a broad staging target near the small goal but away from the wall."""
-        reach_cm = geometry.rear_cm + geometry.unload_extension_cm
-        return max(reach_cm + 18.0, 42.0), self.field.height_cm * 0.5
+        """Return the fixed robot-origin staging target for small-goal unloading."""
+        pose = self.small_goal_unload_pose(geometry, self.config.unload_staging_margin_cm)
+        return pose.x_cm, pose.y_cm
 
     def search_staging_region(
         self,
@@ -1726,25 +1730,13 @@ class GreedyRoutePlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig,
     ) -> tuple[list[HybridPose], HybridPose | None, tuple[float, float] | None]:
-        """Plan via a broad staging region, then dock into the small goal."""
-        staging_segment = self.hybrid_planner.search_staging_region(grid, current_pose, geometry, config)
-        if not staging_segment:
-            print("Hybrid A* could not route from current pose to the small goal staging region.")
-            return [], None, None
+        """Plan to the fixed perpendicular small-goal staging pose."""
+        unload_pose = self.hybrid_planner.small_goal_unload_pose(geometry, config.unload_staging_margin_cm)
+        unload_segment = self.hybrid_planner.search_pose_goal(grid, current_pose, unload_pose, geometry, config)
+        if unload_segment:
+            return unload_segment, unload_pose, self.hybrid_planner.small_goal_center_cm()
 
-        docking_config = replace(config, max_expansions=min(config.max_expansions, 6000))
-        docking_segment = self.hybrid_planner.search_unload_goal(
-            grid,
-            staging_segment[-1],
-            geometry,
-            docking_config,
-            timeout_s=1.0,
-        )
-        if docking_segment:
-            combined = staging_segment + docking_segment[1:]
-            return combined, combined[-1], self.hybrid_planner.small_goal_center_cm()
-
-        print("Hybrid A* could not route from current pose to the small goal unload region.")
+        print("Hybrid A* could not route from current pose to the fixed small goal staging pose.")
         return [], None, None
 
     def plan_target_segment(
@@ -2028,6 +2020,7 @@ class RoutePlanningFacade:
             flexible_standoff_max_cm=self.planner_config.flexible_standoff_max_cm,
             flexible_standoff_min_cm=self.planner_config.flexible_standoff_min_cm,
             flexible_standoff_heading_tolerance_rad=self.planner_config.flexible_standoff_heading_tolerance_rad,
+            unload_staging_margin_cm=self.planner_config.unload_staging_margin_cm,
             avoid_non_target_balls_enabled=self.planner_config.avoid_non_target_balls_enabled,
             ball_radius_cm=self.planner_config.ball_radius_cm,
             non_target_ball_extra_clearance_cm=self.planner_config.non_target_ball_extra_clearance_cm,

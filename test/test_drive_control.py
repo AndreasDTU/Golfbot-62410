@@ -647,7 +647,7 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.initial_total_balls = 1
         app.runtime.balls_collected = 1
         unload_y = app.config.field.height_cm * 0.5
-        app.runtime.robot_pose = RobotPose(70.0, unload_y, math.radians(90.0), 0.0, 0.0)
+        app.runtime.robot_pose = RobotPose(55.0, unload_y, math.radians(90.0), 0.0, 0.0)
         app.runtime.route_plan = RoutePlan(
             points=[HybridPose(90.0, unload_y, 0.0), HybridPose(50.0, unload_y, 0.0)],
             active_target=None,

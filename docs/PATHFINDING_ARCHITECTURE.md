@@ -295,14 +295,21 @@ longer matches the active geometry.
 
 If `balls_collected > 0` and the current camera frame contains zero visible
 balls, the route planner may receive an empty target list as an explicit request
-to route directly from the current robot pose to the small-goal unload pose.
+to route directly from the current robot pose to the fixed small-goal staging
+pose.
+
+The unload route no longer asks Hybrid A* to dock backwards into the goal. It
+targets one fixed robot body-center pose that is perpendicular to the left wall:
+`x = goal_x + rear_cm + unload_extension_cm + unload_staging_margin_cm`,
+`y = field.height_cm / 2`, `theta = 0`. This places the lowered pipe tip a small
+configurable margin away from the small-goal center while keeping the body
+square to the goal.
 
 Before the autonomous unload pipe sequence is allowed to run, the drive loop
-intercepts the final unload route inside a configurable staging radius around
-the fixed small-goal center `(0.0, field.height_cm / 2)`. It stops normal XTE
-tracking with `LR 0 0`, enters `PRE_UNLOAD_PIVOT`, and tank-steers in place
-until the robot rear roughly faces the goal. This avoids asking the XTE tracker
-to follow the tight backwards-arrival curve near the wall.
+intercepts the final unload route once the robot body reaches that fixed staging
+pose. It stops normal XTE tracking with `LR 0 0`, enters `PRE_UNLOAD_PIVOT`,
+and tank-steers in place until the robot rear roughly faces the goal. This
+keeps XTE out of the final unload maneuver near the wall.
 
 After the rough stationary pivot, the drive loop performs reverse visual
 servoing. The controller computes the live rear unload tip from

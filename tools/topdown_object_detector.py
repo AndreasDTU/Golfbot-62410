@@ -1116,17 +1116,18 @@ class TopdownDetectorApp:
     def _unload_staging_intercept_reached(self) -> bool:
         if self.runtime.robot_pose is None or not self._unload_route_is_terminal_target():
             return False
-        goal_x, goal_y = self._unload_goal_center_cm()
-        distance_to_goal_cm = math.hypot(
-            self.runtime.robot_pose.x_cm - goal_x,
-            self.runtime.robot_pose.y_cm - goal_y,
+        unload_pose = self.runtime.route_plan.unload_pose
+        if unload_pose is None:
+            return False
+        distance_to_staging_cm = math.hypot(
+            self.runtime.robot_pose.x_cm - unload_pose.x_cm,
+            self.runtime.robot_pose.y_cm - unload_pose.y_cm,
         )
-        geometry = self._unload_geometry()
-        minimum_staging_distance_cm = (
-            geometry.rear_cm + geometry.unload_extension_cm + self.config.drive.near_zone_cm
+        staging_distance_cm = max(
+            self.config.drive.unload_staging_distance_cm,
+            self.config.drive.unload_trigger_distance_cm,
         )
-        staging_distance_cm = max(self.config.drive.unload_staging_distance_cm, minimum_staging_distance_cm)
-        return distance_to_goal_cm <= staging_distance_cm
+        return distance_to_staging_cm <= staging_distance_cm
 
     def _force_drive_stop(self, drive_runtime: DriveRuntime, state: DriveControlState, message: str) -> None:
         """Send a deterministic zero-speed command, forcing a TCP stop packet."""

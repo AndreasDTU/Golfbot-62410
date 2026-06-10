@@ -40,6 +40,14 @@ All notable larger additions and behavioral changes to this repository should be
     static small-goal center, then hands directly to `UNLOAD_ALIGNING` for final
     reverse visual-servo correction and pipe-drop verification.
 
+- Changed autonomous unload routing to target a fixed perpendicular staging
+  pose.
+  - After all balls are collected, Hybrid A* now routes to a body-center pose at
+    `rear_cm + unload_extension_cm + unload_staging_margin_cm` from the small
+    goal center, with heading perpendicular to the left wall.
+  - The planner no longer performs the final backwards unload docking search;
+    stationary pivot and reverse visual servoing own that final maneuver.
+
 ### Changed
 
 - Corrected near-zone pickup alignment and cached-route pickup consumption.

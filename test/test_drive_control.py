@@ -1,4 +1,5 @@
 import math
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -262,9 +263,14 @@ class DriveControlTests(unittest.TestCase):
                 tube_y_cm=0.0,
             )
             owns_control_after_vision = app.update_pickup_state(drive_runtime, now_s=1.1)
+            app.runtime.near_zone_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            owns_control_after_settle = app.update_pickup_state(drive_runtime, now_s=1.2)
 
         self.assertTrue(owns_control)
         self.assertTrue(owns_control_after_vision)
+        self.assertTrue(owns_control_after_settle)
         self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
         self.assertEqual(events[0], ("tcp_lr", 0.0, None))
         self.assertEqual(events[1], ("turn", 10.0, int(round(app.config.drive.near_zone_turn_speed_pct))))
@@ -327,6 +333,10 @@ class DriveControlTests(unittest.TestCase):
             app.update_pickup_state(drive_runtime, now_s=1.2)
             app.runtime.robot_pose = RobotPose(6.0, 0.1, 0.0, 0.0, 0.0)
             app.update_pickup_state(drive_runtime, now_s=1.3)
+            app.runtime.near_zone_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            app.update_pickup_state(drive_runtime, now_s=1.4)
 
         turn_events = [event for event in events if event[0] == "turn"]
         self.assertGreaterEqual(len(turn_events), 2)
@@ -334,6 +344,45 @@ class DriveControlTests(unittest.TestCase):
         self.assertGreater(turn_events[0][2], turn_events[-1][2])
         self.assertIn(("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
+
+    def test_visual_servo_recorrects_when_settling_drifts_outside_noise_floor(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.robot_pose = RobotPose(6.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+            def move(self, distance: float, speed_percent: int) -> str:
+                events.append(("move", distance, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            app.update_pickup_state(drive_runtime, now_s=1.0)
+            app.runtime.robot_pose = RobotPose(6.0, 0.1, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.1)
+            app.runtime.near_zone_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            app.runtime.robot_pose = RobotPose(6.0, 2.0, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.2)
+
+        self.assertIn(("turn", 8.0, int(round(app.config.drive.near_zone_turn_speed_pct))), events)
+        self.assertNotIn(("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
 
     def test_visual_servo_converges_when_alignment_stops_improving(self) -> None:
         app = TopdownDetectorApp()
@@ -361,6 +410,10 @@ class DriveControlTests(unittest.TestCase):
 
             def unload_full_cycle(self) -> str:
                 events.append("unload_full_cycle")
+                return "OK"
+
+            def turn(self, _degrees: float, _speed: int = 100) -> str:
+                events.append("turn")
                 return "OK"
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
@@ -473,6 +526,10 @@ class DriveControlTests(unittest.TestCase):
                 events.append("unload_full_cycle")
                 return "OK"
 
+            def turn(self, _degrees: float, _speed: int = 100) -> str:
+                events.append("turn")
+                return "OK"
+
             def pipe_down(self, units: float, speed: int) -> str:
                 events.append(f"pipe_down {units} {speed}")
                 return "OK"
@@ -503,7 +560,7 @@ class DriveControlTests(unittest.TestCase):
         self.assertTrue(owns_after_complete)
         self.assertEqual(
             events,
-            ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
+            ["turn", "unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
         )
         self.assertNotIn("move", events)
         self.assertNotIn("back", events)
@@ -515,7 +572,7 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
+            ["turn", "unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
         )
 
     def test_unload_endpoint_waits_for_optimistic_collection_complete(self) -> None:

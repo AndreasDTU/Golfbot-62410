@@ -14,6 +14,14 @@ All notable larger additions and behavioral changes to this repository should be
   - Alignment continues until the measured lateral error reaches the configured
     camera noise floor, stops improving, or hits a bounded iteration limit.
 
+- Added visual-servo settling verification before the final near-zone pickup
+  move.
+  - When alignment converges or stalls, the drive loop now forces a zero-speed
+    TCP stop, waits for the configurable settling delay, then verifies alignment
+    again on a fresh camera frame before sending the final `move(...)`.
+  - If physical settling leaves the robot outside the configured visual-servo
+    noise floor, the loop resumes micro-correction instead of driving forward.
+
 ### Changed
 
 - Corrected near-zone pickup alignment and cached-route pickup consumption.

@@ -338,6 +338,7 @@ class DriveConfig:
     visual_servo_min_turn_deg: float = 0.25
     visual_servo_max_turn_deg: float = 8.0
     visual_servo_min_turn_speed_pct: float = 8.0
+    visual_servo_settle_time_s: float = 0.5
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
     edge_max_gain_scale: float = 1.6

@@ -24,7 +24,7 @@ class TcpWheelDispatcher:
         max_speed_pct: float | None = None,
         command_deadband_pct: float | None = None,
         time_fn: Callable[[], float] | None = None,
-        controller_factory: Callable[..., RobotController] | None = None,
+        controller: RobotController | None = None,
         drive_config: DriveConfig | None = None,
     ) -> None:
         config = drive_config or DriveConfig()
@@ -42,12 +42,11 @@ class TcpWheelDispatcher:
         self.last_sent: tuple[float, float] | None = None
         self.last_error = ""
         self.time_fn = time_fn or time.perf_counter
-        self.controller_factory = controller_factory or RobotController
-        self.controller: RobotController | None = None
+        self.controller: RobotController | None = controller
 
     def _controller(self) -> RobotController:
         if self.controller is None:
-            self.controller = self.controller_factory(self.host, port=self.port)
+            self.controller = RobotController(self.host, self.port)
         return self.controller
 
     def close(self) -> None:

@@ -29,7 +29,9 @@ class RobotController:
             self.sock.sendall(payload)
             return self.sock.recv(1024).decode('utf-8').strip()
         except OSError as exc:
-            raise RuntimeError(f"EV3 command failed after send attempt ({cmd!r}): {exc}") from exc
+            print(f"EV3 command failed after send attempt ({cmd!r}): {exc}")
+            self.sock = self._connect()
+            self._send(cmd)
 
     def close(self):
         try:

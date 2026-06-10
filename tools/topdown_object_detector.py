@@ -1951,6 +1951,7 @@ class TopdownDetectorApp:
         resize_notice_shown = False
         video_paused = False
         paused_views: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+        autofocus_disabled = False
         try:
             while True:
                 if video_paused and mode_label == "Video" and paused_views is not None:
@@ -2018,6 +2019,9 @@ class TopdownDetectorApp:
                         break
                     if self.homography_calibrator is not None and self.homography_calibrator.transform_matrix is not None:
                         continue
+                elif not autofocus_disabled:
+                    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+                    autofocus_disabled = True
 
                 self.sync_camera_ground_trackbars(preprocessed)
                 params = self.read_params()

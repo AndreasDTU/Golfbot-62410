@@ -699,20 +699,38 @@ class HybridAStarPlanner:
         goal_node: tuple[int, int],
         geometry: RobotGeometry,
         goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig | None = None,
     ) -> list[HybridPose]:
         """Return deterministic diagonal pickup poses for a tightly cornered ball."""
         heading_rad = self.tight_corner_pickup_heading(goal_point_cm)
         if heading_rad is None:
             return []
-        return [
-            self.pickup_aligned_pose_for_theta(
-                goal_node,
-                normalize_planner_angle(heading_rad + math.radians(offset_deg)),
-                geometry,
-                goal_point_cm,
-            )
-            for offset_deg in self.CORNER_PICKUP_HEADING_OFFSETS_DEG
-        ]
+        cfg = config or self.config
+        max_backoff_cm = max(0.0, self.robot_config.tube_width_cm * 0.5 + cfg.ball_radius_cm)
+        backoff_steps = max(1, int(math.ceil(max_backoff_cm / 0.5)))
+        candidates: list[HybridPose] = []
+        seen: set[tuple[int, int, int]] = set()
+        for offset_deg in self.CORNER_PICKUP_HEADING_OFFSETS_DEG:
+            theta_rad = normalize_planner_angle(heading_rad + math.radians(offset_deg))
+            exact_pose = self.pickup_aligned_pose_for_theta(goal_node, theta_rad, geometry, goal_point_cm)
+            forward = (math.cos(theta_rad), math.sin(theta_rad))
+            for step in range(backoff_steps + 1):
+                backoff_cm = min(max_backoff_cm, step * 0.5)
+                pose = HybridPose(
+                    x_cm=exact_pose.x_cm - forward[0] * backoff_cm,
+                    y_cm=exact_pose.y_cm - forward[1] * backoff_cm,
+                    theta_rad=exact_pose.theta_rad,
+                )
+                key = (
+                    int(round(pose.x_cm * 10.0)),
+                    int(round(pose.y_cm * 10.0)),
+                    self.theta_bin(pose.theta_rad),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(pose)
+        return candidates
 
     def pickup_standoff_pose_candidates(
         self,
@@ -737,6 +755,54 @@ class HybridAStarPlanner:
             seen.add(key)
             candidates.append(pose)
         return candidates
+
+    def wall_normal_pickup_headings(
+        self,
+        goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig,
+    ) -> tuple[float, ...]:
+        """Return preferred wall-normal headings for balls close to field walls."""
+        x_cm, y_cm = goal_point_cm
+        threshold_cm = max(0.0, config.wall_pickup_prefer_distance_cm)
+        headings: list[float] = []
+        if x_cm <= threshold_cm:
+            headings.append(math.pi)
+        if self.field.width_cm - x_cm <= threshold_cm:
+            headings.append(0.0)
+        if y_cm <= threshold_cm:
+            headings.append(-math.pi * 0.5)
+        if self.field.height_cm - y_cm <= threshold_cm:
+            headings.append(math.pi * 0.5)
+        return tuple(headings)
+
+    def wall_pickup_heading_error(
+        self,
+        pose: HybridPose,
+        goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig,
+    ) -> float:
+        """Return smallest error to a wall-normal approach, or zero away from walls."""
+        headings = self.wall_normal_pickup_headings(goal_point_cm, config)
+        if not headings:
+            return 0.0
+        return min(abs(normalize_planner_angle(pose.theta_rad - heading)) for heading in headings)
+
+    def preferred_wall_pickup_standoff_goals(
+        self,
+        goals: list[PickupStandoffGoal],
+        goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig,
+    ) -> list[PickupStandoffGoal]:
+        """Prefer perpendicular approaches for near-wall balls without making them mandatory."""
+        if not self.wall_normal_pickup_headings(goal_point_cm, config):
+            return goals
+        tolerance_rad = max(0.0, config.wall_pickup_perpendicular_tolerance_rad)
+        preferred = [
+            goal
+            for goal in goals
+            if self.wall_pickup_heading_error(goal.final_pickup_pose, goal_point_cm, config) <= tolerance_rad
+        ]
+        return preferred or goals
 
     @staticmethod
     def standoff_pose_for_final_pickup(
@@ -932,7 +998,7 @@ class HybridAStarPlanner:
             return []
         cfg = config or self.config
         collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry, self.field, self.robot_config)
-        for pickup_pose in self.corner_pickup_pose_candidates(goal_node, geometry, goal_point_cm):
+        for pickup_pose in self.corner_pickup_pose_candidates(goal_node, geometry, goal_point_cm, cfg):
             if not collision_checker.is_pose_valid(pickup_pose):
                 continue
             segment = self.search_pose_goal(raw_red_grid, start_pose, pickup_pose, geometry, cfg, costmap=costmap)
@@ -1414,14 +1480,29 @@ class HybridAStarPlanner:
         standoff_goals = self.valid_pickup_standoff_goals(raw_red_grid, goal_node, geometry, goal_point_cm)
         if not standoff_goals:
             return []
+        preferred_standoff_goals = self.preferred_wall_pickup_standoff_goals(standoff_goals, goal_point_cm, cfg)
+        use_preferred_first = len(preferred_standoff_goals) < len(standoff_goals)
 
-        attempts: tuple[tuple[str, HybridPlannerConfig, np.ndarray | None], ...] = (
-            ("standard", cfg, costmap),
+        attempts: list[tuple[str, HybridPlannerConfig, np.ndarray | None, list[PickupStandoffGoal]]] = []
+        attempts.append(
+            (
+                "wall-normal preferred" if use_preferred_first else "standard",
+                cfg,
+                costmap,
+                preferred_standoff_goals,
+            )
+        )
+        attempts.append(
             (
                 "relaxed soft costs",
                 cfg,
                 None if costmap is None else costmap.astype(np.float32, copy=False) * 0.1,
+                preferred_standoff_goals,
             ),
+        )
+        if use_preferred_first:
+            attempts.append(("all hard-valid approaches", cfg, costmap, standoff_goals))
+        attempts.append(
             (
                 "desperation",
                 replace(
@@ -1433,6 +1514,7 @@ class HybridAStarPlanner:
                     ),
                 ),
                 None,
+                standoff_goals,
             ),
         )
         ball_x, ball_y = self.goal_to_field_metric_cm(goal_node, goal_point_cm)
@@ -1441,7 +1523,7 @@ class HybridAStarPlanner:
             f"targeting ball at ({ball_x:.1f}, {ball_y:.1f}); "
             f"{len(standoff_goals)} hard-valid standoff candidates."
         )
-        for attempt_index, (attempt_name, attempt_config, attempt_costmap) in enumerate(attempts, start=1):
+        for attempt_index, (attempt_name, attempt_config, attempt_costmap, attempt_goals) in enumerate(attempts, start=1):
             segment = self._search_pickup_standoff_goal_once(
                 raw_red_grid,
                 start_pose,
@@ -1451,7 +1533,7 @@ class HybridAStarPlanner:
                 goal_point_cm,
                 attempt_costmap,
                 collision_checker,
-                standoff_goals,
+                attempt_goals,
                 attempt_name,
             )
             if segment:
@@ -2021,6 +2103,8 @@ class RoutePlanningFacade:
             flexible_standoff_min_cm=self.planner_config.flexible_standoff_min_cm,
             flexible_standoff_heading_tolerance_rad=self.planner_config.flexible_standoff_heading_tolerance_rad,
             unload_staging_margin_cm=self.planner_config.unload_staging_margin_cm,
+            wall_pickup_prefer_distance_cm=self.planner_config.wall_pickup_prefer_distance_cm,
+            wall_pickup_perpendicular_tolerance_rad=self.planner_config.wall_pickup_perpendicular_tolerance_rad,
             avoid_non_target_balls_enabled=self.planner_config.avoid_non_target_balls_enabled,
             ball_radius_cm=self.planner_config.ball_radius_cm,
             non_target_ball_extra_clearance_cm=self.planner_config.non_target_ball_extra_clearance_cm,

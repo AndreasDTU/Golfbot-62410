@@ -32,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from pathfinding.planner import RoutePlanningFacade
-from robot.control import DriveSafetyGuard, distance_to_route_goal_cm, route_goal_pose
+from robot.control import DriveSafetyGuard, distance_to_route_goal_cm, robot_body_edge_clearance_cm, route_goal_pose
 from robot.controller import RobotController
 from robot.io import TcpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
@@ -66,6 +66,8 @@ class PickupExecutionState(Enum):
     BLIND_APPROACH = "BLIND_APPROACH"
     PICKUP_ASSIST = "PICKUP_ASSIST"
     REPLAN = "REPLAN"
+    POST_PICKUP_ESCAPE = "POST_PICKUP_ESCAPE"
+    POST_PICKUP_ALIGN = "POST_PICKUP_ALIGN"
 
 
 class UnloadExecutionState(Enum):
@@ -124,6 +126,7 @@ class RuntimeState:
     near_zone_alignment_iterations: int = 0
     near_zone_alignment_settle_started_s: float = 0.0
     near_zone_alignment_settle_reason: str = ""
+    post_pickup_escape_fired: bool = False
     unload_state: UnloadExecutionState = UnloadExecutionState.IDLE
     unload_command_fired: bool = False
     unload_started_s: float = 0.0
@@ -164,6 +167,7 @@ class RuntimeState:
         self.near_zone_alignment_iterations = 0
         self.near_zone_alignment_settle_started_s = 0.0
         self.near_zone_alignment_settle_reason = ""
+        self.post_pickup_escape_fired = False
 
     def reset_unload_alignment_state(self) -> None:
         self.unload_alignment_best_error_cm = float("inf")
@@ -1000,6 +1004,114 @@ class TopdownDetectorApp:
         self.runtime.route_cache_target_cm = None
         return True
 
+    def _robot_body_edge_clearance_cm(self) -> float:
+        if self.runtime.robot_pose is None:
+            return float("inf")
+        geometry = self.robot_estimator.robot_geometry_from_params(self.latest_params)
+        return robot_body_edge_clearance_cm(self.runtime.robot_pose, geometry, self.config.field)
+
+    def _next_route_goal_after_pickup(self) -> HybridPose | None:
+        if self.runtime.robot_pose is None or len(self.runtime.route_plan.points) < 2:
+            return None
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+        )
+        if tracking_error is None:
+            if self.runtime.route_plan.unload_pose is not None:
+                return self.runtime.route_plan.unload_pose
+            return self.runtime.route_plan.points[-1]
+        return route_goal_pose(
+            self.runtime.route_plan.points,
+            tracking_error,
+            self.runtime.route_plan.pickup_poses,
+            include_final=True,
+        )
+
+    def _begin_post_pickup_recovery(self, drive_runtime: DriveRuntime, next_message: str) -> bool:
+        """Choose a bounded recovery action before route tracking resumes."""
+        clearance_cm = self._robot_body_edge_clearance_cm()
+        if clearance_cm <= self.config.drive.post_pickup_escape_clearance_cm:
+            self.runtime.pickup_state = PickupExecutionState.POST_PICKUP_ESCAPE
+            self.runtime.post_pickup_escape_fired = False
+            self.drive_guard.wheel_controller.reset()
+            self._force_drive_stop(
+                drive_runtime,
+                DriveControlState.POST_PICKUP_ESCAPE,
+                f"{next_message}; edge {clearance_cm:.1f}cm, reversing before replan",
+            )
+            return True
+        if (
+            clearance_cm <= self.config.drive.post_pickup_align_clearance_cm
+            and self._next_route_goal_after_pickup() is not None
+        ):
+            self.runtime.pickup_state = PickupExecutionState.POST_PICKUP_ALIGN
+            self.drive_guard.wheel_controller.reset()
+            self._force_drive_stop(
+                drive_runtime,
+                DriveControlState.POST_PICKUP_ALIGN,
+                f"{next_message}; edge {clearance_cm:.1f}cm, pivoting before drive",
+            )
+            return True
+        self.runtime.reset_pickup_state()
+        drive_runtime.stop(DriveControlState.REPLANNING, next_message)
+        return True
+
+    def _run_post_pickup_escape(self, drive_runtime: DriveRuntime) -> bool:
+        """Back away from a critically close wall before asking for a fresh route."""
+        if not self.runtime.post_pickup_escape_fired:
+            self.drive_guard.wheel_controller.reset()
+            self._force_drive_stop(drive_runtime, DriveControlState.POST_PICKUP_ESCAPE, "post-pickup reverse escape")
+            try:
+                self._controller().back(
+                    round(float(self.config.drive.post_pickup_escape_back_cm), 1),
+                    int(round(self.config.drive.post_pickup_escape_speed_pct)),
+                )
+            except Exception as exc:
+                drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"post-pickup reverse escape failed: {exc}")
+                self.runtime.clear_route()
+                self.runtime.reset_pickup_state()
+                return True
+            self.runtime.post_pickup_escape_fired = True
+            self.runtime.clear_route()
+            drive_runtime.stop(DriveControlState.REPLANNING, "post-pickup reverse escape complete; requesting new route")
+            self.runtime.reset_pickup_state()
+            return True
+        self.runtime.clear_route()
+        drive_runtime.stop(DriveControlState.REPLANNING, "post-pickup reverse escape complete; requesting new route")
+        self.runtime.reset_pickup_state()
+        return True
+
+    def _run_post_pickup_align(self, drive_runtime: DriveRuntime) -> bool:
+        """Tank-steer in place toward the next route goal before resuming XTE."""
+        if self.runtime.robot_pose is None:
+            drive_runtime.stop(DriveControlState.NO_POSE, "post-pickup align missing robot pose")
+            return True
+        goal = self._next_route_goal_after_pickup()
+        if goal is None:
+            self.runtime.reset_pickup_state()
+            drive_runtime.stop(DriveControlState.REPLANNING, "post-pickup align has no route goal")
+            return True
+        heading_to_goal = math.atan2(
+            goal.y_cm - self.runtime.robot_pose.y_cm,
+            goal.x_cm - self.runtime.robot_pose.x_cm,
+        )
+        heading_error_rad = normalize_angle(heading_to_goal - self.runtime.robot_pose.heading_rad)
+        tolerance_rad = math.radians(self.config.drive.post_pickup_align_tolerance_deg)
+        if abs(heading_error_rad) <= tolerance_rad:
+            self.drive_guard.wheel_controller.reset()
+            self._force_drive_stop(drive_runtime, DriveControlState.POST_PICKUP_ALIGN, "post-pickup pivot complete")
+            self.runtime.reset_pickup_state()
+            return True
+        speed_pct = float(self.config.drive.post_pickup_align_speed_pct)
+        left_pct = -math.copysign(speed_pct, heading_error_rad)
+        right_pct = math.copysign(speed_pct, heading_error_rad)
+        drive_runtime.state = DriveControlState.POST_PICKUP_ALIGN
+        drive_runtime.last_message = f"Post-pickup pivot {math.degrees(heading_error_rad):.1f}deg"
+        drive_runtime.last_command = WheelCommand(left_pct, right_pct)
+        drive_runtime.dispatcher.send_wheel_speeds(left_pct, right_pct, force=True)
+        return True
+
     def _start_pickup_assist_command_thread(self) -> None:
         if self.pickup_thread is not None and self.pickup_thread.is_alive():
             return
@@ -1021,6 +1133,10 @@ class TopdownDetectorApp:
             return False
         if state == PickupExecutionState.NAVIGATION:
             return self._run_near_zone_precise_move(drive_runtime)
+        if state == PickupExecutionState.POST_PICKUP_ESCAPE:
+            return self._run_post_pickup_escape(drive_runtime)
+        if state == PickupExecutionState.POST_PICKUP_ALIGN:
+            return self._run_post_pickup_align(drive_runtime)
 
         if state == PickupExecutionState.PICKUP_ASSIST:
             drive_runtime.stop(DriveControlState.PICKUP, "pickup assist")
@@ -1038,19 +1154,13 @@ class TopdownDetectorApp:
         if state == PickupExecutionState.REPLAN:
             self.drive_guard.wheel_controller.reset()
             if self.optimistic_collection_complete() and self.runtime.route_plan.unload_pose is not None:
-                drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; routing to unload")
                 self.consume_completed_pickup_checkpoint()
-                self.runtime.reset_pickup_state()
-                return True
+                return self._begin_post_pickup_recovery(drive_runtime, "pickup complete; routing to unload")
             if self.should_keep_cached_route_after_pickup():
-                drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; continuing cached route")
                 self.consume_completed_pickup_checkpoint()
-                self.runtime.reset_pickup_state()
-                return True
+                return self._begin_post_pickup_recovery(drive_runtime, "pickup complete; continuing cached route")
             self.runtime.clear_route()
-            drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; requesting new route")
-            self.runtime.reset_pickup_state()
-            return True
+            return self._begin_post_pickup_recovery(drive_runtime, "pickup complete; requesting new route")
 
         return False
 

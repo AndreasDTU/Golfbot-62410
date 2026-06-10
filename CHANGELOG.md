@@ -40,6 +40,20 @@ All notable larger additions and behavioral changes to this repository should be
     static small-goal center, then hands directly to `UNLOAD_ALIGNING` for final
     reverse visual-servo correction and pipe-drop verification.
 
+- Added wall-aware pickup approach prioritization.
+  - Balls close to a field wall now first try wall-normal pickup standoff goals
+    so the robot avoids wall-parallel approaches unless they are the only
+    routeable option.
+  - Tightly cornered balls now include backed-off diagonal candidates when the
+    exact tube-center-over-ball pose is body-invalid but the ball remains inside
+    the intake-mouth capture tolerance.
+
+- Added post-pickup wall recovery before resuming route tracking.
+  - Critical edge clearance now triggers a bounded TCP reverse escape, clears
+    the cached route, and requests a replan from the backed-out pose.
+  - Less severe edge proximity enters `POST_PICKUP_ALIGN`, tank-steers in place
+    toward the next route goal, and only then returns to normal XTE tracking.
+
 - Changed autonomous unload routing to target a fixed perpendicular staging
   pose.
   - After all balls are collected, Hybrid A* now routes to a body-center pose at

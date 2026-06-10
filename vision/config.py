@@ -293,6 +293,8 @@ class PlannerConfig:
     flexible_standoff_min_cm: float = 0.0
     flexible_standoff_heading_tolerance_rad: float = math.radians(10.0)
     unload_staging_margin_cm: float = 2.0
+    wall_pickup_prefer_distance_cm: float = 12.0
+    wall_pickup_perpendicular_tolerance_rad: float = math.radians(35.0)
     num_intermediate_snapshots: int = 0
     route_heading_marker_interval: int = 20
     route_target_move_invalidate_cm: float = 5.0
@@ -356,6 +358,12 @@ class DriveConfig:
     manual_move_speed: int = 40
     manual_turn_degrees: int = 15
     manual_turn_speed: int = 30
+    post_pickup_escape_clearance_cm: float = 4.0
+    post_pickup_align_clearance_cm: float = 12.0
+    post_pickup_escape_back_cm: float = 8.0
+    post_pickup_escape_speed_pct: float = 8.0
+    post_pickup_align_tolerance_deg: float = 15.0
+    post_pickup_align_speed_pct: float = 18.0
     unload_staging_distance_cm: float = 10.0
     unload_pivot_tolerance_deg: float = 12.0
     unload_pivot_speed_pct: float = 18.0

@@ -176,6 +176,19 @@ the planner accepts that pose as the handoff point. This lets the robot stop,
 pivot, and start the TCP sneak immediately when it is already close instead of
 backing up to exactly 15 cm.
 
+For balls close to a field wall, the pickup-standoff search first tries only
+wall-normal approach headings. This keeps the robot from choosing wall-parallel
+approaches when a perpendicular approach is available. If no wall-normal route
+can be found, the planner falls back to all hard-valid pickup approaches so a
+wall ball is not skipped merely because the preferred approach is blocked.
+
+Tightly cornered balls use a deterministic diagonal pickup fallback before the
+normal standoff ring. If the exact tube-center-over-ball pose would put the
+robot body outside the legal footprint, the corner fallback may back the body
+away by a few centimeters as long as the ball remains inside the intake-mouth
+capture tolerance. This keeps deepest-corner balls routeable without relaxing
+hard wall or robot-body collision checks.
+
 Before a route segment is returned, Hybrid A* applies a greedy pruning pass. A
 middle node is removed when the anchor node has a sampled collision-free straight
 segment to a later node and that shortcut does not enter a worse soft-cost band
@@ -194,17 +207,21 @@ target ball directly. The final pose is then the straight-line creep endpoint
 whose tube center lands on the ball. This keeps smoothing from removing the
 controlled TCP creep sequence.
 
-Pickup-standoff search uses progressive fallback when the standard soft-cost
-attempt exhausts its expansion budget:
+Pickup-standoff search uses progressive fallback when the preferred/standard
+soft-cost attempt exhausts its expansion budget:
 
-1. Standard weighted A* with normal soft ball costs.
+1. Wall-normal preferred weighted A* for near-wall balls, otherwise standard
+   weighted A* with normal soft ball costs.
 2. Relaxed soft costs, with the ball costmap scaled to 10% of its original
    values.
-3. Desperation mode, with no soft ball costs, `heuristic_weight = 1.0`, and the
+3. All hard-valid pickup approaches for near-wall balls whose wall-normal
+   preferred attempt failed.
+4. Desperation mode, with no soft ball costs, `heuristic_weight = 1.0`, and the
    flexible handoff heading tolerance widened to 30 degrees.
 
 These fallbacks never relax hard red-zone, wall, or robot-footprint validity.
-If no hard-valid standoff/final pickup pair exists, the target is still rejected
+If no hard-valid standoff/final pickup pair exists and the tight-corner fallback
+cannot produce a body-valid intake-mouth pose, the target is still rejected
 before search begins.
 
 ## Route Cache
@@ -268,7 +285,12 @@ calibrated TCP position control on the same command server:
 8. Execute blocking TCP `move(distance, speedPercent)` only if post-settle
    verification still passes.
 9. Run the collection-only `pickup_assist()` pipe command.
-10. Continue along the cached global route unless visible remaining balls no
+10. Before normal XTE tracking resumes, run post-pickup wall recovery when the
+   body is near an edge. Critical edge clearance triggers one low-speed TCP
+   `back(...)`, clears the route cache, and requests a fresh route from the
+   backed-out pose. Less severe edge proximity triggers an in-place `LR +/-
+   speed` pivot toward the next pickup or unload goal.
+11. Continue along the cached global route unless visible remaining balls no
    longer match the original plan.
 
 The near-zone TCP turn speed is configured through `DriveConfig`; the TCP move

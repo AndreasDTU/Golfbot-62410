@@ -470,15 +470,15 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.initial_total_balls = 2
         app.runtime.balls_collected = 1
         app.runtime.pickup_state = PickupExecutionState.REPLAN
-        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
+        app.runtime.robot_pose = RobotPose(40.0, 40.0, 0.0, 40.0, 40.0)
         app.runtime.route_plan = RoutePlan(
             points=[
-                HybridPose(0.0, 0.0, 0.0),
-                HybridPose(10.0, 0.0, 0.0),
-                HybridPose(20.0, 0.0, 0.0),
+                HybridPose(30.0, 40.0, 0.0),
+                HybridPose(40.0, 40.0, 0.0),
+                HybridPose(55.0, 40.0, 0.0),
             ],
             active_target=SimpleNamespace(track_id=1),
-            pickup_poses=[HybridPose(10.0, 0.0, 0.0), HybridPose(20.0, 0.0, 0.0)],
+            pickup_poses=[HybridPose(40.0, 40.0, 0.0), HybridPose(55.0, 40.0, 0.0)],
         )
         app.runtime.route_cache_ball_signature = (
             (1, "white", 2, 0),
@@ -494,12 +494,92 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertTrue(owns_control)
         self.assertTrue(app.runtime.route_plan.points)
-        self.assertEqual(app.runtime.route_plan.pickup_poses, [HybridPose(20.0, 0.0, 0.0)])
+        self.assertEqual(app.runtime.route_plan.pickup_poses, [HybridPose(55.0, 40.0, 0.0)])
         self.assertIsNone(app.runtime.route_plan.active_target)
         self.assertEqual(app.runtime.route_cache_target_id, -1)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
-        self.assertAlmostEqual(app._pickup_distance_to_goal_cm(), 10.0)
+        self.assertAlmostEqual(app._pickup_distance_to_goal_cm(), 15.0)
         self.assertEqual(drive_runtime.last_message, "pickup complete; continuing cached route")
+
+    def test_post_pickup_critical_edge_clearance_reverses_then_replans(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 2
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(5.0, 40.0, 0.0, 5.0, 40.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(5.0, 40.0, 0.0), HybridPose(30.0, 40.0, 0.0)],
+            active_target=SimpleNamespace(track_id=1),
+            pickup_poses=[HybridPose(5.0, 40.0, 0.0), HybridPose(30.0, 40.0, 0.0)],
+        )
+        app.runtime.route_cache_ball_signature = ((2, "white", 6, 8),)
+        app.runtime.route_cache_unload_extension_cm = 15.0
+        app.runtime.route_cache_target_id = 1
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(2, "white", (0, 0), (0, 0), 4, 30.0, 40.0),
+        ]
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def back(self, distance: float, speed_percent: int) -> str:
+                events.append(("back", distance, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.0))
+            self.assertEqual(app.runtime.pickup_state, PickupExecutionState.POST_PICKUP_ESCAPE)
+            self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.1))
+
+        self.assertEqual(
+            events,
+            [("back", app.config.drive.post_pickup_escape_back_cm, int(round(app.config.drive.post_pickup_escape_speed_pct)))],
+        )
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertEqual(app.runtime.route_plan.points, [])
+        self.assertEqual(drive_runtime.state, DriveControlState.REPLANNING)
+
+    def test_post_pickup_low_edge_clearance_tank_pivots_before_navigation(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 2
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(20.0, 40.0, 0.0, 20.0, 40.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(20.0, 40.0, 0.0), HybridPose(20.0, 70.0, math.pi * 0.5)],
+            active_target=SimpleNamespace(track_id=1),
+            pickup_poses=[HybridPose(20.0, 40.0, 0.0), HybridPose(20.0, 70.0, math.pi * 0.5)],
+        )
+        app.runtime.route_cache_ball_signature = ((2, "white", 4, 14),)
+        app.runtime.route_cache_unload_extension_cm = 15.0
+        app.runtime.route_cache_target_id = 1
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(2, "white", (0, 0), (0, 0), 4, 20.0, 70.0),
+        ]
+
+        self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.0))
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.POST_PICKUP_ALIGN)
+        self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.1))
+
+        self.assertEqual(drive_runtime.state, DriveControlState.POST_PICKUP_ALIGN)
+        self.assertEqual(
+            dispatcher.commands[-1],
+            (
+                -app.config.drive.post_pickup_align_speed_pct,
+                app.config.drive.post_pickup_align_speed_pct,
+                True,
+            ),
+        )
+        app.runtime.robot_pose = RobotPose(20.0, 40.0, math.pi * 0.5, 20.0, 40.0)
+        self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.2))
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
 
     def test_unload_endpoint_runs_pipe_only_double_unload_once(self) -> None:
         app = TopdownDetectorApp()
@@ -745,12 +825,12 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.initial_total_balls = 1
         app.runtime.balls_collected = 1
         app.runtime.pickup_state = PickupExecutionState.REPLAN
-        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
+        app.runtime.robot_pose = RobotPose(40.0, 40.0, 0.0, 40.0, 40.0)
         app.runtime.route_plan = RoutePlan(
-            points=[HybridPose(10.0, 0.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
+            points=[HybridPose(40.0, 40.0, 0.0), HybridPose(55.0, 60.0, 0.0)],
             active_target=None,
-            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
-            unload_pose=HybridPose(25.0, 60.0, 0.0),
+            pickup_poses=[HybridPose(40.0, 40.0, 0.0)],
+            unload_pose=HybridPose(55.0, 60.0, 0.0),
             unload_goal_cm=(0.0, 60.0),
         )
 

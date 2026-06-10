@@ -316,6 +316,14 @@ class TopdownDetectorApp:
         self.pickup_last_error: str = ""
         self.unload_thread: threading.Thread | None = None
         self.unload_last_error: str = ""
+        self.controller: RobotController | None = None
+
+    def _controller(self):
+        print("Creating controller")
+        if self.controller is None:
+            self.controller = RobotController(self.config.drive.robot_ip, self.config.drive.robot_tcp_port)
+        print(str(self.controller))
+        return self.controller
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
@@ -544,7 +552,7 @@ class TopdownDetectorApp:
 
     def _make_drive_runtime(self, drive_enabled: bool) -> tuple[DriveRuntime, TcpWheelDispatcher | None]:
         dispatcher = (
-            TcpWheelDispatcher(drive_config=self.config.drive)
+            TcpWheelDispatcher(controller=self._controller(), drive_config=self.config.drive)
             if drive_enabled
             else None
         )
@@ -815,7 +823,6 @@ class TopdownDetectorApp:
             return True
 
         try:
-            controller = RobotController(self.config.drive.robot_ip)
             if not self.runtime.near_zone_turn_fired:
                 target_heading_rad = math.atan2(
                     target_y_cm - float(self.runtime.robot_pose.y_cm),
@@ -825,7 +832,7 @@ class TopdownDetectorApp:
                 tcp_turn_deg = -heading_error_deg
                 if abs(tcp_turn_deg) > 0.5:
                     drive_runtime.last_message = f"TCP turn {tcp_turn_deg:.1f}deg"
-                    controller.turn(
+                    self._controller().turn(
                         round(tcp_turn_deg, 1),
                         int(round(self.config.drive.near_zone_turn_speed_pct)),
                     )
@@ -845,7 +852,7 @@ class TopdownDetectorApp:
                     f"Visual servo {abs(lateral_cm):.2f}cm lateral; "
                     f"turn {turn_deg:.2f}deg @ {turn_speed_pct}%"
                 )
-                controller.turn(round(turn_deg, 2), turn_speed_pct)
+                self._controller().turn(round(turn_deg, 2), turn_speed_pct)
                 return True
 
             target_x_cm, target_y_cm = self._pickup_target_body_pose(goal)
@@ -859,7 +866,7 @@ class TopdownDetectorApp:
                 return True
 
             drive_runtime.last_message = f"TCP move {remaining_cm:.1f}cm after visual servo: {reason}"
-            controller.move(
+            self._controller().move(
                 round(remaining_cm, 1),
                 int(round(self.config.drive.near_zone_move_speed_pct)),
             )
@@ -939,7 +946,7 @@ class TopdownDetectorApp:
 
         def run_pickup_assist() -> None:
             try:
-                RobotController(self.config.drive.robot_ip).pickup_assist()
+                self._controller().pickup_assist()
                 self.pickup_last_error = ""
             except Exception as exc:
                 self.pickup_last_error = str(exc)
@@ -1024,16 +1031,11 @@ class TopdownDetectorApp:
             return
 
         def run_unload_sequence() -> None:
-            controller: RobotController | None = None
             try:
-                controller = RobotController(self.config.drive.robot_ip)
-                # Turn 180
-                controller.turn(180)
-
                 self.runtime.collector_state = CollectorPositionState.UNLOADING
                 self.runtime.unload_state = UnloadExecutionState.UNLOADING_FIRST
                 print("Unload: first unload_full_cycle")
-                controller.unload_full_cycle()
+                self._controller().unload_full_cycle()
 
                 self.runtime.unload_state = UnloadExecutionState.PIPE_SHAKE
                 shake_cycles = max(0, int(self.config.drive.unload_pipe_shake_cycles))
@@ -1041,13 +1043,13 @@ class TopdownDetectorApp:
                 shake_speed = int(round(self.config.drive.unload_pipe_shake_speed))
                 for cycle in range(shake_cycles):
                     print(f"Unload: pipe shake cycle {cycle + 1}/{shake_cycles}")
-                    controller.pipe_down(shake_units, shake_speed)
-                    controller.pipe_up(shake_units, shake_speed)
+                    self._controller().pipe_down(shake_units, shake_speed)
+                    self._controller().pipe_up(shake_units, shake_speed)
 
                 self.runtime.unload_state = UnloadExecutionState.UNLOADING_SECOND
                 print("Unload: second unload_full_cycle")
-                controller.unload_full_cycle()
-                controller.pipe_stop()
+                self._controller().unload_full_cycle()
+                self._controller().pipe_stop()
                 self.runtime.collector_state = CollectorPositionState.UNKNOWN
                 self.runtime.unload_state = UnloadExecutionState.COMPLETE
                 self.unload_last_error = ""
@@ -1056,9 +1058,9 @@ class TopdownDetectorApp:
                 self.unload_last_error = str(exc)
                 self.runtime.unload_state = UnloadExecutionState.FAILED
                 print(f"Unload: failed: {exc}")
-                if controller is not None:
+                if self.controller is not None:
                     try:
-                        controller.pipe_stop()
+                        self._controller().pipe_stop()
                     except Exception as stop_exc:
                         print(f"Unload: pipe_stop after failure also failed: {stop_exc}")
                 self.runtime.collector_state = CollectorPositionState.UNKNOWN

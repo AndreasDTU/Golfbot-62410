@@ -128,7 +128,7 @@ class RobotGeometryConfig:
     tuned_tube_offset_cm: float = 17.1
     tuned_tube_right_offset_cm: float = 0.0
     tube_width_cm: float = 6.0
-    tuned_unload_extension_cm: float = 17.0
+    tuned_unload_extension_cm: float = 40.0
 
     @property
     def front_axle_from_origin_cm(self) -> float:
@@ -333,7 +333,7 @@ class DriveConfig:
     visual_servo_noise_floor_cm: float = 0.25
     visual_servo_min_improvement_cm: float = 0.08
     visual_servo_stall_frames: int = 3
-    visual_servo_max_iterations: int = 4
+    visual_servo_max_iterations: int = 12
     visual_servo_turn_kp: float = 0.85
     visual_servo_min_turn_deg: float = 0.25
     visual_servo_max_turn_deg: float = 8.0

@@ -1027,6 +1027,9 @@ class TopdownDetectorApp:
             controller: RobotController | None = None
             try:
                 controller = RobotController(self.config.drive.robot_ip)
+                # Turn 180
+                controller.turn(180)
+
                 self.runtime.collector_state = CollectorPositionState.UNLOADING
                 self.runtime.unload_state = UnloadExecutionState.UNLOADING_FIRST
                 print("Unload: first unload_full_cycle")

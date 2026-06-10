@@ -555,6 +555,9 @@ class DriveControlTests(unittest.TestCase):
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
             owns_control = app.update_unload_state(drive_runtime, now_s=1.0)
             self.assertIsNone(app.unload_thread)
+            self.assertEqual(app.runtime.unload_state, UnloadExecutionState.PRE_UNLOAD_PIVOT)
+            owns_after_pivot = app.update_unload_state(drive_runtime, now_s=1.05)
+            self.assertIsNone(app.unload_thread)
             app.runtime.unload_alignment_settle_started_s = (
                 time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
             )
@@ -564,6 +567,7 @@ class DriveControlTests(unittest.TestCase):
             owns_after_complete = app.update_unload_state(drive_runtime, now_s=1.2)
 
         self.assertTrue(owns_control)
+        self.assertTrue(owns_after_pivot)
         self.assertTrue(owns_after_alignment)
         self.assertTrue(owns_after_complete)
         self.assertEqual(
@@ -623,6 +627,8 @@ class DriveControlTests(unittest.TestCase):
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
             self.assertTrue(app.update_unload_state(drive_runtime, now_s=1.0))
+            self.assertEqual(app.runtime.unload_state, UnloadExecutionState.PRE_UNLOAD_PIVOT)
+            self.assertTrue(app.update_unload_state(drive_runtime, now_s=1.05))
             app.runtime.unload_alignment_settle_started_s = (
                 time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
             )
@@ -633,6 +639,39 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(app.runtime.unload_state, UnloadExecutionState.ALIGNING)
         self.assertIn(("back", 3.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
         self.assertNotIn(("unload_full_cycle",), events)
+
+    def test_unload_staging_pivot_suspends_xte_and_tank_turns(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        unload_y = app.config.field.height_cm * 0.5
+        app.runtime.robot_pose = RobotPose(70.0, unload_y, math.radians(90.0), 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(90.0, unload_y, 0.0), HybridPose(50.0, unload_y, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+            unload_pose=HybridPose(50.0, unload_y, 0.0),
+            unload_goal_cm=(0.0, unload_y),
+        )
+
+        owns_control = app.update_unload_state(drive_runtime, now_s=1.0)
+        pivot_owns_control = app.update_unload_state(drive_runtime, now_s=1.1)
+
+        self.assertTrue(owns_control)
+        self.assertTrue(pivot_owns_control)
+        self.assertEqual(app.runtime.unload_state, UnloadExecutionState.PRE_UNLOAD_PIVOT)
+        self.assertEqual(drive_runtime.state, DriveControlState.PRE_UNLOAD_PIVOT)
+        self.assertEqual(dispatcher.commands[0][:2], (0.0, 0.0))
+        self.assertEqual(
+            dispatcher.commands[-1],
+            (
+                app.config.drive.unload_pivot_speed_pct,
+                -app.config.drive.unload_pivot_speed_pct,
+                True,
+            ),
+        )
 
     def test_unload_endpoint_waits_for_optimistic_collection_complete(self) -> None:
         app = TopdownDetectorApp()

@@ -36,7 +36,15 @@ from robot.control import DriveSafetyGuard, distance_to_route_goal_cm, route_goa
 from robot.controller import RobotController
 from robot.io import TcpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
-from robot.models import DriveControlState, DriveRuntime, RobotCalibrationPhase, RobotCalibrationRuntime, RobotGeometry, RobotPose
+from robot.models import (
+    DriveControlState,
+    DriveRuntime,
+    RobotCalibrationPhase,
+    RobotCalibrationRuntime,
+    RobotGeometry,
+    RobotPose,
+    WheelCommand,
+)
 from vision.calibration import HomographyCalibrator
 from vision.config import AppConfig
 from vision.debug import DebugRenderer
@@ -64,6 +72,7 @@ class UnloadExecutionState(Enum):
     """Minimal terminal unload states for the live drive loop."""
 
     IDLE = "IDLE"
+    PRE_UNLOAD_PIVOT = "PRE_UNLOAD_PIVOT"
     ALIGNING = "UNLOAD_ALIGNING"
     SETTLING = "UNLOAD_SETTLING"
     READY = "UNLOAD_READY"
@@ -1077,6 +1086,48 @@ class TopdownDetectorApp:
         )
         return distance_cm <= self.config.drive.unload_trigger_distance_cm
 
+    def _unload_route_is_terminal_target(self) -> bool:
+        if (
+            self.runtime.robot_pose is None
+            or self.runtime.route_plan.unload_pose is None
+            or len(self.runtime.route_plan.points) < 2
+            or self.runtime.pickup_state != PickupExecutionState.NAVIGATION
+            or not self.optimistic_collection_complete()
+        ):
+            return False
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            self.runtime.robot_pose,
+            self.runtime.route_plan.points,
+        )
+        if tracking_error is None:
+            return False
+        next_goal = route_goal_pose(
+            self.runtime.route_plan.points,
+            tracking_error,
+            self.runtime.route_plan.pickup_poses,
+            include_final=True,
+        )
+        unload_pose = self.runtime.route_plan.unload_pose
+        return next_goal is not None and math.hypot(
+            next_goal.x_cm - unload_pose.x_cm,
+            next_goal.y_cm - unload_pose.y_cm,
+        ) <= self.config.planner.goal_tolerance_cm
+
+    def _unload_staging_intercept_reached(self) -> bool:
+        if self.runtime.robot_pose is None or not self._unload_route_is_terminal_target():
+            return False
+        goal_x, goal_y = self._unload_goal_center_cm()
+        distance_to_goal_cm = math.hypot(
+            self.runtime.robot_pose.x_cm - goal_x,
+            self.runtime.robot_pose.y_cm - goal_y,
+        )
+        geometry = self._unload_geometry()
+        minimum_staging_distance_cm = (
+            geometry.rear_cm + geometry.unload_extension_cm + self.config.drive.near_zone_cm
+        )
+        staging_distance_cm = max(self.config.drive.unload_staging_distance_cm, minimum_staging_distance_cm)
+        return distance_to_goal_cm <= staging_distance_cm
+
     def _force_drive_stop(self, drive_runtime: DriveRuntime, state: DriveControlState, message: str) -> None:
         """Send a deterministic zero-speed command, forcing a TCP stop packet."""
         drive_runtime.stop(state, message)
@@ -1158,6 +1209,52 @@ class TopdownDetectorApp:
         speed_pct = int(round(self.config.drive.near_zone_move_speed_pct))
         command = "back" if rear_forward_error_cm > 0.0 else "move"
         return command, distance_cm, speed_pct
+
+    def _pre_unload_pivot_metrics(self) -> dict[str, float | bool]:
+        """Return the rough point-turn error needed to face the rear at the goal."""
+        if self.runtime.robot_pose is None:
+            return {"valid": False}
+        robot_pose = self.runtime.robot_pose
+        goal_x, goal_y = self._unload_goal_center_cm()
+        goal_bearing_rad = math.atan2(goal_y - robot_pose.y_cm, goal_x - robot_pose.x_cm)
+        desired_heading_rad = normalize_angle(goal_bearing_rad - math.pi)
+        heading_error_rad = normalize_angle(desired_heading_rad - robot_pose.heading_rad)
+        tolerance_rad = math.radians(self.config.drive.unload_pivot_tolerance_deg)
+        return {
+            "valid": abs(heading_error_rad) <= tolerance_rad,
+            "heading_error_rad": heading_error_rad,
+            "tolerance_rad": tolerance_rad,
+        }
+
+    def _run_pre_unload_pivot(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
+        """Suspend XTE and tank-steer in place until the rear roughly faces the goal."""
+        if self.runtime.robot_pose is None:
+            drive_runtime.stop(DriveControlState.NO_POSE, "pre-unload pivot missing robot pose")
+            return True
+        metrics = self._pre_unload_pivot_metrics()
+        if metrics.get("valid", False):
+            self.runtime.unload_state = UnloadExecutionState.ALIGNING
+            self.runtime.reset_unload_alignment_state()
+            self.drive_guard.wheel_controller.reset()
+            self._force_drive_stop(
+                drive_runtime,
+                DriveControlState.PRE_UNLOAD_PIVOT,
+                "pre-unload pivot complete; starting rear visual servo",
+            )
+            print("Unload: pre-unload pivot complete; starting reverse visual-servo alignment")
+            return self._run_unload_precise_move(drive_runtime, now_s)
+
+        heading_error_rad = float(metrics["heading_error_rad"])
+        speed_pct = float(self.config.drive.unload_pivot_speed_pct)
+        left_pct = -math.copysign(speed_pct, heading_error_rad)
+        right_pct = math.copysign(speed_pct, heading_error_rad)
+        drive_runtime.state = DriveControlState.PRE_UNLOAD_PIVOT
+        drive_runtime.last_message = (
+            f"Pre-unload pivot {math.degrees(heading_error_rad):.1f}deg"
+        )
+        drive_runtime.last_command = WheelCommand(left_pct, right_pct)
+        drive_runtime.dispatcher.send_wheel_speeds(left_pct, right_pct, force=True)
+        return True
 
     def _run_unload_precise_move(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
         """Reverse visual-servo the rear unload tip onto the goal before dropping the pipe."""
@@ -1316,10 +1413,22 @@ class TopdownDetectorApp:
         if self.unload_thread is not None and self.unload_thread.is_alive():
             drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
             return True
+        if state == UnloadExecutionState.PRE_UNLOAD_PIVOT:
+            return self._run_pre_unload_pivot(drive_runtime, now_s)
         if state in (UnloadExecutionState.ALIGNING, UnloadExecutionState.SETTLING):
             return self._run_unload_precise_move(drive_runtime, now_s)
         if self.runtime.unload_command_fired:
             return False
+        if self._unload_staging_intercept_reached():
+            self.runtime.unload_state = UnloadExecutionState.PRE_UNLOAD_PIVOT
+            self.drive_guard.wheel_controller.reset()
+            self._force_drive_stop(
+                drive_runtime,
+                DriveControlState.PRE_UNLOAD_PIVOT,
+                "unload staging reached; starting stationary pivot",
+            )
+            print("Unload: staging reached; starting stationary rear-facing pivot")
+            return True
         if not self._unload_endpoint_reached():
             return False
 

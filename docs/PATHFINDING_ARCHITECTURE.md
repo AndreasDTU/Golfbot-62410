@@ -297,11 +297,17 @@ If `balls_collected > 0` and the current camera frame contains zero visible
 balls, the route planner may receive an empty target list as an explicit request
 to route directly from the current robot pose to the small-goal unload pose.
 
-Before the autonomous unload pipe sequence is allowed to run, the drive loop now
-performs reverse visual servoing against the fixed small-goal center
-`(0.0, field.height_cm / 2)`. The controller computes the live rear unload tip
-from `rear_cm + unload_extension_cm`, turns so the robot rear faces the goal,
-and issues small TCP `move`/`back` corrections until the rear tip is within the
+Before the autonomous unload pipe sequence is allowed to run, the drive loop
+intercepts the final unload route inside a configurable staging radius around
+the fixed small-goal center `(0.0, field.height_cm / 2)`. It stops normal XTE
+tracking with `LR 0 0`, enters `PRE_UNLOAD_PIVOT`, and tank-steers in place
+until the robot rear roughly faces the goal. This avoids asking the XTE tracker
+to follow the tight backwards-arrival curve near the wall.
+
+After the rough stationary pivot, the drive loop performs reverse visual
+servoing. The controller computes the live rear unload tip from
+`rear_cm + unload_extension_cm`, turns so the robot rear faces the goal, and
+issues small TCP `move`/`back` corrections until the rear tip is within the
 configured visual-servo noise floor. The final drop is accepted only after a
 forced zero-speed stop, the configured settling interval, and a fresh-frame
 verification that the rear tip is still on the goal and the robot heading is

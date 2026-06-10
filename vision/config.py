@@ -355,6 +355,9 @@ class DriveConfig:
     manual_move_speed: int = 40
     manual_turn_degrees: int = 15
     manual_turn_speed: int = 30
+    unload_staging_distance_cm: float = 70.0
+    unload_pivot_tolerance_deg: float = 12.0
+    unload_pivot_speed_pct: float = 18.0
     unload_trigger_distance_cm: float = 8.0
     unload_pipe_shake_units: float = 2.0
     unload_pipe_shake_speed: int = 35

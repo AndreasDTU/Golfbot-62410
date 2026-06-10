@@ -32,6 +32,14 @@ All notable larger additions and behavioral changes to this repository should be
     fresh-frame verification that the rear tip remains inside the allowed goal
     tolerance and heading arc.
 
+- Added a pre-unload stationary pivot before reverse unload visual servoing.
+  - The drive loop now intercepts terminal unload routing inside a configurable
+    staging radius, stops XTE tracking with `LR 0 0`, and enters
+    `PRE_UNLOAD_PIVOT`.
+  - The pivot tank-steers in place until the robot rear roughly faces the
+    static small-goal center, then hands directly to `UNLOAD_ALIGNING` for final
+    reverse visual-servo correction and pipe-drop verification.
+
 ### Changed
 
 - Corrected near-zone pickup alignment and cached-route pickup consumption.

@@ -263,9 +263,12 @@ calibrated TCP position control on the same command server:
 6. Stop aligning only when the lateral error reaches the configured camera
    noise floor, improvement stalls for the configured number of frames, or the
    bounded iteration limit is reached.
-7. Execute blocking TCP `move(distance, speedPercent)`.
-8. Run the collection-only `pickup_assist()` pipe command.
-9. Continue along the cached global route unless visible remaining balls no
+7. Force a zero-speed TCP stop, wait for the configured settling interval, and
+   verify the lateral error on a fresh camera frame.
+8. Execute blocking TCP `move(distance, speedPercent)` only if post-settle
+   verification still passes.
+9. Run the collection-only `pickup_assist()` pipe command.
+10. Continue along the cached global route unless visible remaining balls no
    longer match the original plan.
 
 The near-zone TCP turn speed is configured through `DriveConfig`; the TCP move
@@ -293,6 +296,16 @@ longer matches the active geometry.
 If `balls_collected > 0` and the current camera frame contains zero visible
 balls, the route planner may receive an empty target list as an explicit request
 to route directly from the current robot pose to the small-goal unload pose.
+
+Before the autonomous unload pipe sequence is allowed to run, the drive loop now
+performs reverse visual servoing against the fixed small-goal center
+`(0.0, field.height_cm / 2)`. The controller computes the live rear unload tip
+from `rear_cm + unload_extension_cm`, turns so the robot rear faces the goal,
+and issues small TCP `move`/`back` corrections until the rear tip is within the
+configured visual-servo noise floor. The final drop is accepted only after a
+forced zero-speed stop, the configured settling interval, and a fresh-frame
+verification that the rear tip is still on the goal and the robot heading is
+within the allowed left-wall unload arc.
 
 If no ball is reachable, that negative result is cached too. The cache is still
 invalidated by ball-set changes or robot drift, which avoids repeating the most

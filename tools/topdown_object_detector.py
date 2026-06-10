@@ -64,6 +64,8 @@ class UnloadExecutionState(Enum):
     """Minimal terminal unload states for the live drive loop."""
 
     IDLE = "IDLE"
+    ALIGNING = "UNLOAD_ALIGNING"
+    SETTLING = "UNLOAD_SETTLING"
     READY = "UNLOAD_READY"
     UNLOADING_FIRST = "UNLOADING_FIRST"
     PIPE_SHAKE = "PIPE_SHAKE"
@@ -111,9 +113,16 @@ class RuntimeState:
     near_zone_alignment_best_error_cm: float = float("inf")
     near_zone_alignment_stale_frames: int = 0
     near_zone_alignment_iterations: int = 0
+    near_zone_alignment_settle_started_s: float = 0.0
+    near_zone_alignment_settle_reason: str = ""
     unload_state: UnloadExecutionState = UnloadExecutionState.IDLE
     unload_command_fired: bool = False
     unload_started_s: float = 0.0
+    unload_alignment_best_error_cm: float = float("inf")
+    unload_alignment_stale_frames: int = 0
+    unload_alignment_iterations: int = 0
+    unload_alignment_settle_started_s: float = 0.0
+    unload_alignment_settle_reason: str = ""
     collector_state: CollectorPositionState = CollectorPositionState.UNKNOWN
     initial_total_balls: int | None = None
     balls_collected: int = 0
@@ -144,6 +153,15 @@ class RuntimeState:
         self.near_zone_alignment_best_error_cm = float("inf")
         self.near_zone_alignment_stale_frames = 0
         self.near_zone_alignment_iterations = 0
+        self.near_zone_alignment_settle_started_s = 0.0
+        self.near_zone_alignment_settle_reason = ""
+
+    def reset_unload_alignment_state(self) -> None:
+        self.unload_alignment_best_error_cm = float("inf")
+        self.unload_alignment_stale_frames = 0
+        self.unload_alignment_iterations = 0
+        self.unload_alignment_settle_started_s = 0.0
+        self.unload_alignment_settle_reason = ""
 
 
 @dataclass(frozen=True)
@@ -319,10 +337,8 @@ class TopdownDetectorApp:
         self.controller: RobotController | None = None
 
     def _controller(self):
-        print("Creating controller")
         if self.controller is None:
-            self.controller = RobotController(self.config.drive.robot_ip, self.config.drive.robot_tcp_port)
-        print(str(self.controller))
+            self.controller = RobotController(self.config.drive.robot_ip, port=self.config.drive.robot_tcp_port)
         return self.controller
 
     @staticmethod
@@ -845,14 +861,49 @@ class TopdownDetectorApp:
                 target_x_cm,
                 target_y_cm,
             )
-            aligned, turn_deg, turn_speed_pct, reason = self._near_zone_visual_servo_turn(forward_cm, lateral_cm)
-            if not aligned:
-                self.runtime.near_zone_alignment_iterations += 1
-                drive_runtime.last_message = (
-                    f"Visual servo {abs(lateral_cm):.2f}cm lateral; "
-                    f"turn {turn_deg:.2f}deg @ {turn_speed_pct}%"
+            settled_verified = False
+            if self.runtime.near_zone_alignment_settle_started_s != 0.0:
+                elapsed_s = time.perf_counter() - self.runtime.near_zone_alignment_settle_started_s
+                if elapsed_s < self.config.drive.visual_servo_settle_time_s:
+                    self._force_drive_stop(
+                        drive_runtime,
+                        DriveControlState.PRECISE_MOVE,
+                        f"Visual servo settling {elapsed_s:.2f}/{self.config.drive.visual_servo_settle_time_s:.2f}s",
+                    )
+                    return True
+                if abs(lateral_cm) <= self.config.drive.visual_servo_noise_floor_cm:
+                    settled_verified = True
+                    reason = f"settled {self.runtime.near_zone_alignment_settle_reason}"
+                    self.runtime.near_zone_alignment_settle_started_s = 0.0
+                    self.runtime.near_zone_alignment_settle_reason = ""
+                else:
+                    drive_runtime.last_message = (
+                        f"Visual servo settle drift {abs(lateral_cm):.2f}cm; correcting"
+                    )
+                    self.runtime.near_zone_alignment_settle_started_s = 0.0
+                    self.runtime.near_zone_alignment_settle_reason = ""
+                    self.runtime.near_zone_alignment_best_error_cm = float("inf")
+                    self.runtime.near_zone_alignment_stale_frames = 0
+                    self.runtime.near_zone_alignment_iterations = 0
+
+            if not settled_verified:
+                aligned, turn_deg, turn_speed_pct, reason = self._near_zone_visual_servo_turn(forward_cm, lateral_cm)
+                if not aligned:
+                    self.runtime.near_zone_alignment_iterations += 1
+                    drive_runtime.last_message = (
+                        f"Visual servo {abs(lateral_cm):.2f}cm lateral; "
+                        f"turn {turn_deg:.2f}deg @ {turn_speed_pct}%"
+                    )
+                    self._controller().turn(round(turn_deg, 2), turn_speed_pct)
+                    return True
+
+                self.runtime.near_zone_alignment_settle_started_s = time.perf_counter()
+                self.runtime.near_zone_alignment_settle_reason = reason
+                self._force_drive_stop(
+                    drive_runtime,
+                    DriveControlState.PRECISE_MOVE,
+                    f"Visual servo aligned; settling before move: {reason}",
                 )
-                self._controller().turn(round(turn_deg, 2), turn_speed_pct)
                 return True
 
             target_x_cm, target_y_cm = self._pickup_target_body_pose(goal)
@@ -1026,6 +1077,190 @@ class TopdownDetectorApp:
         )
         return distance_cm <= self.config.drive.unload_trigger_distance_cm
 
+    def _force_drive_stop(self, drive_runtime: DriveRuntime, state: DriveControlState, message: str) -> None:
+        """Send a deterministic zero-speed command, forcing a TCP stop packet."""
+        drive_runtime.stop(state, message)
+        if drive_runtime.dispatcher is not None:
+            drive_runtime.dispatcher.send_wheel_speeds(0.0, 0.0, force=True)
+
+    def _unload_goal_center_cm(self) -> tuple[float, float]:
+        if self.runtime.route_plan.unload_goal_cm is not None:
+            return self.runtime.route_plan.unload_goal_cm
+        return self.route_facade.hybrid_planner.small_goal_center_cm()
+
+    def _unload_geometry(self) -> RobotGeometry:
+        return self.robot_estimator.robot_geometry_from_params(self.latest_params)
+
+    def _unload_alignment_metrics(self) -> dict[str, float | bool]:
+        """Return reverse-alignment errors from the rear unload tip to the small goal."""
+        if self.runtime.robot_pose is None:
+            return {"valid": False}
+        geometry = self._unload_geometry()
+        robot_pose = self.runtime.robot_pose
+        goal_x, goal_y = self._unload_goal_center_cm()
+        planner_pose = HybridPose(robot_pose.x_cm, robot_pose.y_cm, robot_pose.heading_rad)
+        rear_x, rear_y = self.route_facade.hybrid_planner.rear_unload_point_for_pose(planner_pose, geometry)
+        dx = goal_x - rear_x
+        dy = goal_y - rear_y
+        forward = (math.cos(robot_pose.heading_rad), math.sin(robot_pose.heading_rad))
+        right = (math.sin(robot_pose.heading_rad), -math.cos(robot_pose.heading_rad))
+        rear_forward_error_cm = -(dx * forward[0] + dy * forward[1])
+        lateral_error_cm = dx * right[0] + dy * right[1]
+        distance_error_cm = math.hypot(dx, dy)
+        goal_bearing_rad = math.atan2(goal_y - robot_pose.y_cm, goal_x - robot_pose.x_cm)
+        desired_heading_rad = normalize_angle(goal_bearing_rad - math.pi)
+        heading_error_rad = normalize_angle(desired_heading_rad - robot_pose.heading_rad)
+        wall_heading_error_rad = normalize_angle(robot_pose.heading_rad)
+        reach_cm = max(1e-6, geometry.rear_cm + geometry.unload_extension_cm)
+        precise_heading_tolerance_rad = max(
+            math.radians(1.0),
+            math.atan2(self.config.drive.visual_servo_noise_floor_cm, reach_cm),
+        )
+        wall_heading_tolerance_rad = math.radians(30.0)
+        valid = (
+            distance_error_cm <= self.config.drive.visual_servo_noise_floor_cm
+            and abs(lateral_error_cm) <= self.config.drive.visual_servo_noise_floor_cm
+            and abs(heading_error_rad) <= precise_heading_tolerance_rad
+            and abs(wall_heading_error_rad) <= wall_heading_tolerance_rad
+        )
+        error_score_cm = max(distance_error_cm, abs(lateral_error_cm), abs(heading_error_rad) * reach_cm)
+        return {
+            "valid": valid,
+            "rear_x_cm": rear_x,
+            "rear_y_cm": rear_y,
+            "rear_forward_error_cm": rear_forward_error_cm,
+            "lateral_error_cm": lateral_error_cm,
+            "distance_error_cm": distance_error_cm,
+            "heading_error_rad": heading_error_rad,
+            "wall_heading_error_rad": wall_heading_error_rad,
+            "precise_heading_tolerance_rad": precise_heading_tolerance_rad,
+            "wall_heading_tolerance_rad": wall_heading_tolerance_rad,
+            "error_score_cm": error_score_cm,
+        }
+
+    def _unload_alignment_turn_command(self, heading_error_rad: float) -> tuple[float, int]:
+        turn_deg = -math.degrees(heading_error_rad) * self.config.drive.visual_servo_turn_kp
+        turn_abs = min(abs(turn_deg), self.config.drive.visual_servo_max_turn_deg)
+        turn_abs = max(turn_abs, self.config.drive.visual_servo_min_turn_deg)
+        turn_deg = math.copysign(turn_abs, turn_deg)
+        max_speed = max(
+            self.config.drive.visual_servo_min_turn_speed_pct,
+            self.config.drive.near_zone_turn_speed_pct,
+        )
+        speed_span = max_speed - self.config.drive.visual_servo_min_turn_speed_pct
+        speed_scale = min(1.0, turn_abs / max(self.config.drive.visual_servo_max_turn_deg, 1e-6))
+        speed_pct = int(round(self.config.drive.visual_servo_min_turn_speed_pct + speed_span * speed_scale))
+        return turn_deg, speed_pct
+
+    def _unload_alignment_distance_command(self, rear_forward_error_cm: float) -> tuple[str, float, int]:
+        distance_cm = min(abs(rear_forward_error_cm), 3.0)
+        distance_cm = max(distance_cm, self.config.drive.visual_servo_noise_floor_cm)
+        speed_pct = int(round(self.config.drive.near_zone_move_speed_pct))
+        command = "back" if rear_forward_error_cm > 0.0 else "move"
+        return command, distance_cm, speed_pct
+
+    def _run_unload_precise_move(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
+        """Reverse visual-servo the rear unload tip onto the goal before dropping the pipe."""
+        if self.runtime.robot_pose is None:
+            drive_runtime.stop(DriveControlState.NO_POSE, "unload alignment missing robot pose")
+            return True
+        metrics = self._unload_alignment_metrics()
+        if not metrics.get("valid", False) and self.runtime.unload_alignment_settle_started_s != 0.0:
+            elapsed_s = time.perf_counter() - self.runtime.unload_alignment_settle_started_s
+            if elapsed_s < self.config.drive.visual_servo_settle_time_s:
+                self._force_drive_stop(
+                    drive_runtime,
+                    DriveControlState.PRECISE_MOVE,
+                    f"Unload settling {elapsed_s:.2f}/{self.config.drive.visual_servo_settle_time_s:.2f}s",
+                )
+                return True
+            self.runtime.unload_alignment_settle_started_s = 0.0
+            self.runtime.unload_alignment_settle_reason = ""
+            self.runtime.reset_unload_alignment_state()
+
+        if self.runtime.unload_alignment_settle_started_s != 0.0:
+            elapsed_s = time.perf_counter() - self.runtime.unload_alignment_settle_started_s
+            if elapsed_s < self.config.drive.visual_servo_settle_time_s:
+                self._force_drive_stop(
+                    drive_runtime,
+                    DriveControlState.PRECISE_MOVE,
+                    f"Unload settling {elapsed_s:.2f}/{self.config.drive.visual_servo_settle_time_s:.2f}s",
+                )
+                return True
+            if metrics.get("valid", False):
+                self.runtime.unload_command_fired = True
+                self.runtime.unload_started_s = now_s
+                self.runtime.unload_state = UnloadExecutionState.READY
+                self.runtime.reset_unload_alignment_state()
+                self._force_drive_stop(drive_runtime, DriveControlState.STOPPED, "unload aligned; starting pipe sequence")
+                print("Unload: rear tip aligned; wheels stopped; starting pipe-only unload sequence")
+                self._start_unload_sequence_thread()
+                return True
+            self.runtime.reset_unload_alignment_state()
+            self.runtime.unload_state = UnloadExecutionState.ALIGNING
+            drive_runtime.last_message = (
+                f"Unload settle drift {float(metrics['distance_error_cm']):.2f}cm; correcting"
+            )
+
+        if metrics.get("valid", False):
+            self.runtime.unload_state = UnloadExecutionState.SETTLING
+            self.runtime.unload_alignment_settle_started_s = time.perf_counter()
+            self.runtime.unload_alignment_settle_reason = "verified candidate"
+            self._force_drive_stop(drive_runtime, DriveControlState.PRECISE_MOVE, "Unload aligned; settling before drop")
+            return True
+
+        self.runtime.unload_state = UnloadExecutionState.ALIGNING
+        error_score_cm = float(metrics["error_score_cm"])
+        if error_score_cm + self.config.drive.visual_servo_min_improvement_cm < self.runtime.unload_alignment_best_error_cm:
+            self.runtime.unload_alignment_best_error_cm = error_score_cm
+            self.runtime.unload_alignment_stale_frames = 0
+        else:
+            self.runtime.unload_alignment_stale_frames += 1
+            if self.runtime.unload_alignment_stale_frames >= self.config.drive.visual_servo_stall_frames:
+                self.runtime.unload_state = UnloadExecutionState.FAILED
+                self.unload_last_error = (
+                    f"unload alignment stalled at {error_score_cm:.2f}cm; pipe not dropped"
+                )
+                self._force_drive_stop(drive_runtime, DriveControlState.DISPATCH_ERROR, self.unload_last_error)
+                return True
+        if self.runtime.unload_alignment_iterations >= self.config.drive.visual_servo_max_iterations:
+            self.runtime.unload_state = UnloadExecutionState.FAILED
+            self.unload_last_error = f"unload alignment iteration limit at {error_score_cm:.2f}cm; pipe not dropped"
+            self._force_drive_stop(drive_runtime, DriveControlState.DISPATCH_ERROR, self.unload_last_error)
+            return True
+
+        try:
+            heading_error_rad = float(metrics["heading_error_rad"])
+            heading_tolerance_rad = float(metrics["precise_heading_tolerance_rad"])
+            wall_error_rad = float(metrics["wall_heading_error_rad"])
+            wall_tolerance_rad = float(metrics["wall_heading_tolerance_rad"])
+            if abs(heading_error_rad) > heading_tolerance_rad or abs(wall_error_rad) > wall_tolerance_rad:
+                turn_deg, turn_speed_pct = self._unload_alignment_turn_command(heading_error_rad)
+                self.runtime.unload_alignment_iterations += 1
+                drive_runtime.last_message = (
+                    f"Unload servo turn {turn_deg:.2f}deg; rear error {float(metrics['distance_error_cm']):.2f}cm"
+                )
+                self._controller().turn(round(turn_deg, 2), turn_speed_pct)
+                return True
+
+            command, distance_cm, speed_pct = self._unload_alignment_distance_command(
+                float(metrics["rear_forward_error_cm"])
+            )
+            self.runtime.unload_alignment_iterations += 1
+            drive_runtime.last_message = (
+                f"Unload servo {command} {distance_cm:.2f}cm; rear error {float(metrics['distance_error_cm']):.2f}cm"
+            )
+            if command == "back":
+                self._controller().back(round(distance_cm, 2), speed_pct)
+            else:
+                self._controller().move(round(distance_cm, 2), speed_pct)
+            return True
+        except Exception as exc:
+            self.runtime.unload_state = UnloadExecutionState.FAILED
+            self.unload_last_error = f"unload alignment failed: {exc}"
+            drive_runtime.stop(DriveControlState.DISPATCH_ERROR, self.unload_last_error)
+            return True
+
     def _start_unload_sequence_thread(self) -> None:
         if self.unload_thread is not None and self.unload_thread.is_alive():
             return
@@ -1081,19 +1316,19 @@ class TopdownDetectorApp:
         if self.unload_thread is not None and self.unload_thread.is_alive():
             drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
             return True
+        if state in (UnloadExecutionState.ALIGNING, UnloadExecutionState.SETTLING):
+            return self._run_unload_precise_move(drive_runtime, now_s)
         if self.runtime.unload_command_fired:
             return False
         if not self._unload_endpoint_reached():
             return False
 
-        self.runtime.unload_command_fired = True
-        self.runtime.unload_started_s = now_s
-        self.runtime.unload_state = UnloadExecutionState.READY
+        self.runtime.unload_state = UnloadExecutionState.ALIGNING
+        self.runtime.reset_unload_alignment_state()
         self.drive_guard.wheel_controller.reset()
-        drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
-        print("Unload: endpoint reached; wheels stopped; starting pipe-only unload sequence")
-        self._start_unload_sequence_thread()
-        return True
+        self._force_drive_stop(drive_runtime, DriveControlState.PRECISE_MOVE, "unload endpoint reached; aligning rear tip")
+        print("Unload: endpoint reached; starting reverse visual-servo alignment")
+        return self._run_unload_precise_move(drive_runtime, now_s)
 
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         return [

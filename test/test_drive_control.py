@@ -56,21 +56,21 @@ class DriveControlTests(unittest.TestCase):
             return controller
 
         now = [10.0]
-        dispatcher = TcpWheelDispatcher(
-            host="robot.local",
-            port=5555,
-            max_speed_pct=50.0,
-            min_send_interval_s=0.1,
-            command_deadband_pct=1.0,
-            time_fn=lambda: now[0],
-            controller_factory=make_controller,
-        )
+        with patch("robot.io.RobotController", make_controller):
+            dispatcher = TcpWheelDispatcher(
+                host="robot.local",
+                port=5555,
+                max_speed_pct=50.0,
+                min_send_interval_s=0.1,
+                command_deadband_pct=1.0,
+                time_fn=lambda: now[0],
+            )
 
-        self.assertTrue(dispatcher.send_wheel_speeds(80.0, -80.0))
-        self.assertTrue(dispatcher.send_wheel_speeds(50.2, -49.8))
-        now[0] += 0.2
-        self.assertTrue(dispatcher.send_wheel_speeds(25.0, 20.0))
-        dispatcher.close()
+            self.assertTrue(dispatcher.send_wheel_speeds(80.0, -80.0))
+            self.assertTrue(dispatcher.send_wheel_speeds(50.2, -49.8))
+            now[0] += 0.2
+            self.assertTrue(dispatcher.send_wheel_speeds(25.0, 20.0))
+            dispatcher.close()
 
         self.assertEqual(controllers[0].commands, ["LR 50.0 -50.0", "LR 25.0 20.0"])
         self.assertTrue(controllers[0].closed)
@@ -242,7 +242,7 @@ class DriveControlTests(unittest.TestCase):
         dispatcher.send_wheel_speeds = record_stop
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def turn(self, degrees: float, speed_percent: int) -> str:
@@ -314,7 +314,7 @@ class DriveControlTests(unittest.TestCase):
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def turn(self, degrees: float, speed_percent: int) -> str:
@@ -359,7 +359,7 @@ class DriveControlTests(unittest.TestCase):
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def turn(self, degrees: float, speed_percent: int) -> str:
@@ -401,7 +401,7 @@ class DriveControlTests(unittest.TestCase):
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def pickup_assist(self) -> str:
@@ -442,7 +442,7 @@ class DriveControlTests(unittest.TestCase):
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def pickup_assist(self) -> str:
@@ -508,18 +508,20 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.collector_state = CollectorPositionState.TRAVEL
         app.runtime.initial_total_balls = 1
         app.runtime.balls_collected = 1
-        app.runtime.robot_pose = RobotPose(25.0, 60.0, 0.0, 42.1, 60.0)
+        unload_x = app.config.robot.tuned_footprint_rear_from_origin_cm + app.config.robot.tuned_unload_extension_cm
+        unload_y = app.config.field.height_cm * 0.5
+        app.runtime.robot_pose = RobotPose(unload_x, unload_y, 0.0, 0.0, 0.0)
         app.runtime.route_plan = RoutePlan(
-            points=[HybridPose(40.0, 60.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
+            points=[HybridPose(unload_x + 10.0, unload_y, 0.0), HybridPose(unload_x, unload_y, 0.0)],
             active_target=None,
             pickup_poses=[],
-            unload_pose=HybridPose(25.0, 60.0, 0.0),
-            unload_goal_cm=(0.0, 60.0),
+            unload_pose=HybridPose(unload_x, unload_y, 0.0),
+            unload_goal_cm=(0.0, unload_y),
         )
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def unload_full_cycle(self) -> str:
@@ -552,15 +554,21 @@ class DriveControlTests(unittest.TestCase):
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
             owns_control = app.update_unload_state(drive_runtime, now_s=1.0)
+            self.assertIsNone(app.unload_thread)
+            app.runtime.unload_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            owns_after_alignment = app.update_unload_state(drive_runtime, now_s=1.1)
             assert app.unload_thread is not None
             app.unload_thread.join(timeout=1.0)
-            owns_after_complete = app.update_unload_state(drive_runtime, now_s=1.1)
+            owns_after_complete = app.update_unload_state(drive_runtime, now_s=1.2)
 
         self.assertTrue(owns_control)
+        self.assertTrue(owns_after_alignment)
         self.assertTrue(owns_after_complete)
         self.assertEqual(
             events,
-            ["turn", "unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
+            ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
         )
         self.assertNotIn("move", events)
         self.assertNotIn("back", events)
@@ -572,8 +580,59 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            ["turn", "unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
+            ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
         )
+
+    def test_unload_visual_servo_recorrects_instead_of_dropping_after_settle_drift(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        unload_x = app.config.robot.tuned_footprint_rear_from_origin_cm + app.config.robot.tuned_unload_extension_cm
+        unload_y = app.config.field.height_cm * 0.5
+        app.runtime.robot_pose = RobotPose(unload_x, unload_y, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(unload_x + 10.0, unload_y, 0.0), HybridPose(unload_x, unload_y, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+            unload_pose=HybridPose(unload_x, unload_y, 0.0),
+            unload_goal_cm=(0.0, unload_y),
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def back(self, distance: float, speed_percent: int) -> str:
+                events.append(("back", distance, speed_percent))
+                return "OK"
+
+            def move(self, distance: float, speed_percent: int) -> str:
+                events.append(("move", distance, speed_percent))
+                return "OK"
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+            def unload_full_cycle(self) -> str:
+                events.append(("unload_full_cycle",))
+                return "unexpected"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            self.assertTrue(app.update_unload_state(drive_runtime, now_s=1.0))
+            app.runtime.unload_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            app.runtime.robot_pose = RobotPose(unload_x + 5.0, unload_y, 0.0, 0.0, 0.0)
+            self.assertTrue(app.update_unload_state(drive_runtime, now_s=1.1))
+
+        self.assertIsNone(app.unload_thread)
+        self.assertEqual(app.runtime.unload_state, UnloadExecutionState.ALIGNING)
+        self.assertIn(("back", 3.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
+        self.assertNotIn(("unload_full_cycle",), events)
 
     def test_unload_endpoint_waits_for_optimistic_collection_complete(self) -> None:
         app = TopdownDetectorApp()

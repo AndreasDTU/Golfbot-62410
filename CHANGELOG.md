@@ -22,6 +22,16 @@ All notable larger additions and behavioral changes to this repository should be
   - If physical settling leaves the robot outside the configured visual-servo
     noise floor, the loop resumes micro-correction instead of driving forward.
 
+- Added reverse visual-servo alignment before autonomous unloading.
+  - The unload state machine now enters an `UNLOAD_ALIGNING` phase at the
+    planned unload endpoint instead of immediately dropping the pipe.
+  - The controller aligns the rear unload tip to the fixed small-goal center
+    using live robot pose, `rear_cm + unload_extension_cm`, TCP micro-turns, and
+    small forward/back corrections.
+  - The pipe thread starts only after a forced stop, physical settle delay, and
+    fresh-frame verification that the rear tip remains inside the allowed goal
+    tolerance and heading arc.
+
 ### Changed
 
 - Corrected near-zone pickup alignment and cached-route pickup consumption.

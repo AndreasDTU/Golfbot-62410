@@ -18,7 +18,7 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -730,7 +730,12 @@ class TopdownDetectorApp:
             self.config.planner.route_target_move_invalidate_cm * 2.0
         ):
             return float(goal.x_cm), float(goal.y_cm)
-        heading = self.runtime.robot_pose.heading_rad if self.runtime.robot_pose is not None else goal.theta_rad
+        heading = goal.theta_rad
+        if self.runtime.robot_pose is not None:
+            dx = nearest.cm_x - float(self.runtime.robot_pose.x_cm)
+            dy = nearest.cm_y - float(self.runtime.robot_pose.y_cm)
+            if math.hypot(dx, dy) > 1e-6:
+                heading = math.atan2(dy, dx)
         forward = (math.cos(heading), math.sin(heading))
         right = (math.sin(heading), -math.cos(heading))
         return (
@@ -898,6 +903,36 @@ class TopdownDetectorApp:
             self.runtime.latest_smoothed_balls
         )
 
+    def consume_completed_pickup_checkpoint(self) -> bool:
+        """Remove the pickup checkpoint that was just completed from the cached route."""
+        if self.runtime.robot_pose is None or not self.runtime.route_plan.pickup_poses:
+            return False
+        pickup_distances = [
+            math.hypot(
+                float(self.runtime.robot_pose.x_cm) - pickup_pose.x_cm,
+                float(self.runtime.robot_pose.y_cm) - pickup_pose.y_cm,
+            )
+            for pickup_pose in self.runtime.route_plan.pickup_poses
+        ]
+        completed_index = min(range(len(pickup_distances)), key=pickup_distances.__getitem__)
+        if pickup_distances[completed_index] > self.config.drive.near_zone_cm:
+            return False
+
+        remaining_pickups = [
+            pickup_pose
+            for index, pickup_pose in enumerate(self.runtime.route_plan.pickup_poses)
+            if index != completed_index
+        ]
+        self.runtime.route_plan = replace(
+            self.runtime.route_plan,
+            active_target=None,
+            pickup_poses=remaining_pickups,
+        )
+        self.runtime.route_cache_target_id = -1
+        self.runtime.route_cache_target_label = None
+        self.runtime.route_cache_target_cm = None
+        return True
+
     def _start_pickup_assist_command_thread(self) -> None:
         if self.pickup_thread is not None and self.pickup_thread.is_alive():
             return
@@ -937,10 +972,12 @@ class TopdownDetectorApp:
             self.drive_guard.wheel_controller.reset()
             if self.optimistic_collection_complete() and self.runtime.route_plan.unload_pose is not None:
                 drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; routing to unload")
+                self.consume_completed_pickup_checkpoint()
                 self.runtime.reset_pickup_state()
                 return True
             if self.should_keep_cached_route_after_pickup():
                 drive_runtime.stop(DriveControlState.REPLANNING, "pickup complete; continuing cached route")
+                self.consume_completed_pickup_checkpoint()
                 self.runtime.reset_pickup_state()
                 return True
             self.runtime.clear_route()

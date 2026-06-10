@@ -272,6 +272,28 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(app.runtime.balls_collected, 1)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
 
+    def test_pickup_target_body_pose_uses_line_of_sight_not_stale_robot_heading(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.robot_pose = RobotPose(
+            x_cm=0.0,
+            y_cm=3.0,
+            heading_rad=math.radians(90.0),
+            tube_x_cm=0.0,
+            tube_y_cm=3.0,
+        )
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(1, "white", (0, 0), (0, 0), 4, 12.0, 3.0),
+        ]
+        params = {"tube_forward_cm": 4.0, "tube_right_cm": 0.0}
+
+        target_x_cm, target_y_cm = app._pickup_target_body_pose(
+            HybridPose(8.0, 3.0, 0.0),
+            params=params,
+        )
+
+        self.assertAlmostEqual(target_x_cm, 8.0)
+        self.assertAlmostEqual(target_y_cm, 3.0)
+
     def test_near_zone_visual_servo_keeps_turning_until_noise_floor(self) -> None:
         app = TopdownDetectorApp()
         dispatcher = FakeDispatcher()
@@ -395,6 +417,7 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.initial_total_balls = 2
         app.runtime.balls_collected = 1
         app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
         app.runtime.route_plan = RoutePlan(
             points=[
                 HybridPose(0.0, 0.0, 0.0),
@@ -418,7 +441,11 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertTrue(owns_control)
         self.assertTrue(app.runtime.route_plan.points)
+        self.assertEqual(app.runtime.route_plan.pickup_poses, [HybridPose(20.0, 0.0, 0.0)])
+        self.assertIsNone(app.runtime.route_plan.active_target)
+        self.assertEqual(app.runtime.route_cache_target_id, -1)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertAlmostEqual(app._pickup_distance_to_goal_cm(), 10.0)
         self.assertEqual(drive_runtime.last_message, "pickup complete; continuing cached route")
 
     def test_unload_endpoint_runs_pipe_only_double_unload_once(self) -> None:
@@ -563,6 +590,7 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.initial_total_balls = 1
         app.runtime.balls_collected = 1
         app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
         app.runtime.route_plan = RoutePlan(
             points=[HybridPose(10.0, 0.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
             active_target=None,
@@ -576,6 +604,7 @@ class DriveControlTests(unittest.TestCase):
         self.assertTrue(owns_control)
         self.assertTrue(app.runtime.route_plan.points)
         self.assertIsNotNone(app.runtime.route_plan.unload_pose)
+        self.assertEqual(app.runtime.route_plan.pickup_poses, [])
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
         self.assertEqual(drive_runtime.last_message, "pickup complete; routing to unload")
 

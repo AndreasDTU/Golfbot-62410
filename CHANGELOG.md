@@ -14,6 +14,16 @@ All notable larger additions and behavioral changes to this repository should be
   - Alignment continues until the measured lateral error reaches the configured
     camera noise floor, stops improving, or hits a bounded iteration limit.
 
+### Changed
+
+- Corrected near-zone pickup alignment and cached-route pickup consumption.
+  - Initial pickup targeting now derives the tube-offset body target from the
+    intended line-of-sight approach to the observed ball centroid instead of the
+    robot's stale pre-turn heading.
+  - Successful cached-route pickup completion now consumes the completed pickup
+    checkpoint and clears stale active-target metadata before returning to
+    navigation, preventing immediate re-entry into the same pickup.
+
 ## 2026-06-08
 
 ### Added

@@ -255,12 +255,17 @@ calibrated TCP position control on the same command server:
 1. Stop TCP wheel output with `LR 0 0`.
 2. Compute the current heading error to the final pickup pose.
 3. Execute blocking TCP `turn(degrees, speedPercent)`.
-4. Return control to the camera loop for one refreshed pose/ball observation.
-5. If the refreshed target is laterally off the current heading by more than
-   `1 cm`, execute a blocking TCP micro-turn correction.
-6. Execute blocking TCP `move(distance, speedPercent)`.
-7. Run the collection-only `pickup_assist()` pipe command.
-8. Continue along the cached global route unless visible remaining balls no
+4. Enter a visual-servo loop that consumes one refreshed pose/ball observation
+   per frame.
+5. While alignment is still improving, compute the lateral ball error in the
+   robot frame and execute proportional TCP micro-turns. Turn angle and speed
+   shrink as the measured error approaches zero.
+6. Stop aligning only when the lateral error reaches the configured camera
+   noise floor, improvement stalls for the configured number of frames, or the
+   bounded iteration limit is reached.
+7. Execute blocking TCP `move(distance, speedPercent)`.
+8. Run the collection-only `pickup_assist()` pipe command.
+9. Continue along the cached global route unless visible remaining balls no
    longer match the original plan.
 
 The near-zone TCP turn speed is configured through `DriveConfig`; the TCP move

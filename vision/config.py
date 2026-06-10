@@ -330,6 +330,14 @@ class DriveConfig:
     near_zone_cm: float = 15.0
     near_zone_turn_speed_pct: float = 30.0
     near_zone_move_speed_pct: float = 7.0
+    visual_servo_noise_floor_cm: float = 0.25
+    visual_servo_min_improvement_cm: float = 0.08
+    visual_servo_stall_frames: int = 3
+    visual_servo_max_iterations: int = 4
+    visual_servo_turn_kp: float = 0.85
+    visual_servo_min_turn_deg: float = 0.25
+    visual_servo_max_turn_deg: float = 8.0
+    visual_servo_min_turn_speed_pct: float = 8.0
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
     edge_max_gain_scale: float = 1.6

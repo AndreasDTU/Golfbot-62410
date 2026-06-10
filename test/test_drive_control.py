@@ -272,6 +272,56 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(app.runtime.balls_collected, 1)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
 
+    def test_near_zone_visual_servo_keeps_turning_until_noise_floor(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.robot_pose = RobotPose(6.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+            def move(self, distance: float, speed_percent: int) -> str:
+                events.append(("move", distance, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            app.update_pickup_state(drive_runtime, now_s=1.0)
+            app.runtime.robot_pose = RobotPose(6.0, 2.0, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.1)
+            app.runtime.robot_pose = RobotPose(6.0, 0.3, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.2)
+            app.runtime.robot_pose = RobotPose(6.0, 0.1, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.3)
+
+        turn_events = [event for event in events if event[0] == "turn"]
+        self.assertGreaterEqual(len(turn_events), 2)
+        self.assertGreater(abs(turn_events[0][1]), abs(turn_events[-1][1]))
+        self.assertGreater(turn_events[0][2], turn_events[-1][2])
+        self.assertIn(("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
+
+    def test_visual_servo_converges_when_alignment_stops_improving(self) -> None:
+        app = TopdownDetectorApp()
+
+        for _index in range(app.config.drive.visual_servo_stall_frames + 1):
+            aligned, _turn_deg, _speed_pct, reason = app._near_zone_visual_servo_turn(4.0, 2.0)
+
+        self.assertTrue(aligned)
+        self.assertEqual(reason, "no further improvement")
+
     def test_autonomous_collection_runs_pickup_assist_not_full_unload(self) -> None:
         app = TopdownDetectorApp()
         dispatcher = FakeDispatcher()

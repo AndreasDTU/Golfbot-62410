@@ -2,7 +2,19 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
-## 2026-05-28
+## 2026-06-10
+
+### Added
+
+- Added precision-seeking visual-servo alignment before the final near-zone TCP
+  pickup move.
+  - The robot now performs the initial TCP turn, then consumes fresh camera
+    pose/ball observations frame-by-frame while issuing proportional TCP
+    micro-turns.
+  - Alignment continues until the measured lateral error reaches the configured
+    camera noise floor, stops improving, or hits a bounded iteration limit.
+
+## 2026-06-08
 
 ### Added
 
@@ -18,10 +30,25 @@ All notable larger additions and behavioral changes to this repository should be
   - The route planner treats an empty target list as a direct unload request
     when invoked by that state.
 
-- Added a two-frame near-zone TCP pickup handoff.
-  - The robot now performs the initial TCP turn, lets the next camera frame
-    refresh pose/ball coordinates, applies a `>1 cm` lateral micro-turn
-    correction if needed, and only then executes the final TCP move.
+### Changed
+
+- Removed automatic autonomous `collector_travel_position()` gating from the
+  live drive loop. The collector safe position is now an operator precondition;
+  the command remains available for manual use.
+
+- Switched the autonomous `--drive` command transport to TCP-only.
+  - Replaced the PC-side wheel dispatcher with a TCP wheel dispatcher that
+    preserves finite-command validation, clipping, send interval/deadband
+    filtering, forced stops, and dispatch error reporting.
+  - Added TCP `LR <left> <right>` handling to `robot/robot_server.py` for
+    continuous route-following wheel speeds on the same command server used by
+    `move`, `turn`, and collector commands.
+  - Updated drive wiring, operator docs, and tests so the old hybrid transport
+    scenario is no longer part of `--drive`.
+
+## 2026-05-28
+
+### Added
 
 - Added schematic debug overlays for soft non-target ball avoidance.
   - `vision/debug.py` now draws faint yellow avoidance halos from
@@ -53,20 +80,6 @@ All notable larger additions and behavioral changes to this repository should be
     distance in `DriveConfig`.
 
 ### Changed
-
-- Removed automatic autonomous `collector_travel_position()` gating from the
-  live drive loop. The collector safe position is now an operator precondition;
-  the command remains available for manual use.
-
-- Switched the autonomous `--drive` command transport to TCP-only.
-  - Replaced the PC-side wheel dispatcher with a TCP wheel dispatcher that
-    preserves finite-command validation, clipping, send interval/deadband
-    filtering, forced stops, and dispatch error reporting.
-  - Added TCP `LR <left> <right>` handling to `robot/robot_server.py` for
-    continuous route-following wheel speeds on the same command server used by
-    `move`, `turn`, and collector commands.
-  - Updated drive wiring, operator docs, and tests so the old hybrid transport
-    scenario is no longer part of `--drive`.
 
 - Tightened autonomous drive and unload safety gates before live contest runs.
   - EV3 TCP `move`/`turn` commands now acknowledge only after motor completion

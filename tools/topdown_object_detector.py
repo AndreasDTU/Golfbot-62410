@@ -108,7 +108,9 @@ class RuntimeState:
     pickup_command_fired: bool = False
     near_zone_move_fired: bool = False
     near_zone_turn_fired: bool = False
-    near_zone_correction_fired: bool = False
+    near_zone_alignment_best_error_cm: float = float("inf")
+    near_zone_alignment_stale_frames: int = 0
+    near_zone_alignment_iterations: int = 0
     unload_state: UnloadExecutionState = UnloadExecutionState.IDLE
     unload_command_fired: bool = False
     unload_started_s: float = 0.0
@@ -139,7 +141,9 @@ class RuntimeState:
         self.pickup_command_fired = False
         self.near_zone_move_fired = False
         self.near_zone_turn_fired = False
-        self.near_zone_correction_fired = False
+        self.near_zone_alignment_best_error_cm = float("inf")
+        self.near_zone_alignment_stale_frames = 0
+        self.near_zone_alignment_iterations = 0
 
 
 @dataclass(frozen=True)
@@ -742,8 +746,44 @@ class TopdownDetectorApp:
         lateral_cm = dx * math.sin(robot_pose.heading_rad) - dy * math.cos(robot_pose.heading_rad)
         return forward_cm, lateral_cm
 
+    def _near_zone_visual_servo_turn(
+        self,
+        forward_cm: float,
+        lateral_cm: float,
+    ) -> tuple[bool, float, int, str]:
+        """Return whether alignment is converged plus the next proportional turn command."""
+        error_cm = abs(lateral_cm)
+        if error_cm <= self.config.drive.visual_servo_noise_floor_cm:
+            return True, 0.0, 0, "noise floor"
+
+        if error_cm + self.config.drive.visual_servo_min_improvement_cm < self.runtime.near_zone_alignment_best_error_cm:
+            self.runtime.near_zone_alignment_best_error_cm = error_cm
+            self.runtime.near_zone_alignment_stale_frames = 0
+        else:
+            self.runtime.near_zone_alignment_stale_frames += 1
+            if self.runtime.near_zone_alignment_stale_frames >= self.config.drive.visual_servo_stall_frames:
+                return True, 0.0, 0, "no further improvement"
+
+        if self.runtime.near_zone_alignment_iterations >= self.config.drive.visual_servo_max_iterations:
+            return True, 0.0, 0, "iteration limit"
+
+        correction_rad = math.atan2(-lateral_cm, max(abs(forward_cm), 1e-6))
+        turn_deg = -math.degrees(correction_rad) * self.config.drive.visual_servo_turn_kp
+        turn_abs = min(abs(turn_deg), self.config.drive.visual_servo_max_turn_deg)
+        turn_abs = max(turn_abs, self.config.drive.visual_servo_min_turn_deg)
+        turn_deg = math.copysign(turn_abs, turn_deg)
+
+        max_speed = max(
+            self.config.drive.visual_servo_min_turn_speed_pct,
+            self.config.drive.near_zone_turn_speed_pct,
+        )
+        speed_span = max_speed - self.config.drive.visual_servo_min_turn_speed_pct
+        speed_scale = min(1.0, turn_abs / max(self.config.drive.visual_servo_max_turn_deg, 1e-6))
+        speed_pct = int(round(self.config.drive.visual_servo_min_turn_speed_pct + speed_span * speed_scale))
+        return False, turn_deg, speed_pct, "aligning"
+
     def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
-        """Stop TCP route tracking, then run turn -> vision correction -> final encoder move."""
+        """Stop TCP route tracking, visually servo heading, then run final encoder move."""
         if self.runtime.near_zone_move_fired:
             return True
         distance_cm = self._pickup_distance_to_goal_cm()
@@ -785,35 +825,35 @@ class TopdownDetectorApp:
                         int(round(self.config.drive.near_zone_turn_speed_pct)),
                     )
                 self.runtime.near_zone_turn_fired = True
-                drive_runtime.last_message = "TCP turn complete; waiting for vision correction"
+                drive_runtime.last_message = "TCP turn complete; visual servo aligning"
                 return True
 
-            if not self.runtime.near_zone_correction_fired:
-                forward_cm, lateral_cm = self._target_offset_in_robot_frame(
-                    self.runtime.robot_pose,
-                    target_x_cm,
-                    target_y_cm,
+            forward_cm, lateral_cm = self._target_offset_in_robot_frame(
+                self.runtime.robot_pose,
+                target_x_cm,
+                target_y_cm,
+            )
+            aligned, turn_deg, turn_speed_pct, reason = self._near_zone_visual_servo_turn(forward_cm, lateral_cm)
+            if not aligned:
+                self.runtime.near_zone_alignment_iterations += 1
+                drive_runtime.last_message = (
+                    f"Visual servo {abs(lateral_cm):.2f}cm lateral; "
+                    f"turn {turn_deg:.2f}deg @ {turn_speed_pct}%"
                 )
-                if abs(lateral_cm) > 1.0 and abs(forward_cm) > 1e-6:
-                    correction_rad = math.atan2(-lateral_cm, forward_cm)
-                    tcp_turn_deg = -math.degrees(correction_rad)
-                    drive_runtime.last_message = f"TCP micro-turn {tcp_turn_deg:.1f}deg"
-                    controller.turn(
-                        round(tcp_turn_deg, 1),
-                        int(round(self.config.drive.near_zone_turn_speed_pct)),
-                    )
-                self.runtime.near_zone_correction_fired = True
-                target_x_cm, target_y_cm = self._pickup_target_body_pose(goal)
-                remaining_cm = math.hypot(
-                    target_x_cm - self.runtime.robot_pose.x_cm,
-                    target_y_cm - self.runtime.robot_pose.y_cm,
-                )
-                if remaining_cm <= 0.5:
-                    self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
-                    self.runtime.pickup_state_started_s = time.perf_counter()
-                    return True
+                controller.turn(round(turn_deg, 2), turn_speed_pct)
+                return True
 
-            drive_runtime.last_message = f"TCP move {remaining_cm:.1f}cm"
+            target_x_cm, target_y_cm = self._pickup_target_body_pose(goal)
+            remaining_cm = math.hypot(
+                target_x_cm - self.runtime.robot_pose.x_cm,
+                target_y_cm - self.runtime.robot_pose.y_cm,
+            )
+            if remaining_cm <= 0.5:
+                self.runtime.pickup_state = PickupExecutionState.PICKUP_ASSIST
+                self.runtime.pickup_state_started_s = time.perf_counter()
+                return True
+
+            drive_runtime.last_message = f"TCP move {remaining_cm:.1f}cm after visual servo: {reason}"
             controller.move(
                 round(remaining_cm, 1),
                 int(round(self.config.drive.near_zone_move_speed_pct)),

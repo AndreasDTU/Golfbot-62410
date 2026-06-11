@@ -150,6 +150,7 @@ class RuntimeState:
     pickup_command_fired: bool = False
     near_zone_move_fired: bool = False
     near_zone_turn_fired: bool = False
+    near_zone_turn_settle_started_s: float = 0.0
     near_zone_alignment_best_error_cm: float = float("inf")
     near_zone_alignment_stale_frames: int = 0
     near_zone_alignment_iterations: int = 0
@@ -210,6 +211,7 @@ class RuntimeState:
         self.pickup_command_fired = False
         self.near_zone_move_fired = False
         self.near_zone_turn_fired = False
+        self.near_zone_turn_settle_started_s = 0.0
         self.near_zone_alignment_best_error_cm = float("inf")
         self.near_zone_alignment_stale_frames = 0
         self.near_zone_alignment_iterations = 0
@@ -1481,11 +1483,11 @@ class TopdownDetectorApp:
         self,
         forward_cm: float,
         lateral_cm: float,
-    ) -> tuple[bool, float, int, str]:
-        """Return whether alignment is converged plus the next proportional turn command."""
+    ) -> tuple[bool, bool, float, int, str]:
+        """Return alignment/failure status plus the next proportional turn command."""
         error_cm = abs(lateral_cm)
         if error_cm <= self.config.drive.visual_servo_noise_floor_cm:
-            return True, 0.0, 0, "noise floor"
+            return True, False, 0.0, 0, "noise floor"
 
         if error_cm + self.config.drive.visual_servo_min_improvement_cm < self.runtime.near_zone_alignment_best_error_cm:
             self.runtime.near_zone_alignment_best_error_cm = error_cm
@@ -1493,12 +1495,13 @@ class TopdownDetectorApp:
         else:
             self.runtime.near_zone_alignment_stale_frames += 1
             if self.runtime.near_zone_alignment_stale_frames >= self.config.drive.visual_servo_stall_frames:
-                return True, 0.0, 0, "no further improvement"
+                return False, True, 0.0, 0, "no further improvement"
 
         if self.runtime.near_zone_alignment_iterations >= self.config.drive.visual_servo_max_iterations:
-            return True, 0.0, 0, "iteration limit"
+            return False, True, 0.0, 0, "iteration limit"
 
-        correction_rad = math.atan2(-lateral_cm, max(abs(forward_cm), 1e-6))
+        signed_forward_cm = forward_cm if abs(forward_cm) > 1e-6 else math.copysign(1e-6, forward_cm)
+        correction_rad = math.atan2(-lateral_cm, signed_forward_cm)
         turn_deg = -math.degrees(correction_rad) * self.config.drive.visual_servo_turn_kp
         turn_abs = min(abs(turn_deg), self.config.drive.visual_servo_max_turn_deg)
         turn_abs = max(turn_abs, self.config.drive.visual_servo_min_turn_deg)
@@ -1511,7 +1514,7 @@ class TopdownDetectorApp:
         speed_span = max_speed - self.config.drive.visual_servo_min_turn_speed_pct
         speed_scale = min(1.0, turn_abs / max(self.config.drive.visual_servo_max_turn_deg, 1e-6))
         speed_pct = int(round(self.config.drive.visual_servo_min_turn_speed_pct + speed_span * speed_scale))
-        return False, turn_deg, speed_pct, "aligning"
+        return False, False, turn_deg, speed_pct, "aligning"
 
     def _run_near_zone_precise_move(self, drive_runtime: DriveRuntime) -> bool:
         """Stop TCP route tracking, visually servo heading, then run final encoder move."""
@@ -1555,8 +1558,20 @@ class TopdownDetectorApp:
                         int(round(self.config.drive.near_zone_turn_speed_pct)),
                     )
                 self.runtime.near_zone_turn_fired = True
-                drive_runtime.last_message = "TCP turn complete; visual servo aligning"
+                self.runtime.near_zone_turn_settle_started_s = time.perf_counter()
+                drive_runtime.last_message = "TCP turn complete; settling before visual servo"
                 return True
+
+            if self.runtime.near_zone_turn_settle_started_s != 0.0:
+                elapsed_s = time.perf_counter() - self.runtime.near_zone_turn_settle_started_s
+                if elapsed_s < self.config.drive.visual_servo_settle_time_s:
+                    self._force_drive_stop(
+                        drive_runtime,
+                        DriveControlState.PRECISE_MOVE,
+                        f"Coarse turn settling {elapsed_s:.2f}/{self.config.drive.visual_servo_settle_time_s:.2f}s",
+                    )
+                    return True
+                self.runtime.near_zone_turn_settle_started_s = 0.0
 
             forward_cm, lateral_cm = self._target_offset_in_robot_frame(
                 self.runtime.robot_pose,
@@ -1589,7 +1604,15 @@ class TopdownDetectorApp:
                     self.runtime.near_zone_alignment_iterations = 0
 
             if not settled_verified:
-                aligned, turn_deg, turn_speed_pct, reason = self._near_zone_visual_servo_turn(forward_cm, lateral_cm)
+                aligned, failed, turn_deg, turn_speed_pct, reason = self._near_zone_visual_servo_turn(
+                    forward_cm,
+                    lateral_cm,
+                )
+                if failed:
+                    self.runtime.pickup_state = PickupExecutionState.REPLAN
+                    self.runtime.pickup_state_started_s = time.perf_counter()
+                    drive_runtime.stop(DriveControlState.REPLANNING, f"near-zone visual servo abort: {reason}")
+                    return True
                 if not aligned:
                     self.runtime.near_zone_alignment_iterations += 1
                     drive_runtime.last_message = (

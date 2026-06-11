@@ -2183,7 +2183,7 @@ class RoutePlanningFacade:
             best = RouteTrackingError(
                 xte_cm=distance,
                 signed_xte_cm=signed_distance,
-                heading_error_rad=normalize_planner_angle(robot_pose.heading_rad - segment_heading),
+                heading_error_rad=normalize_planner_angle(segment_heading - robot_pose.heading_rad),
                 closest_point_cm=(cx, cy),
                 segment_heading_rad=segment_heading,
                 segment_index=index,

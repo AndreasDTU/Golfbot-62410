@@ -35,6 +35,23 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Changed
 
+- Restored the normal route-tracking heading-error sign so large heading
+  corrections in `TRACKING` steer toward the active route segment instead of
+  away from it.
+  - Added a regression test for the large-angle tank-steer case where an
+    eastbound route and a 130 degree heading error must command a clockwise
+    correction.
+
+- Near-zone pickup alignment now waits for the chassis and top-down pose stream
+  to settle after the initial blocking TCP turn before visual-servo corrections
+  begin.
+  - The visual-servo turn math now preserves the sign of forward target offset
+    instead of mirroring behind-robot geometry with `abs(forward_cm)`.
+  - Near-zone visual-servo stall and iteration limits now abort into replanning
+    instead of being treated as good-enough alignment for the final blind TCP
+    move.
+  - Updated focused drive-control tests for the new settle and abort semantics.
+
 - XTE route tracking is now monotonic and progress-aware.
   - The drive loop keeps a route-progress segment cursor per active route and
     projects only onto the current/future route window instead of the whole

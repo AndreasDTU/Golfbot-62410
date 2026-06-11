@@ -4,6 +4,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import cv2
+import numpy as np
+
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
 from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
 from robot.io import TcpWheelDispatcher
@@ -18,7 +21,10 @@ from tools.topdown_object_detector import (
 )
 from vision.config import DriveConfig, FieldConfig
 from vision.debug import DebugRenderer
+from vision.models import CalibrationState
 from vision.models import SmoothedBallCoordinate
+from vision.pipeline import VisionFrameResult
+from vision.preprocessing import PreprocessedFrame
 
 
 class FakeDispatcher:
@@ -29,6 +35,20 @@ class FakeDispatcher:
     def send_wheel_speeds(self, left_pct: float, right_pct: float, force: bool = False) -> bool:
         self.commands.append((left_pct, right_pct, force))
         return True
+
+
+class FakeCapture:
+    def __init__(self) -> None:
+        self.values: dict[int, float] = {}
+        self.set_calls: list[tuple[int, float]] = []
+
+    def set(self, prop_id: int, value: float) -> bool:
+        self.values[prop_id] = value
+        self.set_calls.append((prop_id, value))
+        return True
+
+    def get(self, prop_id: int) -> float:
+        return self.values.get(prop_id, 0.0)
 
 
 class FakeTcpController:
@@ -818,6 +838,107 @@ class DriveControlTests(unittest.TestCase):
         )
 
         self.assertEqual(app.runtime.route_plan.points, [])
+
+    def test_collection_complete_routes_to_unload_even_if_balls_are_visible(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.NAVIGATION
+        app.runtime.robot_pose = RobotPose(40.0, 40.0, 0.0, 40.0, 40.0)
+        visible_ball = SmoothedBallCoordinate(7, "white", (0, 0), (0, 0), 4, 80.0, 80.0)
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        grid = np.zeros((app.config.field.grid_height_cm, app.config.field.grid_width_cm), dtype=np.uint8)
+        result = VisionFrameResult(
+            raw_frame=frame,
+            preprocessed=PreprocessedFrame(
+                undistorted=frame,
+                topdown=frame,
+                normalized=None,
+                calibration_state=CalibrationState.CALIBRATED_AUTO,
+                transform_matrix=None,
+                camera_ground_projection=None,
+            ),
+            frame_for_detection=frame,
+            red_zones=[],
+            red_mask=np.zeros((4, 4), dtype=np.uint8),
+            white_balls=[],
+            orange_balls=[],
+            ball_masks={},
+            smoothed_ball_coordinates=[visible_ball],
+            occupancy_grid=grid,
+        )
+        submitted_requests: list[RoutePlanningRequest] = []
+
+        class FakeAsyncRoutePlanner:
+            def is_busy(self) -> bool:
+                return False
+
+            def poll_completed(self) -> None:
+                return None
+
+            def submit(self, request: RoutePlanningRequest) -> bool:
+                submitted_requests.append(request)
+                return True
+
+        app.async_route_planner = FakeAsyncRoutePlanner()
+
+        app.update_route(result, {"unload_extension_cm": 15.0})
+
+        self.assertEqual(len(submitted_requests), 1)
+        self.assertEqual(submitted_requests[0].ball_targets, [])
+        self.assertEqual(submitted_requests[0].ball_signature, ())
+
+    def test_short_pose_loss_preserves_cached_route_and_stops(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        route = [HybridPose(10.0, 10.0, 0.0), HybridPose(20.0, 10.0, 0.0)]
+        app.runtime.route_plan = RoutePlan(points=route, active_target=None, pickup_poses=[])
+        app.runtime.robot_pose = None
+        app.runtime.pose_missing_frames = app.config.camera.pose_loss_grace_frames
+
+        app.enforce_pose_loss_route_policy(drive_runtime)
+        app.drive_guard.update_drive_control(
+            None,
+            app.runtime.route_plan.points,
+            drive_runtime,
+            clear_route_cache=app.runtime.clear_route,
+        )
+
+        self.assertEqual(app.runtime.route_plan.points, route)
+        self.assertEqual(drive_runtime.state, DriveControlState.NO_POSE)
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+
+    def test_sustained_pose_loss_clears_cached_route(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(10.0, 10.0, 0.0), HybridPose(20.0, 10.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+        )
+        app.runtime.robot_pose = None
+        app.runtime.pose_missing_frames = app.config.camera.pose_loss_clear_route_frames + 1
+
+        app.enforce_pose_loss_route_policy(drive_runtime)
+
+        self.assertEqual(app.runtime.route_plan.points, [])
+        self.assertIn("route cleared", drive_runtime.last_message)
+
+    def test_camera_focus_locks_after_ball_count_prep(self) -> None:
+        app = TopdownDetectorApp()
+        cap = FakeCapture()
+
+        app.configure_camera_prep_focus(cap, "test camera")
+        self.assertEqual(cap.set_calls[-1], (cv2.CAP_PROP_AUTOFOCUS, 1.0))
+
+        app.lock_camera_focus_after_prep(cap, "test camera")
+        first_lock_calls = list(cap.set_calls)
+        app.lock_camera_focus_after_prep(cap, "test camera")
+
+        self.assertEqual(first_lock_calls, cap.set_calls)
+        self.assertIn((cv2.CAP_PROP_AUTOFOCUS, 0.0), cap.set_calls)
+        self.assertIn((cv2.CAP_PROP_FOCUS, app.config.camera.manual_focus_value), cap.set_calls)
 
     def test_final_pickup_preserves_existing_unload_route_when_collection_complete(self) -> None:
         app = TopdownDetectorApp()

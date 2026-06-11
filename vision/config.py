@@ -76,6 +76,11 @@ class CameraConfig:
     lk_max_level: int = 3
     lk_criteria_count: int = 30
     lk_criteria_epsilon: float = 0.01
+    pose_loss_grace_frames: int = 3
+    pose_loss_clear_route_frames: int = 15
+    lock_focus_after_ball_count: bool = True
+    camera_autofocus_enabled_during_prep: bool = True
+    manual_focus_value: float = 0.0
 
     @property
     def lk_params(self) -> dict[str, object]:
@@ -128,7 +133,7 @@ class RobotGeometryConfig:
     tuned_tube_offset_cm: float = 17.1
     tuned_tube_right_offset_cm: float = 0.0
     tube_width_cm: float = 6.0
-    tuned_unload_extension_cm: float = 40.0
+    tuned_unload_extension_cm: float = 30.0
 
     @property
     def front_axle_from_origin_cm(self) -> float:

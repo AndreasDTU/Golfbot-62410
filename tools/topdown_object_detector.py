@@ -115,6 +115,8 @@ class RuntimeState:
     route_failed_start_signature: tuple[int, int, int] | None = None
     robot_pose: RobotPose | None = None
     robot_topdown_px: tuple[float, float] | None = None
+    pose_missing_frames: int = 0
+    camera_focus_locked: bool = False
     latest_smoothed_balls: list[SmoothedBallCoordinate] = field(default_factory=list)
     pickup_state: PickupExecutionState = PickupExecutionState.NAVIGATION
     pickup_state_started_s: float = 0.0
@@ -964,9 +966,9 @@ class TopdownDetectorApp:
         )
         return all(count <= cached[key] for key, count in current.items())
 
-    def should_route_directly_to_unload(self, smoothed_balls: list[SmoothedBallCoordinate]) -> bool:
-        """Return true for the collected-something / now-empty-field unload case."""
-        return self.runtime.balls_collected > 0 and not smoothed_balls and self.runtime.robot_pose is not None
+    def should_route_directly_to_unload(self) -> bool:
+        """Return true when collection is complete and robot pose can seed unload routing."""
+        return self.optimistic_collection_complete() and self.runtime.robot_pose is not None
 
     def should_keep_cached_route_after_pickup(self) -> bool:
         """Continue a global route after pickup unless vision shows a changed ball scene."""
@@ -1760,34 +1762,40 @@ class TopdownDetectorApp:
             self.runtime.selected_start_cm = self.mapper.field_metric_cm_to_grid_node((selected_ball.cm_x, selected_ball.cm_y))
         else:
             self.runtime.selected_start_cm = None
+            if (
+                self.runtime.route_plan.points
+                and 0 < self.runtime.pose_missing_frames <= self.config.camera.pose_loss_clear_route_frames
+            ):
+                return
             self.runtime.clear_route()
             return
 
         smoothed_balls = result.smoothed_ball_coordinates
-        route_to_unload_without_visible_balls = self.should_route_directly_to_unload(smoothed_balls)
+        route_to_unload = self.should_route_directly_to_unload()
+        route_balls = [] if route_to_unload else smoothed_balls
 
-        if not smoothed_balls and self.runtime.robot_pose is None:
+        if not route_balls and self.runtime.robot_pose is None:
             self.runtime.selected_start_cm = None
             self.runtime.clear_route()
             return
-        if not smoothed_balls and not route_to_unload_without_visible_balls:
+        if not route_balls and not route_to_unload:
             if not self.runtime.route_plan.points:
                 self.runtime.clear_route()
             return
 
-        ball_signature = self.ball_cache_signature(smoothed_balls)
+        ball_signature = self.ball_cache_signature(route_balls)
         self.accept_completed_route_if_current(
             ball_signature,
             geometry.unload_extension_cm,
             self.route_start_signature(start_pose),
         )
 
-        if self.cached_route_is_valid(start_pose, smoothed_balls, params):
+        if self.cached_route_is_valid(start_pose, route_balls, params):
             return
 
         self.submit_route_plan_if_needed(
             result.occupancy_grid,
-            self._ball_targets(smoothed_balls),
+            self._ball_targets(route_balls),
             start_pose,
             geometry,
             ball_signature,
@@ -1797,6 +1805,7 @@ class TopdownDetectorApp:
         if topdown_frame is None:
             self.runtime.robot_pose = None
             self.runtime.robot_topdown_px = None
+            self.runtime.pose_missing_frames += 1
             return
         pose, topdown_px, observations, parallax_config = self.robot_estimator.estimate(
             topdown_frame,
@@ -1805,6 +1814,10 @@ class TopdownDetectorApp:
         )
         self.runtime.robot_pose = pose
         self.runtime.robot_topdown_px = topdown_px
+        if pose is None:
+            self.runtime.pose_missing_frames += 1
+        else:
+            self.runtime.pose_missing_frames = 0
         self.robot_runtime.latest_observations = observations
         self.robot_runtime.latest_parallax_config = parallax_config
         if self.robot_runtime.phase == RobotCalibrationPhase.STATE_CALIBRATING_SPIN:
@@ -1813,11 +1826,29 @@ class TopdownDetectorApp:
                     (float(observation.ground_center[0]), float(observation.ground_center[1]))
                 )
 
+    def enforce_pose_loss_route_policy(self, drive_runtime: DriveRuntime | None = None) -> None:
+        """Preserve routes through brief marker dropouts, then clear after sustained pose loss."""
+        if self.runtime.robot_pose is not None or self.runtime.pose_missing_frames <= 0:
+            return
+        if self.runtime.pose_missing_frames <= self.config.camera.pose_loss_clear_route_frames:
+            if drive_runtime is not None and self.runtime.route_plan.points:
+                drive_runtime.last_message = (
+                    f"pose lost {self.runtime.pose_missing_frames} frame(s); preserving route"
+                )
+            return
+        if self.runtime.route_plan.points:
+            self.runtime.clear_route()
+            if drive_runtime is not None:
+                drive_runtime.last_message = (
+                    f"pose lost {self.runtime.pose_missing_frames} frames; route cleared"
+                )
+
     def reset_detection_state(self) -> None:
         """Clear detection state when calibration is not valid or stream state resets."""
         self.runtime.latest_smoothed_balls = []
         self.runtime.robot_pose = None
         self.runtime.robot_topdown_px = None
+        self.runtime.pose_missing_frames = 0
         self.runtime.selected_ball_track_id = None
         self.runtime.selected_start_cm = None
         self.runtime.clear_route()
@@ -2330,6 +2361,38 @@ class TopdownDetectorApp:
         interpolation = cv2.INTER_AREA if frame_width > target_width or frame_height > target_height else cv2.INTER_LINEAR
         return cv2.resize(frame_bgr, target_size, interpolation=interpolation)
 
+    @staticmethod
+    def _try_set_capture_property(cap: cv2.VideoCapture, prop_id: int, value: float) -> tuple[bool, float]:
+        ok = bool(cap.set(prop_id, value))
+        readback = float(cap.get(prop_id))
+        return ok, readback
+
+    def configure_camera_prep_focus(self, cap: cv2.VideoCapture, source_name: str) -> None:
+        """Allow autofocus during prep when the backend exposes the UVC property."""
+        if not self.config.camera.lock_focus_after_ball_count:
+            return
+        if not self.config.camera.camera_autofocus_enabled_during_prep:
+            return
+        ok, readback = self._try_set_capture_property(cap, cv2.CAP_PROP_AUTOFOCUS, 1.0)
+        print(f"Camera focus prep ({source_name}): autofocus on request ok={ok}, readback={readback:.3g}")
+
+    def lock_camera_focus_after_prep(self, cap: cv2.VideoCapture, source_name: str) -> None:
+        """Best-effort autofocus disable plus manual focus lock after ball-count prep."""
+        if self.runtime.camera_focus_locked or not self.config.camera.lock_focus_after_ball_count:
+            return
+        autofocus_ok, autofocus_readback = self._try_set_capture_property(cap, cv2.CAP_PROP_AUTOFOCUS, 0.0)
+        focus_ok, focus_readback = self._try_set_capture_property(
+            cap,
+            cv2.CAP_PROP_FOCUS,
+            float(self.config.camera.manual_focus_value),
+        )
+        self.runtime.camera_focus_locked = True
+        print(
+            f"Camera focus lock ({source_name}): autofocus off ok={autofocus_ok}, "
+            f"readback={autofocus_readback:.3g}; focus={self.config.camera.manual_focus_value:.3g} "
+            f"ok={focus_ok}, readback={focus_readback:.3g}"
+        )
+
     def run_image_mode(self, image_path: Path) -> int:
         frame = self.load_image_frame(image_path)
         pipeline = self.build_image_pipeline()
@@ -2391,6 +2454,8 @@ class TopdownDetectorApp:
         drive_runtime, dispatcher = self._make_drive_runtime(drive_enabled)
         self.runtime.step_mode_enabled = bool(drive_enabled and step_enabled)
         self.runtime.step_drive_paused = self.runtime.step_mode_enabled
+        self.runtime.camera_focus_locked = False
+        self.configure_camera_prep_focus(cap, source_name)
         if drive_enabled:
             print(
                 f"Integrated drive dispatch enabled: TCP "
@@ -2525,7 +2590,10 @@ class TopdownDetectorApp:
                 result = self.process_preprocessed_topdown(pipeline, raw_frame, preprocessed, params)
                 now = time.perf_counter()
                 self.update_ball_count_reconciliation(result, now)
+                if self.ball_count_initialized():
+                    self.lock_camera_focus_after_prep(cap, source_name)
                 self.update_route(result, params)
+                self.enforce_pose_loss_route_policy(drive_runtime)
                 frame_dt_s = max(1e-6, now - last_tick)
                 robot_geometry = self.robot_estimator.robot_geometry_from_params(params)
                 drive_waiting_for_ball_count = (
@@ -2634,7 +2702,6 @@ class TopdownDetectorApp:
             return 1
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width if width > 0 else calibration_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height if height > 0 else calibration_height)
-        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0) # Disable autofocus
         try:
             return self.run_stream(cap, f"camera {camera_index}", balance, "Live", 1, drive_enabled, step_enabled)
         finally:

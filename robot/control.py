@@ -318,8 +318,6 @@ class DriveSafetyGuard:
             return
         if robot_pose is None:
             self.wheel_controller.reset()
-            if clear_route_cache is not None:
-                clear_route_cache()
             drive_runtime.last_error = None
             drive_runtime.stop(DriveControlState.NO_POSE, "robot marker missing")
             return

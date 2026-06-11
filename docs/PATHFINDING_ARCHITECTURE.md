@@ -308,6 +308,19 @@ count. If stable visible balls exceed the expected visible count, the pickup is
 treated as missed and `balls_collected` is decremented so the ball can be routed
 again.
 
+During that same prep phase, live camera mode can leave webcam autofocus enabled
+so the field plane can settle. Once the initial ball count is stable, the
+detector makes a best-effort OpenCV request to disable autofocus and set the
+configured manual focus value. Backends that ignore these UVC controls are
+reported through the focus-lock readback print, but they do not abort the run.
+
+If ArUco robot pose is lost briefly during drive, the controller now sends
+zero-speed output and preserves the cached route for the configured pose-loss
+window. This handles short blur/autofocus dropouts without forcing a costly
+route reset. If pose remains missing beyond the configured clear-route frame
+count, the cached route is cleared and the robot stays stopped until a valid
+pose can seed a new route.
+
 Pickup completion no longer clears the route unconditionally. The detector
 keeps following the cached global route when the current visible balls remain a
 stationary subset of the balls used for the plan. It clears/replans only when a
@@ -315,10 +328,12 @@ remaining ball crosses the configured target-move bucket, a new/previously
 hidden ball appears, robot drift invalidates the route, or route metadata no
 longer matches the active geometry.
 
-If `balls_collected > 0` and the current camera frame contains zero visible
-balls, the route planner may receive an empty target list as an explicit request
-to route directly from the current robot pose to the fixed small-goal staging
-pose.
+If `balls_collected >= initial_total_balls` and the robot pose is visible, route
+planning ignores any remaining visible ball detections and submits an empty
+target list as an explicit request to route directly from the current robot pose
+to the fixed small-goal staging pose. This keeps recalculation and noisy late
+detections from sending the robot back into collection mode after the internal
+state says collection is complete.
 
 The unload route no longer asks Hybrid A* to dock backwards into the goal. It
 targets one fixed robot body-center pose that is perpendicular to the left wall:

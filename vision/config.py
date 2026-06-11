@@ -363,6 +363,13 @@ class DriveConfig:
     manual_move_speed: int = 40
     manual_turn_degrees: int = 15
     manual_turn_speed: int = 30
+    drive_calibration_turn_degrees: float = 360.0
+    drive_calibration_move_cm: float = 10.0
+    drive_calibration_turn_speed_pct: float = 20.0
+    drive_calibration_move_speed_pct: float = 15.0
+    drive_calibration_settle_time_s: float = 0.5
+    drive_calibration_min_actual_turn_deg: float = 45.0
+    drive_calibration_min_actual_distance_cm: float = 1.0
     post_pickup_escape_clearance_cm: float = 4.0
     post_pickup_align_clearance_cm: float = 12.0
     post_pickup_escape_back_cm: float = 8.0

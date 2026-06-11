@@ -1906,12 +1906,12 @@ class TopdownDetectorApp:
                 self.unload_last_error = (
                     f"unload alignment stalled at {error_score_cm:.2f}cm; pipe not dropped"
                 )
-                self._force_drive_stop(drive_runtime, DriveControlState.DISPATCH_ERROR, self.unload_last_error)
+                self._force_drive_stop(drive_runtime, DriveControlState.STOPPED, self.unload_last_error)
                 return True
         if self.runtime.unload_alignment_iterations >= self.config.drive.visual_servo_max_iterations:
             self.runtime.unload_state = UnloadExecutionState.FAILED
             self.unload_last_error = f"unload alignment iteration limit at {error_score_cm:.2f}cm; pipe not dropped"
-            self._force_drive_stop(drive_runtime, DriveControlState.DISPATCH_ERROR, self.unload_last_error)
+            self._force_drive_stop(drive_runtime, DriveControlState.STOPPED, self.unload_last_error)
             return True
 
         try:
@@ -1993,11 +1993,17 @@ class TopdownDetectorApp:
         if drive_runtime.dispatcher is None:
             return False
         state = self.runtime.unload_state
-        if state in (UnloadExecutionState.COMPLETE, UnloadExecutionState.FAILED):
+        if state == UnloadExecutionState.FAILED:
+            self.drive_guard.wheel_controller.reset()
+            message = f"{state.value}: {self.unload_last_error}"
+            self.runtime.unload_state = UnloadExecutionState.IDLE
+            return True
+        if state == UnloadExecutionState.COMPLETE:
             self.drive_guard.wheel_controller.reset()
             message = state.value if state == UnloadExecutionState.COMPLETE else f"{state.value}: {self.unload_last_error}"
             drive_runtime.stop(DriveControlState.STOPPED, message)
-            return True
+            drive_runtime.state = DriveControlState.TRACKING
+            return False
         if self.unload_thread is not None and self.unload_thread.is_alive():
             drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)
             return True

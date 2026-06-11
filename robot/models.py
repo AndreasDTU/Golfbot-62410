@@ -82,6 +82,8 @@ class DriveRuntime:
     last_command: WheelCommand = field(default_factory=lambda: WheelCommand(0.0, 0.0))
     last_message: str = ""
     suppress_dispatch_this_frame: bool = False
+    active_route_identity: int | None = None
+    route_progress_segment_index: int = 0
 
     def stop(self, state: DriveControlState, message: str = "") -> None:
         """Send a deterministic zero-speed command and update overlay state."""

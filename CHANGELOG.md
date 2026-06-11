@@ -31,6 +31,13 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Changed
 
+- XTE route tracking is now monotonic and progress-aware.
+  - The drive loop keeps a route-progress segment cursor per active route and
+    projects only onto the current/future route window instead of the whole
+    cached route.
+  - This prevents intersecting or nearby old route segments from stealing XTE
+    control after the robot has already passed them.
+
 - Post-pickup cached route continuation now trims the consumed route prefix.
   - Completing a pickup removes both the completed pickup checkpoint and the
     route points leading up to it, then reseeds the remaining route from the

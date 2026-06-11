@@ -241,11 +241,19 @@ external `autonomous_navigator.py` flow is not required for closed-loop driving.
 After the required vision pipeline and Hybrid A* route update, the detector:
 
 - estimates the live robot pose from calibrated ArUco markers
-- projects the robot origin onto the closest cached Hybrid A* route segment
-- computes cross-track error (XTE) as the shortest segment distance
+- projects the robot origin onto the current/future cached Hybrid A* route
+  window using a monotonic route-progress cursor
+- computes cross-track error (XTE) from that progress-aware segment projection
 - computes heading error against that segment heading
 - converts those errors into bounded left/right differential-drive speeds
 - dispatches the wheel-speed command directly to the robot microcontroller
+
+The route-progress cursor resets whenever a new route object is installed. While
+tracking a route, it only advances; the controller does not search previous
+segments again. This prevents old route geometry, loopbacks, or close
+intersections from stealing XTE control after the robot has already passed that
+part of the plan. `DriveConfig.route_tracking_lookahead_segments` controls how
+many future route segments remain eligible for projection.
 
 Dispatch uses the EV3 TCP command server for the entire `--drive` scenario,
 including continuous route-following wheel speeds and calibrated pickup moves.

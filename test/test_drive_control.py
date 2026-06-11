@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
-from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
+from robot.control import DriveSafetyGuard, WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
 from robot.drive_calibration import DriveCalibrationValues
 from robot.io import TcpWheelDispatcher
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
@@ -128,6 +128,28 @@ class DriveControlTests(unittest.TestCase):
         error = RouteTrackingError(0.0, 0.0, 0.0, (0.0, 0.0), 0.0, 0)
 
         self.assertEqual(route_goal_pose(route, error, pickup, include_final=False), route[1])
+
+    def test_progressive_tracking_ignores_previous_intersecting_segments(self) -> None:
+        guard = DriveSafetyGuard(DriveConfig(route_tracking_lookahead_segments=3))
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        route = [
+            HybridPose(0.0, 0.0, 0.0),
+            HybridPose(10.0, 0.0, 0.0),
+            HybridPose(20.0, 0.0, 0.0),
+            HybridPose(20.0, 20.0, math.pi * 0.5),
+            HybridPose(10.0, 20.0, math.pi),
+            HybridPose(10.0, 0.0, -math.pi * 0.5),
+        ]
+        drive_runtime.active_route_identity = id(route)
+        drive_runtime.route_progress_segment_index = 3
+        robot_pose = RobotPose(10.0, 0.5, -math.pi * 0.5, 10.0, 0.5)
+
+        tracking_error = guard.compute_progressive_tracking_error(robot_pose, route, drive_runtime)
+
+        assert tracking_error is not None
+        self.assertGreaterEqual(tracking_error.segment_index, 3)
+        self.assertNotEqual(tracking_error.segment_index, 0)
+        self.assertGreaterEqual(drive_runtime.route_progress_segment_index, 3)
 
     def test_route_heatmap_breaks_at_near_zone_boundary_for_each_pickup(self) -> None:
         renderer = DebugRenderer(drive_config=DriveConfig(near_zone_cm=15.0))

@@ -376,6 +376,7 @@ class DriveConfig:
     post_pickup_escape_speed_pct: float = 8.0
     post_pickup_align_tolerance_deg: float = 15.0
     post_pickup_align_speed_pct: float = 18.0
+    route_tracking_lookahead_segments: int = 12
     unload_staging_distance_cm: float = 10.0
     unload_pivot_tolerance_deg: float = 12.0
     unload_pivot_speed_pct: float = 18.0

@@ -2137,7 +2137,12 @@ class RoutePlanningFacade:
         return min(math.hypot(pose.x_cm - point.x_cm, pose.y_cm - point.y_cm) for point in route)
 
     @staticmethod
-    def compute_route_tracking_error(robot_pose: RobotPose, route: list[HybridPose]) -> RouteTrackingError | None:
+    def compute_route_tracking_error(
+        robot_pose: RobotPose,
+        route: list[HybridPose],
+        start_segment_index: int = 0,
+        end_segment_index: int | None = None,
+    ) -> RouteTrackingError | None:
         """Project live robot pose onto the closest cached route segment."""
         if len(route) < 2:
             return None
@@ -2147,7 +2152,11 @@ class RoutePlanningFacade:
         best: RouteTrackingError | None = None
         best_distance = float("inf")
 
-        for index in range(len(route) - 1):
+        first_segment = max(0, min(int(start_segment_index), len(route) - 2))
+        last_segment = len(route) - 2 if end_segment_index is None else int(end_segment_index)
+        last_segment = max(first_segment, min(last_segment, len(route) - 2))
+
+        for index in range(first_segment, last_segment + 1):
             start = route[index]
             end = route[index + 1]
             sx, sy = float(start.x_cm), float(start.y_cm)

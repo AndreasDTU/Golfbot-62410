@@ -786,7 +786,7 @@ class DriveControlTests(unittest.TestCase):
         self.assertTrue(owns_control)
         self.assertTrue(owns_after_pivot)
         self.assertTrue(owns_after_alignment)
-        self.assertTrue(owns_after_complete)
+        self.assertFalse(owns_after_complete)
         self.assertEqual(
             events,
             ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],

@@ -2,6 +2,25 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-06-11
+
+### Added
+
+- Added camera focus-lock and short ArUco pose-loss route preservation.
+  - Live camera mode now lets autofocus run during the initial ball-count prep
+    phase, then makes a best-effort OpenCV request to disable autofocus and set
+    the configured manual focus value.
+  - Brief robot-pose loss now stops motor output but preserves the cached route;
+    sustained pose loss clears the route after the configured frame threshold.
+
+### Changed
+
+- Route planning now treats `balls_collected >= initial_total_balls` as an
+  unconditional unload-routing state when robot pose is available.
+  - Visible ball detections are ignored in that state, so recalculation submits
+    an empty target list and routes to the fixed unload staging pose instead of
+    returning to ball collection.
+
 ## 2026-06-10
 
 ### Added
@@ -54,13 +73,6 @@ All notable larger additions and behavioral changes to this repository should be
   - Less severe edge proximity enters `POST_PICKUP_ALIGN`, tank-steers in place
     toward the next route goal, and only then returns to normal XTE tracking.
 
-- Added camera focus-lock and short ArUco pose-loss route preservation.
-  - Live camera mode now lets autofocus run during the initial ball-count prep
-    phase, then makes a best-effort OpenCV request to disable autofocus and set
-    the configured manual focus value.
-  - Brief robot-pose loss now stops motor output but preserves the cached route;
-    sustained pose loss clears the route after the configured frame threshold.
-
 - Changed autonomous unload routing to target a fixed perpendicular staging
   pose.
   - After all balls are collected, Hybrid A* now routes to a body-center pose at
@@ -68,14 +80,6 @@ All notable larger additions and behavioral changes to this repository should be
     goal center, with heading perpendicular to the left wall.
   - The planner no longer performs the final backwards unload docking search;
     stationary pivot and reverse visual servoing own that final maneuver.
-
-### Changed
-
-- Route planning now treats `balls_collected >= initial_total_balls` as an
-  unconditional unload-routing state when robot pose is available.
-  - Visible ball detections are ignored in that state, so recalculation submits
-    an empty target list and routes to the fixed unload staging pose instead of
-    returning to ball collection.
 
 - Corrected near-zone pickup alignment and cached-route pickup consumption.
   - Initial pickup targeting now derives the tube-offset body target from the

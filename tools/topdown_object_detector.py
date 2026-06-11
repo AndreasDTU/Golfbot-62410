@@ -32,7 +32,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from pathfinding.planner import RoutePlanningFacade
-from robot.control import DriveSafetyGuard, distance_to_route_goal_cm, robot_body_edge_clearance_cm, route_goal_pose
+from robot.control import (
+    DriveSafetyGuard,
+    closest_route_index,
+    distance_to_route_goal_cm,
+    robot_body_edge_clearance_cm,
+    route_goal_pose,
+)
 from robot.controller import RobotController
 from robot.io import TcpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
@@ -977,7 +983,7 @@ class TopdownDetectorApp:
         )
 
     def consume_completed_pickup_checkpoint(self) -> bool:
-        """Remove the pickup checkpoint that was just completed from the cached route."""
+        """Remove the completed pickup checkpoint and consumed route prefix."""
         if self.runtime.robot_pose is None or not self.runtime.route_plan.pickup_poses:
             return False
         pickup_distances = [
@@ -991,14 +997,29 @@ class TopdownDetectorApp:
         if pickup_distances[completed_index] > self.config.drive.near_zone_cm:
             return False
 
+        completed_pickup = self.runtime.route_plan.pickup_poses[completed_index]
         remaining_pickups = [
             pickup_pose
             for index, pickup_pose in enumerate(self.runtime.route_plan.pickup_poses)
             if index != completed_index
         ]
+        completed_route_index = closest_route_index(self.runtime.route_plan.points, completed_pickup)
+        current_pose = HybridPose(
+            float(self.runtime.robot_pose.x_cm),
+            float(self.runtime.robot_pose.y_cm),
+            float(self.runtime.robot_pose.heading_rad),
+        )
+        remaining_route_points = (
+            [current_pose] + list(self.runtime.route_plan.points[completed_route_index + 1 :])
+            if completed_route_index >= 0
+            else list(self.runtime.route_plan.points)
+        )
+        if len(remaining_route_points) == 1 and remaining_pickups:
+            remaining_route_points.extend(remaining_pickups)
         self.runtime.route_plan = replace(
             self.runtime.route_plan,
             active_target=None,
+            points=remaining_route_points,
             pickup_poses=remaining_pickups,
         )
         self.runtime.route_cache_target_id = -1

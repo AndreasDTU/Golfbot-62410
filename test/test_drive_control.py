@@ -514,6 +514,10 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertTrue(owns_control)
         self.assertTrue(app.runtime.route_plan.points)
+        self.assertEqual(
+            app.runtime.route_plan.points,
+            [HybridPose(40.0, 40.0, 0.0), HybridPose(55.0, 40.0, 0.0)],
+        )
         self.assertEqual(app.runtime.route_plan.pickup_poses, [HybridPose(55.0, 40.0, 0.0)])
         self.assertIsNone(app.runtime.route_plan.active_target)
         self.assertEqual(app.runtime.route_cache_target_id, -1)
@@ -572,7 +576,11 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.pickup_state = PickupExecutionState.REPLAN
         app.runtime.robot_pose = RobotPose(20.0, 40.0, 0.0, 20.0, 40.0)
         app.runtime.route_plan = RoutePlan(
-            points=[HybridPose(20.0, 40.0, 0.0), HybridPose(20.0, 70.0, math.pi * 0.5)],
+            points=[
+                HybridPose(20.0, 10.0, math.pi * 0.5),
+                HybridPose(20.0, 40.0, 0.0),
+                HybridPose(20.0, 70.0, math.pi * 0.5),
+            ],
             active_target=SimpleNamespace(track_id=1),
             pickup_poses=[HybridPose(20.0, 40.0, 0.0), HybridPose(20.0, 70.0, math.pi * 0.5)],
         )
@@ -585,6 +593,10 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.0))
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.POST_PICKUP_ALIGN)
+        self.assertEqual(
+            app.runtime.route_plan.points,
+            [HybridPose(20.0, 40.0, 0.0), HybridPose(20.0, 70.0, math.pi * 0.5)],
+        )
         self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.1))
 
         self.assertEqual(drive_runtime.state, DriveControlState.POST_PICKUP_ALIGN)

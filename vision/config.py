@@ -184,7 +184,7 @@ class DetectionConfig:
     yolo_conf_pct: int = 50
     yolo_min_area: int = 157
     yolo_max_area: int = 1580
-    cam_height_cm: int = 179
+    cam_height_cm: int = 184
     calib_z_cm: int = 7
     heading_tuning: int = 180
 

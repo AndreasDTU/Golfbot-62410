@@ -15,6 +15,13 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Changed
 
+- Post-pickup cached route continuation now trims the consumed route prefix.
+  - Completing a pickup removes both the completed pickup checkpoint and the
+    route points leading up to it, then reseeds the remaining route from the
+    live robot pose.
+  - This prevents `POST_PICKUP_ALIGN` tank-steer recovery from handing control
+    back to stale pre-pickup path geometry near walls.
+
 - Route planning now treats `balls_collected >= initial_total_balls` as an
   unconditional unload-routing state when robot pose is available.
   - Visible ball detections are ignored in that state, so recalculation submits

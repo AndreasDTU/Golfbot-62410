@@ -10,7 +10,8 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
 
 These tests cover closed-loop drive handoff, drive calibration state ownership,
 EV3 TCP command safety, drive calibration `drivecal get/set` protocol handling,
-persistence, and the controller helpers that call those commands. The
+persistence, robot-origin pivot suggestions, and the controller helpers that
+call those commands. The
 `test_drive_control` module imports OpenCV through the top-down app, so run it
 with the same Python environment used for live vision.
 

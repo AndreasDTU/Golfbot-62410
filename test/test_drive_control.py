@@ -314,6 +314,41 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertAlmostEqual(math.degrees(app.runtime.drive_calibration_turn_accumulated_rad), 20.0)
 
+    def test_drive_calibration_origin_suggestion_preserves_heading_alpha(self) -> None:
+        app = TopdownDetectorApp()
+        center = (100.0, 100.0)
+        radius = 10.0
+        points = [
+            (
+                center[0] + math.cos(index * math.tau / 24.0) * radius,
+                center[1] + math.sin(index * math.tau / 24.0) * radius,
+            )
+            for index in range(24)
+        ]
+        app.robot_runtime.calibration = {
+            "version": 1,
+            "marker_ids": [4, 5],
+            "topdown_size": list(app.config.camera.topdown_warp_size),
+            "markers": {
+                "4": {"dx": 12.0, "dy": 0.0, "alpha_rad": 0.0, "alpha_deg": 0.0},
+                "5": {"dx": -12.0, "dy": 0.0, "alpha_rad": 0.0, "alpha_deg": 0.0},
+            },
+        }
+        app.runtime.drive_calibration_origin_points = {4: points, 5: points}
+        app.runtime.drive_calibration_origin_latest_observations = {
+            4: SimpleNamespace(ground_center=np.array([110.0, 100.0], dtype=np.float32), yaw_rad=math.radians(90.0)),
+            5: SimpleNamespace(ground_center=np.array([100.0, 110.0], dtype=np.float32), yaw_rad=0.0),
+        }
+
+        app._build_drive_calibration_origin_suggestion()
+
+        suggested = app.runtime.drive_calibration_origin_suggested_calibration
+        assert suggested is not None
+        self.assertEqual(suggested["markers"]["4"]["alpha_rad"], 0.0)
+        self.assertAlmostEqual(suggested["markers"]["4"]["dx"], 0.0, places=3)
+        self.assertAlmostEqual(suggested["markers"]["4"]["dy"], 10.0, places=3)
+        self.assertIsNotNone(app.runtime.drive_calibration_origin_shift_cm)
+
     def test_drive_calibration_apply_requires_ready_result(self) -> None:
         app = TopdownDetectorApp()
         dispatcher = FakeDispatcher()

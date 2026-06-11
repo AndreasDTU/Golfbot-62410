@@ -12,8 +12,12 @@ All notable larger additions and behavioral changes to this repository should be
     turn and 10 cm move in background TCP calls, and keeps the vision loop alive
     to measure ArUco heading/distance error.
   - The calibration overlay reports expected vs actual turn and distance,
-    lateral drift, old EV3 constants, suggested corrected constants, and the
-    `y` save / `x` discard controls.
+    lateral drift, old EV3 constants, suggested corrected constants, robot
+    origin sample quality, pivot shift, and the `y` save / `x` discard controls.
+  - The 360 degree turn now also collects robot ArUco marker paths, fits the
+    actual pivot/origin, rejects insufficient or elliptical marker data, and
+    previews updated `robot_calibration.json` `dx/dy` offsets while preserving
+    existing marker `alpha_rad` heading calibration.
   - The EV3 server now supports `drivecal get` and
     `drivecal set <axle_track_mm> <mm_per_unit>`, persisting accepted values to
     `robot/robot_drive_calibration.json` while preserving built-in defaults if

@@ -55,13 +55,16 @@ python3 tools/topdown_object_detector.py --live --camera-index 0 --drive --step
 - press `k`; the app stops route control, commands the EV3 turn and move in the
   background, and keeps measuring ArUco pose in the live loop
 - review the overlay for expected vs actual turn, expected vs actual distance,
-  lateral drift, old values, and suggested values
-- press `y` to persist/apply the suggested EV3 drive calibration values, or
-  press `x` to discard/cancel
+  lateral drift, old values, suggested values, robot-origin sample counts, and
+  pivot/origin shift
+- press `y` to persist/apply the suggested EV3 drive calibration values and
+  robot-origin `dx/dy` offsets, or press `x` to discard/cancel
 
 Saved values are written by the EV3 command server to
 `robot/robot_drive_calibration.json`. If that file is missing or invalid, the
-server falls back to the built-in robot defaults.
+server falls back to the built-in robot defaults. The robot pivot/origin update
+is written to `robot_calibration.json`; the existing marker heading `alpha_rad`
+is preserved.
 
 8. Full autonomous without per-target pauses:
 

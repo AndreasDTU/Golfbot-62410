@@ -370,6 +370,7 @@ class DriveConfig:
     drive_calibration_settle_time_s: float = 0.5
     drive_calibration_min_actual_turn_deg: float = 45.0
     drive_calibration_min_actual_distance_cm: float = 1.0
+    drive_calibration_max_origin_disagreement_cm: float = 3.0
     post_pickup_escape_clearance_cm: float = 4.0
     post_pickup_align_clearance_cm: float = 12.0
     post_pickup_escape_back_cm: float = 8.0

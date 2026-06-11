@@ -124,6 +124,25 @@ def projected_motion_cm(start_xy_cm, end_xy_cm, start_heading_rad):
     return forward_cm, lateral_cm
 
 
+def image_yaw_rotate_xy(x_value, y_value, angle_rad):
+    """Rotate an image-space vector using the robot marker yaw convention."""
+    angle = float(angle_rad)
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return (
+        c * float(x_value) + s * float(y_value),
+        -s * float(x_value) + c * float(y_value),
+    )
+
+
+def marker_offset_with_preserved_alpha(marker_xy, origin_xy, marker_yaw_rad, alpha_rad):
+    """Return marker ``dx/dy`` for a measured pivot while preserving heading alpha."""
+    true_image_heading = normalize_angle(float(marker_yaw_rad) - float(alpha_rad))
+    raw_x = float(marker_xy[0]) - float(origin_xy[0])
+    raw_y = float(marker_xy[1]) - float(origin_xy[1])
+    return image_yaw_rotate_xy(raw_x, raw_y, -true_image_heading)
+
+
 def format_drive_calibration_response(values):
     """Return the EV3 TCP response format for drive calibration values."""
     validated = validate_drive_calibration(values)

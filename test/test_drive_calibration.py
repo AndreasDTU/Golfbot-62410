@@ -7,6 +7,7 @@ from robot.drive_calibration import (
     DriveCalibrationValues,
     format_drive_calibration_response,
     load_drive_calibration,
+    marker_offset_with_preserved_alpha,
     parse_drive_calibration_response,
     projected_motion_cm,
     save_drive_calibration,
@@ -31,6 +32,17 @@ class DriveCalibrationMathTests(unittest.TestCase):
 
         self.assertAlmostEqual(forward, 10.0)
         self.assertAlmostEqual(lateral, 0.0)
+
+    def test_marker_offset_preserves_existing_alpha(self) -> None:
+        dx, dy = marker_offset_with_preserved_alpha(
+            marker_xy=(110.0, 100.0),
+            origin_xy=(100.0, 100.0),
+            marker_yaw_rad=math.radians(90.0),
+            alpha_rad=0.0,
+        )
+
+        self.assertAlmostEqual(dx, 0.0, places=6)
+        self.assertAlmostEqual(dy, 10.0, places=6)
 
     def test_drive_calibration_json_round_trips_valid_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

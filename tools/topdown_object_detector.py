@@ -42,6 +42,7 @@ from robot.control import (
 from robot.controller import RobotController
 from robot.drive_calibration import (
     DriveCalibrationValues,
+    marker_offset_with_preserved_alpha,
     projected_motion_cm,
     suggest_axle_track_mm,
     suggest_mm_per_unit,
@@ -181,6 +182,13 @@ class RuntimeState:
     drive_calibration_turn_accumulated_rad: float = 0.0
     drive_calibration_distance_start_pose: RobotPose | None = None
     drive_calibration_settle_started_s: float = 0.0
+    drive_calibration_origin_points: dict[int, list[tuple[float, float]]] = field(default_factory=dict)
+    drive_calibration_origin_latest_observations: dict[int, Any] = field(default_factory=dict)
+    drive_calibration_origin_suggested_calibration: dict[str, Any] | None = None
+    drive_calibration_origin_marker_counts: dict[int, int] = field(default_factory=dict)
+    drive_calibration_origin_ellipse_ratios: dict[int, float] = field(default_factory=dict)
+    drive_calibration_origin_shift_cm: tuple[float, float] | None = None
+    drive_calibration_origin_max_disagreement_cm: float | None = None
     visible_ball_count_history: deque[tuple[float, int]] = field(
         default_factory=lambda: deque(maxlen=BALL_COUNT_HISTORY_FRAMES)
     )
@@ -229,6 +237,13 @@ class RuntimeState:
         self.drive_calibration_turn_accumulated_rad = 0.0
         self.drive_calibration_distance_start_pose = None
         self.drive_calibration_settle_started_s = 0.0
+        self.drive_calibration_origin_points.clear()
+        self.drive_calibration_origin_latest_observations.clear()
+        self.drive_calibration_origin_suggested_calibration = None
+        self.drive_calibration_origin_marker_counts.clear()
+        self.drive_calibration_origin_ellipse_ratios.clear()
+        self.drive_calibration_origin_shift_cm = None
+        self.drive_calibration_origin_max_disagreement_cm = None
 
 
 @dataclass(frozen=True)
@@ -812,6 +827,25 @@ class TopdownDetectorApp:
             lines.append(
                 f"MM_PER_UNIT: {current.mm_per_unit:.4f} -> {suggested.mm_per_unit:.4f}"
             )
+        if self.runtime.drive_calibration_origin_marker_counts:
+            counts = ", ".join(
+                f"ID {marker_id}:{count}"
+                for marker_id, count in sorted(self.runtime.drive_calibration_origin_marker_counts.items())
+            )
+            lines.append(f"Origin samples: {counts}")
+        if self.runtime.drive_calibration_origin_shift_cm is not None:
+            shift_x, shift_y = self.runtime.drive_calibration_origin_shift_cm
+            disagreement = self.runtime.drive_calibration_origin_max_disagreement_cm
+            disagreement_text = "?" if disagreement is None else f"{disagreement:.2f}cm"
+            lines.append(
+                f"Origin shift: x {shift_x:+.2f}cm y {shift_y:+.2f}cm disagree {disagreement_text}"
+            )
+            if self.runtime.drive_calibration_origin_ellipse_ratios:
+                ratios = ", ".join(
+                    f"ID {marker_id}:{ratio:.2f}"
+                    for marker_id, ratio in sorted(self.runtime.drive_calibration_origin_ellipse_ratios.items())
+                )
+                lines.append(f"Origin ellipse: {ratios}; alpha preserved")
         if state == DriveCalibrationExecutionState.READY_TO_APPLY:
             lines.append("Press y to save/apply, x to discard")
         elif state in (DriveCalibrationExecutionState.FAILED, DriveCalibrationExecutionState.CANCELLING):
@@ -955,6 +989,144 @@ class TopdownDetectorApp:
         )
         self._start_drive_calibration_command_thread("ev3-drive-calibration-move", "move")
 
+    def _reset_drive_calibration_origin_collection(self) -> None:
+        marker_ids = tuple(self.config.robot.marker_ids)
+        self.runtime.drive_calibration_origin_points = {marker_id: [] for marker_id in marker_ids}
+        self.runtime.drive_calibration_origin_latest_observations = {}
+        self.runtime.drive_calibration_origin_marker_counts = {marker_id: 0 for marker_id in marker_ids}
+        self.runtime.drive_calibration_origin_ellipse_ratios = {}
+        self.runtime.drive_calibration_origin_suggested_calibration = None
+        self.runtime.drive_calibration_origin_shift_cm = None
+        self.runtime.drive_calibration_origin_max_disagreement_cm = None
+
+    def _record_drive_calibration_origin_observations(self) -> None:
+        marker_ids = set(self.config.robot.marker_ids)
+        for marker_id, observation in self.robot_runtime.latest_observations.items():
+            if marker_id not in marker_ids:
+                continue
+            self.runtime.drive_calibration_origin_points.setdefault(marker_id, []).append(
+                (float(observation.ground_center[0]), float(observation.ground_center[1]))
+            )
+            self.runtime.drive_calibration_origin_latest_observations[marker_id] = observation
+        self.runtime.drive_calibration_origin_marker_counts = {
+            marker_id: len(self.runtime.drive_calibration_origin_points.get(marker_id, []))
+            for marker_id in self.config.robot.marker_ids
+        }
+
+    def _topdown_point_to_field_cm(self, point_px: tuple[float, float] | np.ndarray) -> tuple[float, float]:
+        return self.mapper.topdown_px_to_field_cm((float(point_px[0]), float(point_px[1])))
+
+    def _topdown_distance_cm(self, a_px: tuple[float, float], b_px: tuple[float, float]) -> float:
+        ax, ay = self._topdown_point_to_field_cm(a_px)
+        bx, by = self._topdown_point_to_field_cm(b_px)
+        return math.hypot(ax - bx, ay - by)
+
+    def _build_drive_calibration_origin_suggestion(self) -> None:
+        calibration = self.robot_runtime.calibration
+        if calibration is None:
+            raise ValueError("robot origin calibration missing")
+        markers = calibration.get("markers", {})
+        marker_ids = tuple(self.config.robot.marker_ids)
+        missing_calibration = [marker_id for marker_id in marker_ids if str(marker_id) not in markers]
+        if missing_calibration:
+            raise ValueError(f"robot calibration missing marker IDs {missing_calibration}")
+
+        fitted_centers: dict[int, tuple[float, float]] = {}
+        ellipse_ratios: dict[int, float] = {}
+        for marker_id in marker_ids:
+            points = self.runtime.drive_calibration_origin_points.get(marker_id, [])
+            if len(points) < self.config.robot_calibration.min_robot_spin_points:
+                raise ValueError(
+                    f"not enough origin samples for marker {marker_id}: "
+                    f"{len(points)}/{self.config.robot_calibration.min_robot_spin_points}"
+                )
+            xc, yc, _radius = self.robot_calibration_collector.fit_circle(points)
+            fitted_centers[marker_id] = (xc, yc)
+            ratio = self.robot_calibration_collector.ellipse_ratio(points)
+            if ratio is not None:
+                ellipse_ratios[marker_id] = ratio
+                if ratio > self.config.robot_calibration.ellipse_warning_ratio:
+                    raise ValueError(
+                        f"marker {marker_id} spin path ellipse ratio {ratio:.2f} "
+                        f"> {self.config.robot_calibration.ellipse_warning_ratio:.2f}"
+                    )
+
+        max_disagreement_cm = 0.0
+        fitted_items = list(fitted_centers.items())
+        for index, (_marker_a, center_a) in enumerate(fitted_items):
+            for _marker_b, center_b in fitted_items[index + 1 :]:
+                max_disagreement_cm = max(max_disagreement_cm, self._topdown_distance_cm(center_a, center_b))
+        if max_disagreement_cm > self.config.drive.drive_calibration_max_origin_disagreement_cm:
+            raise ValueError(
+                f"marker pivot disagreement {max_disagreement_cm:.2f}cm "
+                f"> {self.config.drive.drive_calibration_max_origin_disagreement_cm:.2f}cm"
+            )
+
+        latest_observations = self.runtime.drive_calibration_origin_latest_observations
+        missing_observations = [marker_id for marker_id in marker_ids if marker_id not in latest_observations]
+        if missing_observations:
+            raise ValueError(f"missing final marker observations {missing_observations}")
+
+        suggested_calibration = json.loads(json.dumps(calibration))
+        suggested_markers = suggested_calibration.setdefault("markers", {})
+        old_origins = []
+        new_origins = []
+        for marker_id in marker_ids:
+            observation = latest_observations[marker_id]
+            marker_key = str(marker_id)
+            marker_config = markers[marker_key]
+            alpha_rad = float(marker_config["alpha_rad"])
+            old_origin_px, _old_heading = self.robot_estimator.robot_origin_from_observation(observation, marker_config)
+            origin_px = fitted_centers[marker_id]
+            dx, dy = marker_offset_with_preserved_alpha(
+                (float(observation.ground_center[0]), float(observation.ground_center[1])),
+                origin_px,
+                float(observation.yaw_rad),
+                alpha_rad,
+            )
+            suggested_marker = dict(suggested_markers.get(marker_key, {}))
+            suggested_marker.update(
+                {
+                    "dx": float(dx),
+                    "dy": float(dy),
+                    "alpha_rad": alpha_rad,
+                    "alpha_deg": math.degrees(alpha_rad),
+                    "origin_x": float(origin_px[0]),
+                    "origin_y": float(origin_px[1]),
+                    "ellipse_ratio": float(ellipse_ratios.get(marker_id, 0.0)),
+                }
+            )
+            suggested_markers[marker_key] = suggested_marker
+            old_origins.append((float(old_origin_px[0]), float(old_origin_px[1])))
+            new_origins.append(origin_px)
+
+        old_origin_px = np.mean(np.array(old_origins, dtype=np.float32), axis=0)
+        new_origin_px = np.mean(np.array(new_origins, dtype=np.float32), axis=0)
+        old_origin_cm = self._topdown_point_to_field_cm(old_origin_px)
+        new_origin_cm = self._topdown_point_to_field_cm(new_origin_px)
+        self.runtime.drive_calibration_origin_shift_cm = (
+            new_origin_cm[0] - old_origin_cm[0],
+            new_origin_cm[1] - old_origin_cm[1],
+        )
+        self.runtime.drive_calibration_origin_max_disagreement_cm = max_disagreement_cm
+        self.runtime.drive_calibration_origin_ellipse_ratios = ellipse_ratios
+
+        parallax_config = self.robot_runtime.latest_parallax_config
+        if parallax_config is not None:
+            suggested_calibration["marker_height_cm"] = float(parallax_config.marker_height_cm)
+            suggested_calibration["camera_height_cm"] = float(parallax_config.camera_height_cm)
+            suggested_calibration["calibration_plane_height_cm"] = float(parallax_config.calibration_plane_height_cm)
+            suggested_calibration["camera_center_x"] = float(parallax_config.camera_center[0])
+            suggested_calibration["camera_center_y"] = float(parallax_config.camera_center[1])
+        suggested_calibration["version"] = int(suggested_calibration.get("version", 1))
+        suggested_calibration["created_unix"] = time.time()
+        suggested_calibration["marker_ids"] = list(marker_ids)
+        suggested_calibration["topdown_size"] = [
+            int(self.config.camera.topdown_warp_size[0]),
+            int(self.config.camera.topdown_warp_size[1]),
+        ]
+        self.runtime.drive_calibration_origin_suggested_calibration = suggested_calibration
+
     def start_drive_calibration(self, drive_runtime: DriveRuntime | None) -> None:
         """Start the optional drive calibration sequence from the live drive UI."""
         if self.drive_calibration_active():
@@ -970,6 +1142,17 @@ class TopdownDetectorApp:
             return
         if self.runtime.robot_pose is None:
             drive_runtime.last_message = "drive calibration waiting for robot pose"
+            return
+        if self.robot_runtime.calibration is None:
+            drive_runtime.last_message = "drive calibration requires robot origin calibration"
+            return
+        missing_markers = [
+            marker_id
+            for marker_id in self.config.robot.marker_ids
+            if marker_id not in self.robot_runtime.latest_observations
+        ]
+        if missing_markers:
+            drive_runtime.last_message = f"drive calibration waiting for robot marker(s): {missing_markers}"
             return
         if self.robot_runtime.phase != RobotCalibrationPhase.STATE_NORMAL:
             drive_runtime.last_message = "finish robot-origin calibration before drive calibration"
@@ -1001,12 +1184,14 @@ class TopdownDetectorApp:
         self.runtime.drive_calibration_turn_actual_deg = None
         self.runtime.drive_calibration_distance_actual_cm = None
         self.runtime.drive_calibration_lateral_drift_cm = None
+        self._reset_drive_calibration_origin_collection()
         self._start_drive_calibration_turn()
 
     def _record_drive_calibration_turn_pose(self) -> None:
         pose = self.runtime.robot_pose
         if pose is None:
             return
+        self._record_drive_calibration_origin_observations()
         current_heading = float(pose.heading_rad)
         previous = self.runtime.drive_calibration_turn_last_heading_rad
         if previous is not None:
@@ -1023,6 +1208,9 @@ class TopdownDetectorApp:
         self.runtime.drive_calibration_message = f"drive calibration failed: {reason}"
         if not keep_suggestion:
             self.runtime.drive_calibration_suggested_values = None
+            self.runtime.drive_calibration_origin_suggested_calibration = None
+            self.runtime.drive_calibration_origin_shift_cm = None
+            self.runtime.drive_calibration_origin_max_disagreement_cm = None
         if emergency_stop:
             self._send_drive_calibration_emergency_stop()
 
@@ -1050,21 +1238,54 @@ class TopdownDetectorApp:
         if suggested is None:
             self._fail_drive_calibration("no suggested values available")
             return
+        origin_suggested = self.runtime.drive_calibration_origin_suggested_calibration
+        origin_tmp_path: Path | None = None
+        if origin_suggested is not None:
+            origin_path = self.config.paths.robot_calibration_file
+            origin_tmp_path = origin_path.with_name(f"{origin_path.name}.drivecal.tmp")
+            try:
+                origin_tmp_path.write_text(
+                    json.dumps(origin_suggested, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                self._fail_drive_calibration(f"origin save staging failed: {exc}", keep_suggestion=True)
+                if drive_runtime is not None:
+                    drive_runtime.state = DriveControlState.DISPATCH_ERROR
+                    drive_runtime.last_message = self.runtime.drive_calibration_message
+                return
         try:
             applied = self._controller().set_drive_calibration(
                 suggested.axle_track_mm,
                 suggested.mm_per_unit,
             )
         except Exception as exc:
+            if origin_tmp_path is not None:
+                origin_tmp_path.unlink(missing_ok=True)
             self._fail_drive_calibration(f"apply failed: {exc}", keep_suggestion=True)
             if drive_runtime is not None:
                 drive_runtime.state = DriveControlState.DISPATCH_ERROR
                 drive_runtime.last_message = self.runtime.drive_calibration_message
             return
 
+        if origin_tmp_path is not None and origin_suggested is not None:
+            try:
+                origin_tmp_path.replace(self.config.paths.robot_calibration_file)
+                self.robot_runtime.calibration = origin_suggested
+            except Exception as exc:
+                self._fail_drive_calibration(f"origin save failed after EV3 apply: {exc}", keep_suggestion=True)
+                if drive_runtime is not None:
+                    drive_runtime.state = DriveControlState.DISPATCH_ERROR
+                    drive_runtime.last_message = self.runtime.drive_calibration_message
+                return
+
+        origin_text = ""
+        if self.runtime.drive_calibration_origin_shift_cm is not None:
+            shift_x, shift_y = self.runtime.drive_calibration_origin_shift_cm
+            origin_text = f", origin shift x {shift_x:+.2f}cm y {shift_y:+.2f}cm"
         self.robot_runtime.warning = (
             f"Applied drive calibration: axle {applied.axle_track_mm:.2f}mm, "
-            f"mm/unit {applied.mm_per_unit:.4f}"
+            f"mm/unit {applied.mm_per_unit:.4f}{origin_text}"
         )
         self.runtime.reset_drive_calibration_state()
         if drive_runtime is not None:
@@ -1140,6 +1361,12 @@ class TopdownDetectorApp:
             current_values = self.runtime.drive_calibration_values
             if current_values is None:
                 self._fail_drive_calibration("missing current calibration values")
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            try:
+                self._build_drive_calibration_origin_suggestion()
+            except ValueError as exc:
+                self._fail_drive_calibration(str(exc))
                 drive_runtime.last_message = self.runtime.drive_calibration_message
                 return True
             suggested_axle = suggest_axle_track_mm(

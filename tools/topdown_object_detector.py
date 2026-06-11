@@ -40,6 +40,13 @@ from robot.control import (
     route_goal_pose,
 )
 from robot.controller import RobotController
+from robot.drive_calibration import (
+    DriveCalibrationValues,
+    projected_motion_cm,
+    suggest_axle_track_mm,
+    suggest_mm_per_unit,
+    unwrapped_heading_delta,
+)
 from robot.io import TcpWheelDispatcher
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
 from robot.models import (
@@ -100,6 +107,19 @@ class CollectorPositionState(Enum):
     UNLOADING = "UNLOADING"
 
 
+class DriveCalibrationExecutionState(Enum):
+    """Optional live drive calibration sequence state."""
+
+    IDLE = "IDLE"
+    TURNING = "TURNING"
+    TURN_SETTLING = "TURN_SETTLING"
+    MOVING = "MOVING"
+    MOVE_SETTLING = "MOVE_SETTLING"
+    READY_TO_APPLY = "READY_TO_APPLY"
+    FAILED = "FAILED"
+    CANCELLING = "CANCELLING"
+
+
 BALL_COUNT_HISTORY_FRAMES = 15
 INITIAL_BALL_COUNT_STABLE_S = 0.75
 
@@ -149,6 +169,18 @@ class RuntimeState:
     stable_visible_balls: int | None = None
     step_mode_enabled: bool = False
     step_drive_paused: bool = False
+    drive_calibration_state: DriveCalibrationExecutionState = DriveCalibrationExecutionState.IDLE
+    drive_calibration_message: str = ""
+    drive_calibration_values: DriveCalibrationValues | None = None
+    drive_calibration_suggested_values: DriveCalibrationValues | None = None
+    drive_calibration_turn_actual_deg: float | None = None
+    drive_calibration_distance_actual_cm: float | None = None
+    drive_calibration_lateral_drift_cm: float | None = None
+    drive_calibration_turn_start_heading_rad: float = 0.0
+    drive_calibration_turn_last_heading_rad: float | None = None
+    drive_calibration_turn_accumulated_rad: float = 0.0
+    drive_calibration_distance_start_pose: RobotPose | None = None
+    drive_calibration_settle_started_s: float = 0.0
     visible_ball_count_history: deque[tuple[float, int]] = field(
         default_factory=lambda: deque(maxlen=BALL_COUNT_HISTORY_FRAMES)
     )
@@ -183,6 +215,20 @@ class RuntimeState:
         self.unload_alignment_iterations = 0
         self.unload_alignment_settle_started_s = 0.0
         self.unload_alignment_settle_reason = ""
+
+    def reset_drive_calibration_state(self) -> None:
+        self.drive_calibration_state = DriveCalibrationExecutionState.IDLE
+        self.drive_calibration_message = ""
+        self.drive_calibration_values = None
+        self.drive_calibration_suggested_values = None
+        self.drive_calibration_turn_actual_deg = None
+        self.drive_calibration_distance_actual_cm = None
+        self.drive_calibration_lateral_drift_cm = None
+        self.drive_calibration_turn_start_heading_rad = 0.0
+        self.drive_calibration_turn_last_heading_rad = None
+        self.drive_calibration_turn_accumulated_rad = 0.0
+        self.drive_calibration_distance_start_pose = None
+        self.drive_calibration_settle_started_s = 0.0
 
 
 @dataclass(frozen=True)
@@ -355,6 +401,8 @@ class TopdownDetectorApp:
         self.pickup_last_error: str = ""
         self.unload_thread: threading.Thread | None = None
         self.unload_last_error: str = ""
+        self.drive_calibration_thread: threading.Thread | None = None
+        self.drive_calibration_thread_error: str = ""
         self.controller: RobotController | None = None
 
     def _controller(self):
@@ -730,6 +778,69 @@ class TopdownDetectorApp:
             cv2.LINE_AA,
         )
 
+    def draw_drive_calibration_overlay(self, frame: np.ndarray) -> None:
+        """Draw the optional drive-calibration status and suggested constants."""
+        state = self.runtime.drive_calibration_state
+        if state == DriveCalibrationExecutionState.IDLE:
+            return
+
+        lines = [
+            f"DRIVE CALIBRATION: {state.value}",
+            self.runtime.drive_calibration_message or "press x to cancel",
+        ]
+        expected_turn = float(self.config.drive.drive_calibration_turn_degrees)
+        expected_distance = float(self.config.drive.drive_calibration_move_cm)
+        if self.runtime.drive_calibration_turn_actual_deg is not None:
+            actual = self.runtime.drive_calibration_turn_actual_deg
+            error_pct = (actual - expected_turn) * 100.0 / max(expected_turn, 1e-6)
+            lines.append(f"Turn: expected {expected_turn:.1f}deg actual {actual:.1f}deg error {error_pct:+.1f}%")
+        if self.runtime.drive_calibration_distance_actual_cm is not None:
+            actual = self.runtime.drive_calibration_distance_actual_cm
+            error_pct = (actual - expected_distance) * 100.0 / max(expected_distance, 1e-6)
+            drift = self.runtime.drive_calibration_lateral_drift_cm
+            drift_text = "?" if drift is None else f"{drift:+.2f}cm"
+            lines.append(
+                f"Move: expected {expected_distance:.1f}cm actual {actual:.2f}cm "
+                f"error {error_pct:+.1f}% drift {drift_text}"
+            )
+        current = self.runtime.drive_calibration_values
+        suggested = self.runtime.drive_calibration_suggested_values
+        if current is not None and suggested is not None:
+            lines.append(
+                f"AXLE_TRACK_MM: {current.axle_track_mm:.2f} -> {suggested.axle_track_mm:.2f}"
+            )
+            lines.append(
+                f"MM_PER_UNIT: {current.mm_per_unit:.4f} -> {suggested.mm_per_unit:.4f}"
+            )
+        if state == DriveCalibrationExecutionState.READY_TO_APPLY:
+            lines.append("Press y to save/apply, x to discard")
+        elif state in (DriveCalibrationExecutionState.FAILED, DriveCalibrationExecutionState.CANCELLING):
+            lines.append("Press x to acknowledge/discard")
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.62
+        thickness = 2
+        padding = 12
+        line_height = 24
+        text_width = max(cv2.getTextSize(line, font, font_scale, thickness)[0][0] for line in lines)
+        box_x = 18
+        box_y = 112
+        box_w = text_width + padding * 2
+        box_h = len(lines) * line_height + padding * 2
+        cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
+        cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 255, 255), 2)
+        for index, line in enumerate(lines):
+            cv2.putText(
+                frame,
+                line,
+                (box_x + padding, box_y + padding + 18 + index * line_height),
+                font,
+                font_scale,
+                (0, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
+
     def release_step_drive_pause(self, drive_runtime: DriveRuntime | None) -> None:
         """Allow one step-mode target run after the operator presses next."""
         if not self.runtime.step_mode_enabled:
@@ -757,6 +868,349 @@ class TopdownDetectorApp:
         self.runtime.step_drive_paused = True
         self.drive_guard.wheel_controller.reset()
         drive_runtime.stop(DriveControlState.STOPPED, "step target complete; press n")
+
+    def drive_calibration_active(self) -> bool:
+        """Return true when the optional drive calibration sequence owns control."""
+        return self.runtime.drive_calibration_state != DriveCalibrationExecutionState.IDLE
+
+    def _drive_calibration_thread_alive(self) -> bool:
+        return self.drive_calibration_thread is not None and self.drive_calibration_thread.is_alive()
+
+    def _send_drive_calibration_emergency_stop(self) -> None:
+        """Best-effort stop on a separate TCP connection while the main command blocks."""
+        controller: RobotController | None = None
+        try:
+            controller = RobotController(
+                self.config.drive.robot_ip,
+                port=self.config.drive.robot_tcp_port,
+                timeout=2.0,
+                connect_retries=0,
+            )
+            controller.stop()
+        except Exception as exc:
+            self.runtime.drive_calibration_message = (
+                f"{self.runtime.drive_calibration_message}; emergency stop failed: {exc}"
+            )
+        finally:
+            if controller is not None:
+                controller.close()
+
+    def _start_drive_calibration_command_thread(self, name: str, command: str) -> None:
+        """Run one blocking EV3 calibration command without freezing vision."""
+        if self._drive_calibration_thread_alive():
+            return
+
+        self.drive_calibration_thread_error = ""
+
+        def run_command() -> None:
+            try:
+                if command == "turn":
+                    self._controller().turn(
+                        round(float(self.config.drive.drive_calibration_turn_degrees), 1),
+                        int(round(self.config.drive.drive_calibration_turn_speed_pct)),
+                    )
+                elif command == "move":
+                    self._controller().move(
+                        round(float(self.config.drive.drive_calibration_move_cm), 1),
+                        int(round(self.config.drive.drive_calibration_move_speed_pct)),
+                    )
+                else:
+                    raise ValueError(f"unknown drive calibration command: {command}")
+            except Exception as exc:
+                self.drive_calibration_thread_error = str(exc)
+
+        self.drive_calibration_thread = threading.Thread(
+            target=run_command,
+            name=name,
+            daemon=True,
+        )
+        self.drive_calibration_thread.start()
+
+    def _start_drive_calibration_turn(self) -> None:
+        pose = self.runtime.robot_pose
+        if pose is None:
+            self.runtime.drive_calibration_state = DriveCalibrationExecutionState.FAILED
+            self.runtime.drive_calibration_message = "drive calibration failed: robot pose missing"
+            return
+        self.runtime.drive_calibration_state = DriveCalibrationExecutionState.TURNING
+        self.runtime.drive_calibration_turn_start_heading_rad = float(pose.heading_rad)
+        self.runtime.drive_calibration_turn_last_heading_rad = float(pose.heading_rad)
+        self.runtime.drive_calibration_turn_accumulated_rad = 0.0
+        self.runtime.drive_calibration_message = (
+            f"turning {self.config.drive.drive_calibration_turn_degrees:.0f}deg for drive calibration"
+        )
+        self._start_drive_calibration_command_thread("ev3-drive-calibration-turn", "turn")
+
+    def _start_drive_calibration_move(self) -> None:
+        pose = self.runtime.robot_pose
+        if pose is None:
+            self.runtime.drive_calibration_state = DriveCalibrationExecutionState.FAILED
+            self.runtime.drive_calibration_message = "drive calibration failed: robot pose missing before move"
+            return
+        self.runtime.drive_calibration_state = DriveCalibrationExecutionState.MOVING
+        self.runtime.drive_calibration_distance_start_pose = pose
+        self.runtime.drive_calibration_settle_started_s = 0.0
+        self.runtime.drive_calibration_message = (
+            f"moving {self.config.drive.drive_calibration_move_cm:.1f}cm for drive calibration"
+        )
+        self._start_drive_calibration_command_thread("ev3-drive-calibration-move", "move")
+
+    def start_drive_calibration(self, drive_runtime: DriveRuntime | None) -> None:
+        """Start the optional drive calibration sequence from the live drive UI."""
+        if self.drive_calibration_active():
+            if drive_runtime is not None:
+                drive_runtime.last_message = "drive calibration already active"
+            return
+        if drive_runtime is None or drive_runtime.dispatcher is None:
+            if drive_runtime is not None:
+                drive_runtime.last_message = "drive calibration requires --drive"
+            return
+        if self.latest_result is None or self.latest_result.frame_for_detection is None:
+            drive_runtime.last_message = "drive calibration waiting for top-down frame"
+            return
+        if self.runtime.robot_pose is None:
+            drive_runtime.last_message = "drive calibration waiting for robot pose"
+            return
+        if self.robot_runtime.phase != RobotCalibrationPhase.STATE_NORMAL:
+            drive_runtime.last_message = "finish robot-origin calibration before drive calibration"
+            return
+        if (
+            self.runtime.pickup_state != PickupExecutionState.NAVIGATION
+            or self.runtime.unload_state != UnloadExecutionState.IDLE
+            or self.runtime.collector_state in (
+                CollectorPositionState.PICKUP_ASSIST,
+                CollectorPositionState.UNLOADING,
+            )
+        ):
+            drive_runtime.last_message = "drive calibration blocked by active pickup/unload state"
+            return
+
+        self.drive_guard.wheel_controller.reset()
+        self.runtime.clear_route()
+        self._force_drive_stop(drive_runtime, DriveControlState.CALIBRATING, "starting drive calibration")
+        try:
+            current_values = self._controller().get_drive_calibration()
+        except Exception as exc:
+            self.runtime.drive_calibration_state = DriveCalibrationExecutionState.FAILED
+            self.runtime.drive_calibration_message = f"drive calibration failed: {exc}"
+            drive_runtime.last_message = self.runtime.drive_calibration_message
+            return
+
+        self.runtime.drive_calibration_values = current_values
+        self.runtime.drive_calibration_suggested_values = None
+        self.runtime.drive_calibration_turn_actual_deg = None
+        self.runtime.drive_calibration_distance_actual_cm = None
+        self.runtime.drive_calibration_lateral_drift_cm = None
+        self._start_drive_calibration_turn()
+
+    def _record_drive_calibration_turn_pose(self) -> None:
+        pose = self.runtime.robot_pose
+        if pose is None:
+            return
+        current_heading = float(pose.heading_rad)
+        previous = self.runtime.drive_calibration_turn_last_heading_rad
+        if previous is not None:
+            self.runtime.drive_calibration_turn_accumulated_rad += unwrapped_heading_delta(previous, current_heading)
+        self.runtime.drive_calibration_turn_last_heading_rad = current_heading
+
+    def _fail_drive_calibration(
+        self,
+        reason: str,
+        emergency_stop: bool = False,
+        keep_suggestion: bool = False,
+    ) -> None:
+        self.runtime.drive_calibration_state = DriveCalibrationExecutionState.FAILED
+        self.runtime.drive_calibration_message = f"drive calibration failed: {reason}"
+        if not keep_suggestion:
+            self.runtime.drive_calibration_suggested_values = None
+        if emergency_stop:
+            self._send_drive_calibration_emergency_stop()
+
+    def cancel_drive_calibration(self, drive_runtime: DriveRuntime | None) -> None:
+        """Cancel drive calibration and hold control until any EV3 command returns."""
+        if not self.drive_calibration_active():
+            return
+        if self._drive_calibration_thread_alive():
+            self.runtime.drive_calibration_state = DriveCalibrationExecutionState.CANCELLING
+            self.runtime.drive_calibration_message = "drive calibration cancel requested; waiting for EV3 command"
+            self._send_drive_calibration_emergency_stop()
+            if drive_runtime is not None:
+                drive_runtime.state = DriveControlState.CALIBRATING
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+            return
+        self.runtime.reset_drive_calibration_state()
+        if drive_runtime is not None:
+            drive_runtime.stop(DriveControlState.STOPPED, "drive calibration cancelled")
+
+    def apply_drive_calibration(self, drive_runtime: DriveRuntime | None) -> None:
+        """Persist suggested calibration values when the operator confirms with ``y``."""
+        if self.runtime.drive_calibration_state != DriveCalibrationExecutionState.READY_TO_APPLY:
+            return
+        suggested = self.runtime.drive_calibration_suggested_values
+        if suggested is None:
+            self._fail_drive_calibration("no suggested values available")
+            return
+        try:
+            applied = self._controller().set_drive_calibration(
+                suggested.axle_track_mm,
+                suggested.mm_per_unit,
+            )
+        except Exception as exc:
+            self._fail_drive_calibration(f"apply failed: {exc}", keep_suggestion=True)
+            if drive_runtime is not None:
+                drive_runtime.state = DriveControlState.DISPATCH_ERROR
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+            return
+
+        self.robot_runtime.warning = (
+            f"Applied drive calibration: axle {applied.axle_track_mm:.2f}mm, "
+            f"mm/unit {applied.mm_per_unit:.4f}"
+        )
+        self.runtime.reset_drive_calibration_state()
+        if drive_runtime is not None:
+            drive_runtime.stop(DriveControlState.STOPPED, "drive calibration applied")
+
+    def update_drive_calibration_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
+        """Advance optional drive calibration and return True while it owns output."""
+        state = self.runtime.drive_calibration_state
+        if state == DriveCalibrationExecutionState.IDLE:
+            return False
+
+        drive_runtime.state = DriveControlState.CALIBRATING
+        drive_runtime.last_error = None
+        drive_runtime.last_command = WheelCommand(0.0, 0.0)
+        drive_runtime.last_message = self.runtime.drive_calibration_message
+
+        if state == DriveCalibrationExecutionState.CANCELLING:
+            if self._drive_calibration_thread_alive():
+                return True
+            self.runtime.reset_drive_calibration_state()
+            drive_runtime.stop(DriveControlState.STOPPED, "drive calibration cancelled")
+            return True
+
+        if state == DriveCalibrationExecutionState.FAILED:
+            if self._drive_calibration_thread_alive():
+                drive_runtime.last_message = f"{self.runtime.drive_calibration_message}; waiting for EV3 command"
+            return True
+
+        if state in (
+            DriveCalibrationExecutionState.TURNING,
+            DriveCalibrationExecutionState.TURN_SETTLING,
+            DriveCalibrationExecutionState.MOVING,
+            DriveCalibrationExecutionState.MOVE_SETTLING,
+        ) and self.runtime.robot_pose is None:
+            self._fail_drive_calibration("robot pose lost", emergency_stop=True)
+            drive_runtime.last_message = self.runtime.drive_calibration_message
+            return True
+
+        if self.drive_calibration_thread_error:
+            self._fail_drive_calibration(self.drive_calibration_thread_error)
+            drive_runtime.last_message = self.runtime.drive_calibration_message
+            return True
+
+        if state == DriveCalibrationExecutionState.TURNING:
+            self._record_drive_calibration_turn_pose()
+            if self._drive_calibration_thread_alive():
+                actual_deg = abs(math.degrees(self.runtime.drive_calibration_turn_accumulated_rad))
+                self.runtime.drive_calibration_message = f"turning; measured {actual_deg:.1f}deg so far"
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            self.runtime.drive_calibration_state = DriveCalibrationExecutionState.TURN_SETTLING
+            self.runtime.drive_calibration_settle_started_s = now_s
+            self.runtime.drive_calibration_message = "turn complete; settling before measurement"
+            return True
+
+        if state == DriveCalibrationExecutionState.TURN_SETTLING:
+            self._record_drive_calibration_turn_pose()
+            elapsed_s = now_s - self.runtime.drive_calibration_settle_started_s
+            if elapsed_s < self.config.drive.drive_calibration_settle_time_s:
+                self.runtime.drive_calibration_message = (
+                    f"turn settling {elapsed_s:.2f}/{self.config.drive.drive_calibration_settle_time_s:.2f}s"
+                )
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            actual_turn_deg = abs(math.degrees(self.runtime.drive_calibration_turn_accumulated_rad))
+            if (
+                not math.isfinite(actual_turn_deg)
+                or actual_turn_deg < self.config.drive.drive_calibration_min_actual_turn_deg
+            ):
+                self._fail_drive_calibration(f"invalid actual turn {actual_turn_deg:.1f}deg")
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            current_values = self.runtime.drive_calibration_values
+            if current_values is None:
+                self._fail_drive_calibration("missing current calibration values")
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            suggested_axle = suggest_axle_track_mm(
+                current_values.axle_track_mm,
+                self.config.drive.drive_calibration_turn_degrees,
+                actual_turn_deg,
+            )
+            self.runtime.drive_calibration_turn_actual_deg = actual_turn_deg
+            self.runtime.drive_calibration_suggested_values = DriveCalibrationValues(
+                axle_track_mm=suggested_axle,
+                mm_per_unit=current_values.mm_per_unit,
+            )
+            self._start_drive_calibration_move()
+            return True
+
+        if state == DriveCalibrationExecutionState.MOVING:
+            if self._drive_calibration_thread_alive():
+                return True
+            self.runtime.drive_calibration_state = DriveCalibrationExecutionState.MOVE_SETTLING
+            self.runtime.drive_calibration_settle_started_s = now_s
+            self.runtime.drive_calibration_message = "move complete; settling before measurement"
+            return True
+
+        if state == DriveCalibrationExecutionState.MOVE_SETTLING:
+            elapsed_s = now_s - self.runtime.drive_calibration_settle_started_s
+            if elapsed_s < self.config.drive.drive_calibration_settle_time_s:
+                self.runtime.drive_calibration_message = (
+                    f"move settling {elapsed_s:.2f}/{self.config.drive.drive_calibration_settle_time_s:.2f}s"
+                )
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            start_pose = self.runtime.drive_calibration_distance_start_pose
+            current_pose = self.runtime.robot_pose
+            suggested = self.runtime.drive_calibration_suggested_values
+            if start_pose is None or current_pose is None or suggested is None:
+                self._fail_drive_calibration("missing distance measurement pose")
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            forward_cm, lateral_cm = projected_motion_cm(
+                (start_pose.x_cm, start_pose.y_cm),
+                (current_pose.x_cm, current_pose.y_cm),
+                start_pose.heading_rad,
+            )
+            if (
+                not math.isfinite(forward_cm)
+                or forward_cm < self.config.drive.drive_calibration_min_actual_distance_cm
+            ):
+                self._fail_drive_calibration(f"invalid actual distance {forward_cm:.2f}cm")
+                drive_runtime.last_message = self.runtime.drive_calibration_message
+                return True
+            new_mm_per_unit = suggest_mm_per_unit(
+                suggested.mm_per_unit,
+                self.config.drive.drive_calibration_move_cm,
+                forward_cm,
+            )
+            self.runtime.drive_calibration_distance_actual_cm = forward_cm
+            self.runtime.drive_calibration_lateral_drift_cm = lateral_cm
+            self.runtime.drive_calibration_suggested_values = DriveCalibrationValues(
+                axle_track_mm=suggested.axle_track_mm,
+                mm_per_unit=new_mm_per_unit,
+            )
+            self.runtime.drive_calibration_state = DriveCalibrationExecutionState.READY_TO_APPLY
+            self.runtime.drive_calibration_message = "drive calibration ready: press y to apply, x to discard"
+            drive_runtime.last_message = self.runtime.drive_calibration_message
+            return True
+
+        if state == DriveCalibrationExecutionState.READY_TO_APPLY:
+            drive_runtime.last_message = self.runtime.drive_calibration_message
+            return True
+
+        return True
 
     def _pickup_target_body_pose(self, goal: HybridPose, params: dict[str, object] | None = None) -> tuple[float, float]:
         """Return the current best body-center target for the next pickup."""
@@ -1753,6 +2207,8 @@ class TopdownDetectorApp:
 
     def update_route(self, result: VisionFrameResult, params: dict[str, object]) -> None:
         self.runtime.latest_smoothed_balls = result.smoothed_ball_coordinates
+        if self.drive_calibration_active():
+            return
         if self.runtime.pickup_state != PickupExecutionState.NAVIGATION:
             return
         if result.occupancy_grid is None:
@@ -1988,6 +2444,7 @@ class TopdownDetectorApp:
             self.renderer.draw_drive_status(combined, drive_runtime)
             self.draw_ball_reconciliation_overlay(combined)
             self.draw_step_pause_overlay(combined)
+            self.draw_drive_calibration_overlay(combined)
             waiting_text = (
                 "Waiting for manual top-down selection"
                 if self.homography_calibrator is not None
@@ -2062,6 +2519,7 @@ class TopdownDetectorApp:
         self.renderer.draw_drive_status(combined, drive_runtime)
         self.draw_ball_reconciliation_overlay(combined)
         self.draw_step_pause_overlay(combined)
+        self.draw_drive_calibration_overlay(combined)
         if video_paused:
             self.renderer.draw_video_pause_overlay(combined)
         return combined, masks, schematic
@@ -2299,6 +2757,8 @@ class TopdownDetectorApp:
         """Map arrow/space keys to the legacy direct non-blocking wheel commands."""
         if drive_runtime is None or drive_runtime.dispatcher is None:
             return
+        if self.drive_calibration_active():
+            return
         if (key & 0xFF) == ord(" "):
             drive_runtime.stop(DriveControlState.STOPPED, "manual stop")
             return
@@ -2336,12 +2796,34 @@ class TopdownDetectorApp:
                 force=True,
             )
 
+    def handle_drive_calibration_key(self, ascii_key: int, drive_runtime: DriveRuntime | None) -> bool:
+        """Handle optional drive calibration keys before normal manual dispatch."""
+        if ascii_key == ord("k"):
+            self.start_drive_calibration(drive_runtime)
+            return True
+        if ascii_key == ord("y"):
+            self.apply_drive_calibration(drive_runtime)
+            return self.drive_calibration_active()
+        if ascii_key == ord("x"):
+            if self.drive_calibration_active():
+                self.cancel_drive_calibration(drive_runtime)
+                return True
+            return False
+        if ascii_key == ord(" ") and self.drive_calibration_active():
+            self.cancel_drive_calibration(drive_runtime)
+            return True
+        return False
+
     def handle_key(self, key: int, drive_runtime: DriveRuntime | None = None) -> bool:
         if key in (255, -1):
             return False
         ascii_key = key & 0xFF
         if ascii_key in (27, ord("q")):
             return True
+        if self.handle_drive_calibration_key(ascii_key, drive_runtime):
+            return False
+        if self.drive_calibration_active():
+            return False
         if self.homography_calibrator is not None:
             if ascii_key == ord("r"):
                 self.homography_calibrator.clear_manual_points()
@@ -2571,9 +3053,15 @@ class TopdownDetectorApp:
                 if preprocessed.transform_matrix is None or preprocessed.normalized is None:
                     self.reset_detection_state()
                     result = self.build_missing_transform_result(raw_frame, preprocessed, params)
-                    if self.runtime.step_mode_enabled:
+                    if self.drive_calibration_active():
+                        self._fail_drive_calibration("top-down calibration lost", emergency_stop=True)
+                        drive_runtime.state = DriveControlState.CALIBRATING
+                        drive_runtime.last_message = self.runtime.drive_calibration_message
+                    elif self.runtime.step_mode_enabled:
                         self.runtime.step_drive_paused = True
-                    drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for top-down calibration")
+                        drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for top-down calibration")
+                    else:
+                        drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for top-down calibration")
                     combined, masks, schematic = self.render(result, params, fps=0.0, drive_runtime=drive_runtime)
                     processing_ms = (time.perf_counter() - start) * 1000.0
                     cv2.putText(
@@ -2621,7 +3109,10 @@ class TopdownDetectorApp:
                     drive_runtime.dispatcher is not None
                     and not self.ball_count_initialized()
                 )
-                if drive_waiting_for_ball_count:
+                calibration_owns_control = self.update_drive_calibration_state(drive_runtime, now)
+                if calibration_owns_control:
+                    self.drive_guard.wheel_controller.reset()
+                elif drive_waiting_for_ball_count:
                     if self.runtime.step_mode_enabled:
                         self.runtime.step_drive_paused = True
                     self.drive_guard.wheel_controller.reset()

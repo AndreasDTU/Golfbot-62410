@@ -5,15 +5,20 @@ This repository has dedicated smoke tests for checkerboard undistortion and pers
 ## Focused Robot Control Tests
 
 ```bash
-env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_control test.test_collection_actuator
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_control test.test_robot_server_commands test.test_robot_controller_safety
 ```
 
-These tests cover closed-loop drive handoff, collection actuator command
-separation, and the rule that autonomous white/orange ball collection uses the
-small `pickup_assist` command rather than the full unload cycle. They also cover
-the autonomous guard that commands `collector_travel_position` before wheel
-route-following starts and returns the collector state to `TRAVEL` after pickup
-assist completes.
+These tests cover closed-loop drive handoff, drive calibration state ownership,
+EV3 TCP command safety, drive calibration `drivecal get/set` protocol handling,
+persistence, and the controller helpers that call those commands. The
+`test_drive_control` module imports OpenCV through the top-down app, so run it
+with the same Python environment used for live vision.
+
+Drive calibration math and persistence helpers can also be run in isolation:
+
+```bash
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_calibration
+```
 
 ## Full Perspective + Distortion Comparison (single command)
 

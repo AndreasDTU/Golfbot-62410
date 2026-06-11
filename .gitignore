@@ -218,3 +218,6 @@ frames/
 test/artifacts/
 # Graphify generated code graph output
 graphify-out/
+
+# Robot-local runtime drive calibration values
+robot/robot_drive_calibration.json

@@ -9,10 +9,12 @@ import numpy as np
 
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
 from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
+from robot.drive_calibration import DriveCalibrationValues
 from robot.io import TcpWheelDispatcher
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
 from tools.topdown_object_detector import (
     CollectorPositionState,
+    DriveCalibrationExecutionState,
     PickupExecutionState,
     RoutePlanningRequest,
     RoutePlanningResult,
@@ -233,6 +235,87 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(drive_runtime.state, DriveControlState.STOPPED)
         self.assertEqual(drive_runtime.last_message, "step target complete; press n")
         self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+
+    def test_drive_calibration_key_requires_drive_and_pose(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=None)
+
+        app.handle_key(ord("k"), drive_runtime)
+
+        self.assertEqual(app.runtime.drive_calibration_state, DriveCalibrationExecutionState.IDLE)
+        self.assertEqual(drive_runtime.last_message, "drive calibration requires --drive")
+
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        app.latest_result = SimpleNamespace(frame_for_detection=object())
+
+        app.handle_key(ord("k"), drive_runtime)
+
+        self.assertEqual(app.runtime.drive_calibration_state, DriveCalibrationExecutionState.IDLE)
+        self.assertEqual(drive_runtime.last_message, "drive calibration waiting for robot pose")
+
+    def test_drive_calibration_start_owns_motor_output(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.latest_result = SimpleNamespace(frame_for_detection=object())
+        app.runtime.robot_pose = RobotPose(10.0, 20.0, 0.0, 27.0, 20.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+        )
+
+        class FakeDriveCalibrationController:
+            def get_drive_calibration(self) -> DriveCalibrationValues:
+                return DriveCalibrationValues(300.0, 12.5)
+
+            def turn(self, _degrees: float, _speed_percent: int) -> str:
+                return "OK"
+
+        app.controller = FakeDriveCalibrationController()
+
+        app.handle_key(ord("k"), drive_runtime)
+        owns_control = app.update_drive_calibration_state(drive_runtime, now_s=1.0)
+
+        self.assertTrue(owns_control)
+        self.assertEqual(drive_runtime.state, DriveControlState.CALIBRATING)
+        self.assertEqual(app.runtime.route_plan.points, [])
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+
+    def test_drive_calibration_turn_accumulation_handles_heading_wrap(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.drive_calibration_state = DriveCalibrationExecutionState.TURNING
+        app.runtime.drive_calibration_turn_last_heading_rad = math.radians(170.0)
+        app.runtime.robot_pose = RobotPose(0.0, 0.0, math.radians(-170.0), 0.0, 0.0)
+
+        app._record_drive_calibration_turn_pose()
+
+        self.assertAlmostEqual(math.degrees(app.runtime.drive_calibration_turn_accumulated_rad), 20.0)
+
+    def test_drive_calibration_apply_requires_ready_result(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        applied: list[tuple[float, float]] = []
+
+        class FakeDriveCalibrationController:
+            def set_drive_calibration(self, axle_track_mm: float, mm_per_unit: float) -> DriveCalibrationValues:
+                applied.append((axle_track_mm, mm_per_unit))
+                return DriveCalibrationValues(axle_track_mm, mm_per_unit)
+
+        app.controller = FakeDriveCalibrationController()
+
+        app.handle_key(ord("y"), drive_runtime)
+
+        self.assertEqual(applied, [])
+
+        app.runtime.drive_calibration_state = DriveCalibrationExecutionState.READY_TO_APPLY
+        app.runtime.drive_calibration_suggested_values = DriveCalibrationValues(310.0, 11.0)
+        app.handle_key(ord("y"), drive_runtime)
+
+        self.assertEqual(applied, [(310.0, 11.0)])
+        self.assertEqual(app.runtime.drive_calibration_state, DriveCalibrationExecutionState.IDLE)
+        self.assertEqual(drive_runtime.last_message, "drive calibration applied")
 
     def test_near_zone_handoff_stops_tcp_tracking_then_turns_and_runs_tcp_move(self) -> None:
         app = TopdownDetectorApp()

@@ -16,6 +16,8 @@ Commands:
   pipe down <units> [speed] - Lower the pipe N units
   pipe stop               - Stop pipe motor immediately
   LR <left> <right>       - Set continuous left/right wheel speeds
+  drivecal get            - Read active drive calibration constants
+  drivecal set <axle_track_mm> <mm_per_unit> - Persist/apply drive calibration
   collector_travel_position - Raise collector to safe driving position
   pickup_assist           - Small pipe jiggle for collecting one ball
   unload_full_cycle       - Full pipe cycle for unloading balls at the goal
@@ -29,10 +31,26 @@ import socket
 import threading
 import time
 import math
+import sys
+from pathlib import Path
 from ev3dev2.motor import (
     LargeMotor, MoveTank,
     OUTPUT_B, OUTPUT_C, OUTPUT_D,
     SpeedPercent
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from robot.drive_calibration import (
+    DEFAULT_AXLE_TRACK_MM,
+    DEFAULT_MM_PER_UNIT,
+    DriveCalibrationValues,
+    format_drive_calibration_response,
+    load_drive_calibration,
+    save_drive_calibration,
+    validate_drive_calibration,
 )
 
 HOST = '0.0.0.0'
@@ -40,8 +58,15 @@ PORT = 5555
 
 # --- Robot physical configuration (tune these to your robot) ---
 WHEEL_DIAMETER_MM = 56.0             # Diameter of drive wheels in mm
-AXLE_TRACK_MM     = 252.5986772      # Center-to-center distance between drive wheels in mm
-MM_PER_UNIT = 9.9664                 # 1 unit = 10mm (1cm). Adjust to recalibrate.
+AXLE_TRACK_MM = DEFAULT_AXLE_TRACK_MM      # Center-to-center distance between drive wheels in mm
+MM_PER_UNIT = DEFAULT_MM_PER_UNIT          # Linear travel mm per move/back unit.
+DRIVE_CALIBRATION_FILE = Path(__file__).with_name("robot_drive_calibration.json")
+_loaded_drive_calibration = load_drive_calibration(
+    DRIVE_CALIBRATION_FILE,
+    DriveCalibrationValues(AXLE_TRACK_MM, MM_PER_UNIT),
+)
+AXLE_TRACK_MM = _loaded_drive_calibration.axle_track_mm
+MM_PER_UNIT = _loaded_drive_calibration.mm_per_unit
 
 # Pipe motor: degrees of motor rotation per unit of pipe travel
 # Tune this based on your pipe mechanism's gear ratio / spool size
@@ -77,6 +102,26 @@ def turn_angle_to_motor_degrees(turn_angle_deg):
     arc = (abs(turn_angle_deg) / 360.0) * 3.14159 * AXLE_TRACK_MM
     circumference = 3.14159 * WHEEL_DIAMETER_MM
     return (arc / circumference) * 360.0
+
+
+def current_drive_calibration():
+    """Return the active drive calibration constants."""
+    return DriveCalibrationValues(
+        axle_track_mm=float(AXLE_TRACK_MM),
+        mm_per_unit=float(MM_PER_UNIT),
+    )
+
+
+def set_drive_calibration(axle_track_mm, mm_per_unit):
+    """Validate, persist, and apply drive calibration constants."""
+    global AXLE_TRACK_MM, MM_PER_UNIT
+    values = validate_drive_calibration(
+        DriveCalibrationValues(float(axle_track_mm), float(mm_per_unit))
+    )
+    save_drive_calibration(DRIVE_CALIBRATION_FILE, values)
+    AXLE_TRACK_MM = values.axle_track_mm
+    MM_PER_UNIT = values.mm_per_unit
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +272,20 @@ def cmd_lr(parts):
     return "ok: wheel speeds {} {}".format(left, right)
 
 
+def cmd_drivecal(parts):
+    if len(parts) < 2:
+        return "error: drivecal requires get or set <axle_track_mm> <mm_per_unit>"
+    subaction = parts[1].lower()
+    if subaction == "get":
+        return format_drive_calibration_response(current_drive_calibration())
+    if subaction == "set":
+        if len(parts) != 4:
+            return "error: drivecal set requires <axle_track_mm> <mm_per_unit>"
+        values = set_drive_calibration(float(parts[2]), float(parts[3]))
+        return format_drive_calibration_response(values)
+    return "error: drivecal requires get or set <axle_track_mm> <mm_per_unit>"
+
+
 # ---------------------------------------------------------------------------
 # Command dispatcher
 # ---------------------------------------------------------------------------
@@ -241,6 +300,8 @@ def handle_command(cmd):
     try:
         if action == "ping":
             return "pong"
+        elif action == "drivecal":
+            return cmd_drivecal(parts)
         elif action == "lr":
             return cmd_lr(parts)
         elif action == "move":

@@ -1,5 +1,7 @@
+import atexit
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -55,6 +57,12 @@ def load_robot_server_with_fake_ev3():
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        test_path = Path(tempfile.gettempdir()) / f"golfbot_drivecal_test_{id(module)}.json"
+        test_path.unlink(missing_ok=True)
+        atexit.register(lambda path=test_path: path.unlink(missing_ok=True))
+        module.DRIVE_CALIBRATION_FILE = test_path
+        module.AXLE_TRACK_MM = module.DEFAULT_AXLE_TRACK_MM
+        module.MM_PER_UNIT = module.DEFAULT_MM_PER_UNIT
         return module
     finally:
         for name, value in previous.items():
@@ -90,6 +98,39 @@ class RobotServerCommandTests(unittest.TestCase):
 
         self.assertEqual(response, "ok: wheel speeds 0.0 0.0")
         self.assertEqual(robot_server.tank.off_calls, 1)
+
+    def test_drivecal_get_returns_loaded_constants(self) -> None:
+        robot_server = load_robot_server_with_fake_ev3()
+
+        response = robot_server.handle_command("drivecal get")
+
+        self.assertIn("ok: drivecal", response)
+        self.assertIn("axle_track_mm", response)
+        self.assertIn("mm_per_unit", response)
+
+    def test_drivecal_set_persists_and_updates_conversion_helpers(self) -> None:
+        robot_server = load_robot_server_with_fake_ev3()
+        with tempfile.TemporaryDirectory() as tmp:
+            robot_server.DRIVE_CALIBRATION_FILE = Path(tmp) / "robot_drive_calibration.json"
+
+            response = robot_server.handle_command("drivecal set 300.0 12.5")
+
+            self.assertEqual(response, "ok: drivecal axle_track_mm 300.000000 mm_per_unit 12.500000")
+            self.assertTrue(robot_server.DRIVE_CALIBRATION_FILE.exists())
+            wheel_circumference_mm = 3.14159 * robot_server.WHEEL_DIAMETER_MM
+            expected_turn_degrees = (3.14159 * 300.0 / wheel_circumference_mm) * 360.0
+            expected_move_degrees = (10.0 * 12.5 / wheel_circumference_mm) * 360.0
+            self.assertAlmostEqual(robot_server.turn_angle_to_motor_degrees(360.0), expected_turn_degrees)
+            self.assertAlmostEqual(robot_server.units_to_degrees(10.0), expected_move_degrees)
+
+    def test_drivecal_rejects_invalid_values(self) -> None:
+        robot_server = load_robot_server_with_fake_ev3()
+        original = robot_server.current_drive_calibration()
+
+        response = robot_server.handle_command("drivecal set nan 12.5")
+
+        self.assertTrue(response.startswith("error:"))
+        self.assertEqual(robot_server.current_drive_calibration(), original)
 
 
 if __name__ == "__main__":

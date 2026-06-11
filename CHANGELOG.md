@@ -6,6 +6,22 @@ All notable larger additions and behavioral changes to this repository should be
 
 ### Added
 
+- Added an optional live `--drive` calibration sequence started with `k`.
+  - The top-down app now pauses route control, owns motor output with
+    `DriveControlState.CALIBRATING`, commands a measured 360 degree EV3 tank
+    turn and 10 cm move in background TCP calls, and keeps the vision loop alive
+    to measure ArUco heading/distance error.
+  - The calibration overlay reports expected vs actual turn and distance,
+    lateral drift, old EV3 constants, suggested corrected constants, and the
+    `y` save / `x` discard controls.
+  - The EV3 server now supports `drivecal get` and
+    `drivecal set <axle_track_mm> <mm_per_unit>`, persisting accepted values to
+    `robot/robot_drive_calibration.json` while preserving built-in defaults if
+    the file is missing or invalid.
+  - Added controller helpers and pure calibration tests for correction math,
+    heading unwrapping, JSON persistence, EV3 server validation, and command
+    formatting.
+
 - Added camera focus-lock and short ArUco pose-loss route preservation.
   - Live camera mode now lets autofocus run during the initial ball-count prep
     phase, then makes a best-effort OpenCV request to disable autofocus and set

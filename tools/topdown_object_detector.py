@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
+from pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan, RouteSegmentType
 from pathfinding.planner import RoutePlanningFacade
 from robot.control import (
     DriveSafetyGuard,
@@ -121,6 +121,18 @@ class DriveCalibrationExecutionState(Enum):
     CANCELLING = "CANCELLING"
 
 
+class TankPivotState(Enum):
+    """State machine for intercepting PIVOT route segments as discrete tank turns."""
+
+    IDLE = "IDLE"
+    STOPPING = "STOPPING"
+    SETTLING_BEFORE = "SETTLING_BEFORE"
+    TURNING = "TURNING"
+    SETTLING_AFTER = "SETTLING_AFTER"
+    VERIFYING = "VERIFYING"
+    COMPLETE = "COMPLETE"
+
+
 BALL_COUNT_HISTORY_FRAMES = 15
 INITIAL_BALL_COUNT_STABLE_S = 0.75
 
@@ -190,6 +202,11 @@ class RuntimeState:
     drive_calibration_origin_ellipse_ratios: dict[int, float] = field(default_factory=dict)
     drive_calibration_origin_shift_cm: tuple[float, float] | None = None
     drive_calibration_origin_max_disagreement_cm: float | None = None
+    pivot_state: TankPivotState = TankPivotState.IDLE
+    pivot_target_heading_rad: float = 0.0
+    pivot_segment_index: int = 0
+    pivot_settle_started_s: float = 0.0
+    pivot_turn_attempts: int = 0
     visible_ball_count_history: deque[tuple[float, int]] = field(
         default_factory=lambda: deque(maxlen=BALL_COUNT_HISTORY_FRAMES)
     )
@@ -204,6 +221,7 @@ class RuntimeState:
         self.route_failed_ball_signature = None
         self.route_failed_unload_extension_cm = None
         self.route_failed_start_signature = None
+        self.reset_pivot_state()
 
     def reset_pickup_state(self) -> None:
         self.pickup_state = PickupExecutionState.NAVIGATION
@@ -218,6 +236,7 @@ class RuntimeState:
         self.near_zone_alignment_settle_started_s = 0.0
         self.near_zone_alignment_settle_reason = ""
         self.post_pickup_escape_fired = False
+        self.reset_pivot_state()
 
     def reset_unload_alignment_state(self) -> None:
         self.unload_alignment_best_error_cm = float("inf")
@@ -225,6 +244,13 @@ class RuntimeState:
         self.unload_alignment_iterations = 0
         self.unload_alignment_settle_started_s = 0.0
         self.unload_alignment_settle_reason = ""
+
+    def reset_pivot_state(self) -> None:
+        self.pivot_state = TankPivotState.IDLE
+        self.pivot_target_heading_rad = 0.0
+        self.pivot_segment_index = 0
+        self.pivot_settle_started_s = 0.0
+        self.pivot_turn_attempts = 0
 
     def reset_drive_calibration_state(self) -> None:
         self.drive_calibration_state = DriveCalibrationExecutionState.IDLE
@@ -1966,6 +1992,188 @@ class TopdownDetectorApp:
         )
         return distance_to_staging_cm <= staging_distance_cm
 
+    # ------------------------------------------------------------------
+    # Tank pivot interceptor
+    # ------------------------------------------------------------------
+
+    def _approaching_pivot_segment(self, drive_runtime: DriveRuntime) -> int | None:
+        """Return the segment index of the next PIVOT within intercept distance, or None."""
+        route = self.runtime.route_plan
+        segment_types = route.segment_types
+        if segment_types is None or self.runtime.robot_pose is None:
+            return None
+        current_seg = drive_runtime.route_progress_segment_index
+        # Look ahead up to 3 segments for a PIVOT
+        for offset in range(0, 3):
+            idx = current_seg + offset
+            if idx >= len(segment_types):
+                break
+            if segment_types[idx] != RouteSegmentType.PIVOT:
+                continue
+            # Guard: need at least one segment after the PIVOT
+            if idx + 1 >= len(route.points):
+                continue
+            pivot_start = route.points[idx]
+            dist = math.hypot(
+                pivot_start.x_cm - self.runtime.robot_pose.x_cm,
+                pivot_start.y_cm - self.runtime.robot_pose.y_cm,
+            )
+            if dist <= self.config.drive.pivot_intercept_cm:
+                return idx
+        return None
+
+    def _pivot_deceleration_poses(self) -> list[HybridPose]:
+        """Return PIVOT start points as deceleration targets for the speed profile."""
+        route = self.runtime.route_plan
+        segment_types = route.segment_types
+        if segment_types is None:
+            return []
+        return [
+            route.points[i]
+            for i, seg_type in enumerate(segment_types)
+            if seg_type == RouteSegmentType.PIVOT and i < len(route.points)
+        ]
+
+    def _run_tank_pivot_if_needed(self, drive_runtime: DriveRuntime) -> bool:
+        """Intercept approaching PIVOT segments and execute them as discrete tank turns.
+
+        Returns True while this handler owns motor output.
+        """
+        state = self.runtime.pivot_state
+
+        # --- IDLE: detect approaching pivot ---
+        if state == TankPivotState.IDLE:
+            pivot_idx = self._approaching_pivot_segment(drive_runtime)
+            if pivot_idx is None:
+                return False
+            route = self.runtime.route_plan
+            target_heading = route.points[pivot_idx + 1].theta_rad
+            self.runtime.pivot_state = TankPivotState.STOPPING
+            self.runtime.pivot_segment_index = pivot_idx
+            self.runtime.pivot_target_heading_rad = target_heading
+            self.runtime.pivot_turn_attempts = 0
+            self._force_drive_stop(
+                drive_runtime,
+                DriveControlState.TANK_TURN,
+                "pivot intercept; stopping",
+            )
+            self.drive_guard.wheel_controller.reset()
+            entry_pos_err = math.hypot(
+                route.points[pivot_idx].x_cm - self.runtime.robot_pose.x_cm,
+                route.points[pivot_idx].y_cm - self.runtime.robot_pose.y_cm,
+            )
+            entry_hdg_err = math.degrees(
+                normalize_angle(route.points[pivot_idx].theta_rad - self.runtime.robot_pose.heading_rad)
+            )
+            print(
+                f"PIVOT seg={pivot_idx} | entry: pos_err={entry_pos_err:.1f}cm"
+                f" hdg_err={entry_hdg_err:.1f}°"
+            )
+            return True
+
+        # For any non-IDLE state, we own control
+        if self.runtime.robot_pose is None:
+            drive_runtime.stop(DriveControlState.NO_POSE, "pivot waiting for pose")
+            return True
+
+        # --- STOPPING: motors halted, begin settle ---
+        if state == TankPivotState.STOPPING:
+            self.runtime.pivot_state = TankPivotState.SETTLING_BEFORE
+            self.runtime.pivot_settle_started_s = time.perf_counter()
+            drive_runtime.stop(DriveControlState.TANK_TURN, "pivot settling before turn")
+            return True
+
+        # --- SETTLING_BEFORE: wait for pose stream to stabilize ---
+        if state == TankPivotState.SETTLING_BEFORE:
+            elapsed = time.perf_counter() - self.runtime.pivot_settle_started_s
+            if elapsed < self.config.drive.pivot_settle_time_s:
+                drive_runtime.stop(
+                    DriveControlState.TANK_TURN,
+                    f"pivot settling {elapsed:.2f}/{self.config.drive.pivot_settle_time_s:.2f}s",
+                )
+                return True
+            # Settle done — compute and execute turn
+            self.runtime.pivot_state = TankPivotState.TURNING
+            # fall through to TURNING
+
+        # --- TURNING: send RobotController.turn() command ---
+        if state == TankPivotState.TURNING or self.runtime.pivot_state == TankPivotState.TURNING:
+            turn_rad = normalize_angle(
+                self.runtime.pivot_target_heading_rad - self.runtime.robot_pose.heading_rad
+            )
+            turn_deg = math.degrees(turn_rad)
+            if abs(turn_deg) < self.config.drive.pivot_min_turn_deg:
+                # Turn too small — skip directly to complete
+                self.runtime.pivot_state = TankPivotState.COMPLETE
+            else:
+                try:
+                    controller = RobotController(self.config.drive.robot_ip)
+                    controller.turn(turn_deg, int(round(self.config.drive.pivot_turn_speed_pct)))
+                    print(f"PIVOT seg={self.runtime.pivot_segment_index} | turn_cmd={turn_deg:.1f}°")
+                except Exception as exc:
+                    print(f"PIVOT turn error: {exc}")
+                    drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"pivot turn failed: {exc}")
+                    self.runtime.reset_pivot_state()
+                    return True
+                self.runtime.pivot_turn_attempts += 1
+                self.runtime.pivot_state = TankPivotState.SETTLING_AFTER
+                self.runtime.pivot_settle_started_s = time.perf_counter()
+            drive_runtime.stop(DriveControlState.TANK_TURN, f"pivot turn cmd={turn_deg:.1f}°")
+            return True
+
+        # --- SETTLING_AFTER: wait for pose to stabilize post-turn ---
+        if state == TankPivotState.SETTLING_AFTER:
+            elapsed = time.perf_counter() - self.runtime.pivot_settle_started_s
+            if elapsed < self.config.drive.pivot_settle_time_s:
+                drive_runtime.stop(
+                    DriveControlState.TANK_TURN,
+                    f"pivot post-turn settle {elapsed:.2f}/{self.config.drive.pivot_settle_time_s:.2f}s",
+                )
+                return True
+            self.runtime.pivot_state = TankPivotState.VERIFYING
+            # fall through to VERIFYING
+
+        # --- VERIFYING: check heading error; corrective turn if needed ---
+        if state == TankPivotState.VERIFYING or self.runtime.pivot_state == TankPivotState.VERIFYING:
+            heading_err_rad = normalize_angle(
+                self.runtime.pivot_target_heading_rad - self.runtime.robot_pose.heading_rad
+            )
+            heading_err_deg = abs(math.degrees(heading_err_rad))
+            if heading_err_deg <= self.config.drive.pivot_heading_tolerance_deg:
+                self.runtime.pivot_state = TankPivotState.COMPLETE
+            elif self.runtime.pivot_turn_attempts >= self.config.drive.pivot_max_correction_attempts:
+                print(
+                    f"PIVOT seg={self.runtime.pivot_segment_index}"
+                    f" | max corrections reached, hdg_err={heading_err_deg:.1f}°; accepting"
+                )
+                self.runtime.pivot_state = TankPivotState.COMPLETE
+            else:
+                # Corrective turn needed
+                self.runtime.pivot_state = TankPivotState.TURNING
+                drive_runtime.stop(
+                    DriveControlState.TANK_TURN,
+                    f"pivot corrective turn needed: {heading_err_deg:.1f}°",
+                )
+                return True
+
+        # --- COMPLETE: advance route progress and return to IDLE ---
+        if self.runtime.pivot_state == TankPivotState.COMPLETE:
+            pivot_idx = self.runtime.pivot_segment_index
+            exit_hdg_err = math.degrees(
+                normalize_angle(
+                    self.runtime.pivot_target_heading_rad - self.runtime.robot_pose.heading_rad
+                )
+            )
+            print(
+                f"PIVOT seg={pivot_idx} | exit: hdg_err={exit_hdg_err:.1f}°"
+                f" attempts={self.runtime.pivot_turn_attempts}"
+            )
+            drive_runtime.route_progress_segment_index = pivot_idx + 1
+            self.runtime.reset_pivot_state()
+            return False
+
+        return False
+
     def _force_drive_stop(self, drive_runtime: DriveRuntime, state: DriveControlState, message: str) -> None:
         """Send a deterministic zero-speed command, forcing a TCP stop packet."""
         drive_runtime.stop(state, message)
@@ -3377,9 +3585,10 @@ class TopdownDetectorApp:
                     self.drive_guard.wheel_controller.reset()
                     drive_runtime.stop(DriveControlState.STOPPED, "step paused; press n")
                 else:
+                    pivot_owns_control = self._run_tank_pivot_if_needed(drive_runtime)
                     pickup_state_before = self.runtime.pickup_state
-                    pickup_owns_control = self.update_pickup_state(drive_runtime, now)
-                    unload_owns_control = False if pickup_owns_control else self.update_unload_state(drive_runtime, now)
+                    pickup_owns_control = False if pivot_owns_control else self.update_pickup_state(drive_runtime, now)
+                    unload_owns_control = False if (pivot_owns_control or pickup_owns_control) else self.update_unload_state(drive_runtime, now)
                     pickup_completed = (
                         self.runtime.step_mode_enabled
                         and pickup_state_before == PickupExecutionState.REPLAN
@@ -3388,19 +3597,21 @@ class TopdownDetectorApp:
                     if pickup_completed:
                         self.pause_step_drive_after_target(drive_runtime)
                         pickup_owns_control = True
-                    if not pickup_owns_control and not unload_owns_control:
+                    if not pivot_owns_control and not pickup_owns_control and not unload_owns_control:
                         self.drive_guard.enforce_xte_guard_before_replan(
                             self.runtime.robot_pose,
                             self.runtime.route_plan.points,
                             drive_runtime,
                             clear_route_cache=self.runtime.clear_route,
                         )
+                        pivot_goal_poses = self._pivot_deceleration_poses()
+                        all_goal_poses = list(self.runtime.route_plan.pickup_poses) + pivot_goal_poses
                         self.drive_guard.update_drive_control(
                             self.runtime.robot_pose,
                             self.runtime.route_plan.points,
                             drive_runtime,
                             clear_route_cache=self.runtime.clear_route,
-                            local_goal_poses=self.runtime.route_plan.pickup_poses,
+                            local_goal_poses=all_goal_poses,
                             dt_s=frame_dt_s,
                             robot_geometry=robot_geometry,
                         )

@@ -7,7 +7,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
+from pathfinding.models import HybridPose, RoutePlan, RouteSegmentType, RouteTrackingError
 from pathfinding.planner import RoutePlanningFacade
 from robot.control import DriveSafetyGuard, WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
 from robot.drive_calibration import DriveCalibrationValues
@@ -19,6 +19,7 @@ from tools.topdown_object_detector import (
     PickupExecutionState,
     RoutePlanningRequest,
     RoutePlanningResult,
+    TankPivotState,
     TopdownDetectorApp,
     UnloadExecutionState,
 )
@@ -1205,6 +1206,338 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(app.runtime.route_plan.pickup_poses, [])
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
         self.assertEqual(drive_runtime.last_message, "pickup complete; routing to unload")
+
+
+    def test_approaching_pivot_segment_detects_nearby_pivot(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        drive_runtime.route_progress_segment_index = 0
+        app.runtime.robot_pose = RobotPose(9.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, math.pi * 0.5),
+                HybridPose(10.0, 10.0, math.pi * 0.5),
+            ],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.PIVOT,
+                RouteSegmentType.CREEP,
+            ],
+        )
+
+        result = app._approaching_pivot_segment(drive_runtime)
+
+        self.assertEqual(result, 1)
+
+    def test_approaching_pivot_segment_returns_none_for_transit_only(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        drive_runtime.route_progress_segment_index = 0
+        app.runtime.robot_pose = RobotPose(5.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(20.0, 0.0, 0.0),
+            ],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.TRANSIT,
+            ],
+        )
+
+        result = app._approaching_pivot_segment(drive_runtime)
+
+        self.assertIsNone(result)
+
+    def test_approaching_pivot_segment_returns_none_when_far(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        drive_runtime.route_progress_segment_index = 0
+        app.runtime.robot_pose = RobotPose(0.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(30.0, 0.0, 0.0),
+                HybridPose(30.0, 0.0, math.pi * 0.5),
+                HybridPose(30.0, 10.0, math.pi * 0.5),
+            ],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.PIVOT,
+                RouteSegmentType.CREEP,
+            ],
+        )
+
+        result = app._approaching_pivot_segment(drive_runtime)
+
+        self.assertIsNone(result)
+
+    def test_pivot_deceleration_poses_extracts_pivot_start_points(self) -> None:
+        app = TopdownDetectorApp()
+        p0 = HybridPose(0.0, 0.0, 0.0)
+        p1 = HybridPose(10.0, 0.0, 0.0)
+        p2 = HybridPose(10.0, 0.0, math.pi * 0.5)
+        p3 = HybridPose(10.0, 10.0, math.pi * 0.5)
+        app.runtime.route_plan = RoutePlan(
+            points=[p0, p1, p2, p3],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.PIVOT,
+                RouteSegmentType.CREEP,
+            ],
+        )
+
+        poses = app._pivot_deceleration_poses()
+
+        self.assertEqual(len(poses), 1)
+        self.assertAlmostEqual(poses[0].x_cm, 10.0)
+        self.assertAlmostEqual(poses[0].y_cm, 0.0)
+
+    def test_pivot_deceleration_poses_empty_for_no_segment_types(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+        )
+
+        poses = app._pivot_deceleration_poses()
+
+        self.assertEqual(poses, [])
+
+    def test_tank_pivot_advances_route_progress_after_turn(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        drive_runtime.route_progress_segment_index = 0
+        # Robot near the pivot start, heading 0, target heading is pi/2
+        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, math.pi * 0.5),
+                HybridPose(10.0, 10.0, math.pi * 0.5),
+            ],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.PIVOT,
+                RouteSegmentType.CREEP,
+            ],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            # Frame 1: detect pivot, go to STOPPING
+            owns = app._run_tank_pivot_if_needed(drive_runtime)
+            self.assertTrue(owns)
+            self.assertEqual(app.runtime.pivot_state, TankPivotState.STOPPING)
+
+            # Frame 2: STOPPING -> SETTLING_BEFORE
+            owns = app._run_tank_pivot_if_needed(drive_runtime)
+            self.assertTrue(owns)
+            self.assertEqual(app.runtime.pivot_state, TankPivotState.SETTLING_BEFORE)
+
+            # Fast-forward past settle time
+            app.runtime.pivot_settle_started_s = time.perf_counter() - app.config.drive.pivot_settle_time_s - 0.01
+
+            # Frame 3: SETTLING_BEFORE -> TURNING -> SETTLING_AFTER
+            owns = app._run_tank_pivot_if_needed(drive_runtime)
+            self.assertTrue(owns)
+            self.assertIn(app.runtime.pivot_state, (TankPivotState.SETTLING_AFTER, TankPivotState.COMPLETE))
+
+            # Simulate that the robot is now pointing in the correct direction
+            app.runtime.robot_pose = RobotPose(10.0, 0.0, math.pi * 0.5, 10.0, 0.0)
+            app.runtime.pivot_settle_started_s = time.perf_counter() - app.config.drive.pivot_settle_time_s - 0.01
+
+            # Run until complete
+            for _ in range(5):
+                owns = app._run_tank_pivot_if_needed(drive_runtime)
+                if app.runtime.pivot_state == TankPivotState.IDLE:
+                    break
+
+        self.assertEqual(app.runtime.pivot_state, TankPivotState.IDLE)
+        self.assertEqual(drive_runtime.route_progress_segment_index, 2)
+        self.assertTrue(len(events) >= 1)
+        self.assertEqual(events[0][0], "turn")
+
+    def test_transit_only_route_unaffected_by_pivot_interceptor(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        drive_runtime.route_progress_segment_index = 0
+        app.runtime.robot_pose = RobotPose(5.0, 0.0, 0.0, 5.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(20.0, 0.0, 0.0),
+            ],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.TRANSIT,
+            ],
+        )
+
+        owns = app._run_tank_pivot_if_needed(drive_runtime)
+
+        self.assertFalse(owns)
+        self.assertEqual(app.runtime.pivot_state, TankPivotState.IDLE)
+        self.assertEqual(drive_runtime.route_progress_segment_index, 0)
+
+    def test_pivot_heading_tolerance_skips_trivial_turn(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        drive_runtime.route_progress_segment_index = 0
+        # Heading already matches target within tolerance
+        target_heading = math.radians(0.5)  # less than pivot_min_turn_deg
+        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, target_heading),
+                HybridPose(10.0, 10.0, target_heading),
+            ],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.PIVOT,
+                RouteSegmentType.CREEP,
+            ],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            # Frame 1: detect pivot -> STOPPING
+            app._run_tank_pivot_if_needed(drive_runtime)
+            # Frame 2: STOPPING -> SETTLING_BEFORE
+            app._run_tank_pivot_if_needed(drive_runtime)
+            # Fast-forward settle
+            app.runtime.pivot_settle_started_s = time.perf_counter() - app.config.drive.pivot_settle_time_s - 0.01
+            # Frame 3: settle done -> TURNING -> turn is trivial -> COMPLETE
+            app._run_tank_pivot_if_needed(drive_runtime)
+            # Frame 4: COMPLETE -> IDLE
+            app._run_tank_pivot_if_needed(drive_runtime)
+
+        self.assertEqual(events, [])
+        self.assertEqual(app.runtime.pivot_state, TankPivotState.IDLE)
+        self.assertEqual(drive_runtime.route_progress_segment_index, 2)
+
+    def test_pivot_corrective_turn_fires_when_heading_error_exceeds_tolerance(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        drive_runtime.route_progress_segment_index = 0
+        target_heading = math.pi * 0.5
+        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, target_heading),
+                HybridPose(10.0, 10.0, target_heading),
+            ],
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.PIVOT,
+                RouteSegmentType.CREEP,
+            ],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            # Run through IDLE -> STOPPING -> SETTLING_BEFORE
+            app._run_tank_pivot_if_needed(drive_runtime)
+            app._run_tank_pivot_if_needed(drive_runtime)
+            app.runtime.pivot_settle_started_s = time.perf_counter() - app.config.drive.pivot_settle_time_s - 0.01
+
+            # SETTLING_BEFORE -> TURNING (first turn fires)
+            app._run_tank_pivot_if_needed(drive_runtime)
+            self.assertEqual(len(events), 1)
+
+            # Simulate robot didn't turn enough (still 20 degrees off)
+            app.runtime.robot_pose = RobotPose(10.0, 0.0, math.radians(70.0), 10.0, 0.0)
+            app.runtime.pivot_settle_started_s = time.perf_counter() - app.config.drive.pivot_settle_time_s - 0.01
+
+            # SETTLING_AFTER -> VERIFYING -> needs correction -> TURNING again
+            app._run_tank_pivot_if_needed(drive_runtime)
+            app._run_tank_pivot_if_needed(drive_runtime)
+            self.assertEqual(len(events), 2)
+
+    def test_pivot_interceptor_preempts_pickup(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        drive_runtime.route_progress_segment_index = 0
+        app.runtime.initial_total_balls = 1
+        app.runtime.robot_pose = RobotPose(10.0, 0.0, 0.0, 10.0, 0.0)
+        pickup_pose = HybridPose(10.0, 10.0, math.pi * 0.5)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(0.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, 0.0),
+                HybridPose(10.0, 0.0, math.pi * 0.5),
+                pickup_pose,
+            ],
+            active_target=None,
+            pickup_poses=[pickup_pose],
+            segment_types=[
+                RouteSegmentType.TRANSIT,
+                RouteSegmentType.PIVOT,
+                RouteSegmentType.CREEP,
+            ],
+        )
+
+        # The pivot interceptor should activate
+        owns = app._run_tank_pivot_if_needed(drive_runtime)
+
+        self.assertTrue(owns)
+        self.assertEqual(app.runtime.pivot_state, TankPivotState.STOPPING)
+        self.assertEqual(drive_runtime.state, DriveControlState.TANK_TURN)
 
 
 if __name__ == "__main__":

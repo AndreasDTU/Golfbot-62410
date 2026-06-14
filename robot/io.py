@@ -9,6 +9,7 @@ from typing import Callable
 import numpy as np
 
 from robot.controller import RobotController
+from robot.telemetry import log_event
 from vision.config import DriveConfig
 
 
@@ -59,6 +60,7 @@ class TcpWheelDispatcher:
         """Validate and dispatch one left/right wheel command over TCP."""
         if not (math.isfinite(left_pct) and math.isfinite(right_pct)):
             self.last_error = "non-finite wheel command rejected"
+            log_event("DISPATCH", "non-finite rejected", left=left_pct, right=right_pct)
             return False
 
         left = float(np.clip(left_pct, -self.max_speed_pct, self.max_speed_pct))
@@ -78,10 +80,12 @@ class TcpWheelDispatcher:
             response = self._controller()._send(command)
         except RuntimeError as exc:
             self.last_error = str(exc)
+            log_event("DISPATCH", "tcp exception", error=str(exc))
             self.close()
             return False
         if response.lower().startswith("error"):
             self.last_error = response
+            log_event("DISPATCH", "error response", response=response)
             return False
 
         self.last_send_time = now

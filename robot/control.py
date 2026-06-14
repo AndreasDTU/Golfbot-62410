@@ -21,12 +21,36 @@ class WheelCommandController:
         self.previous_cross_track_error: float | None = None
         self.previous_heading_error: float | None = None
         self.previous_profile_speed_pct: float = 0.0
+        self.last_forward_scale: float = 0.0
+        self.last_desired_base_speed: float = 0.0
+        self.last_base_speed: float = 0.0
+        self.last_edge_gain: float = 1.0
+        self.last_heading_derivative: float = 0.0
+        self.last_cross_track_derivative: float = 0.0
+        self.last_turn_speed: float = 0.0
+        self.last_heading_p_term: float = 0.0
+        self.last_heading_d_term: float = 0.0
+        self.last_xte_p_term: float = 0.0
+        self.last_xte_d_term: float = 0.0
+        self.last_distance_to_goal_cm: float = float("inf")
 
     def reset(self) -> None:
         """Clear derivative history after stops, replans, or route loss."""
         self.previous_cross_track_error = None
         self.previous_heading_error = None
         self.previous_profile_speed_pct = 0.0
+        self.last_forward_scale = 0.0
+        self.last_desired_base_speed = 0.0
+        self.last_base_speed = 0.0
+        self.last_edge_gain = 1.0
+        self.last_heading_derivative = 0.0
+        self.last_cross_track_derivative = 0.0
+        self.last_turn_speed = 0.0
+        self.last_heading_p_term = 0.0
+        self.last_heading_d_term = 0.0
+        self.last_xte_p_term = 0.0
+        self.last_xte_d_term = 0.0
+        self.last_distance_to_goal_cm = float("inf")
 
     @staticmethod
     def edge_control_scale(edge_clearance_cm: float | None, config: DriveConfig | None = None) -> float:
@@ -95,6 +119,7 @@ class WheelCommandController:
         edge_clearance_cm: float | None = None,
     ) -> WheelCommand:
         """Compute a profiled PD wheel command for route tracking."""
+        self.last_distance_to_goal_cm = distance_to_goal_cm
         heading_error = float(
             np.clip(
                 error.heading_error_rad,
@@ -122,12 +147,24 @@ class WheelCommandController:
         self.previous_cross_track_error = error.signed_xte_cm
 
         edge_gain = self.edge_gain_multiplier(edge_clearance_cm, self.config)
-        turn_speed = (
-            self.config.heading_kp * edge_gain * heading_error
-            + self.config.heading_kd * heading_derivative
-            - self.config.xte_kp * edge_gain * error.signed_xte_cm
-            - self.config.xte_kd * cross_track_derivative
-        )
+        heading_p = self.config.heading_kp * edge_gain * heading_error
+        heading_d = self.config.heading_kd * heading_derivative
+        xte_p = self.config.xte_kp * edge_gain * error.signed_xte_cm
+        xte_d = self.config.xte_kd * cross_track_derivative
+        turn_speed = heading_p + heading_d - xte_p - xte_d
+
+        self.last_forward_scale = forward_scale
+        self.last_desired_base_speed = desired_base_speed
+        self.last_base_speed = base_speed
+        self.last_edge_gain = edge_gain
+        self.last_heading_derivative = heading_derivative
+        self.last_cross_track_derivative = cross_track_derivative
+        self.last_heading_p_term = heading_p
+        self.last_heading_d_term = heading_d
+        self.last_xte_p_term = xte_p
+        self.last_xte_d_term = xte_d
+        self.last_turn_speed = turn_speed
+
         left = float(np.clip(base_speed - turn_speed, -self.config.max_speed_pct, self.config.max_speed_pct))
         right = float(np.clip(base_speed + turn_speed, -self.config.max_speed_pct, self.config.max_speed_pct))
         return WheelCommand(left, right)

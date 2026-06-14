@@ -395,6 +395,9 @@ class DriveConfig:
     key_up_arrow: set[int] = dataclass_field(default_factory=lambda: {2490368, 65362, 63232, 82})
     key_right_arrow: set[int] = dataclass_field(default_factory=lambda: {2555904, 65363, 63235, 83})
     key_down_arrow: set[int] = dataclass_field(default_factory=lambda: {2621440, 65364, 63233, 84})
+    telemetry_ringbuffer_size: int = 300
+    telemetry_auto_dump_enabled: bool = True
+    telemetry_dump_dir: str = "telemetry"
 
 
 @dataclass(frozen=True)

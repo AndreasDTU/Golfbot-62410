@@ -49,6 +49,7 @@ from robot.drive_calibration import (
     unwrapped_heading_delta,
 )
 from robot.io import TcpWheelDispatcher
+from robot.telemetry import DriveTelemetryRecorder, log_event
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
 from robot.models import (
     DriveControlState,
@@ -447,6 +448,11 @@ class TopdownDetectorApp:
         self.drive_calibration_thread: threading.Thread | None = None
         self.drive_calibration_thread_error: str = ""
         self.controller: RobotController | None = None
+        self.telemetry = DriveTelemetryRecorder(
+            maxlen=self.config.drive.telemetry_ringbuffer_size,
+            dump_dir=self.config.drive.telemetry_dump_dir,
+            auto_dump_enabled=self.config.drive.telemetry_auto_dump_enabled,
+        )
 
     def _controller(self):
         if self.controller is None:
@@ -1576,6 +1582,7 @@ class TopdownDetectorApp:
                     target_x_cm - float(self.runtime.robot_pose.x_cm),
                 )
                 heading_error_deg = math.degrees(normalize_angle(target_heading_rad - float(self.runtime.robot_pose.heading_rad)))
+                log_event("NEAR_ZONE", "entry", distance_cm=remaining_cm, heading_error_deg=heading_error_deg)
                 tcp_turn_deg = -heading_error_deg
                 if abs(tcp_turn_deg) > 0.5:
                     drive_runtime.last_message = f"TCP turn {tcp_turn_deg:.1f}deg"
@@ -1646,6 +1653,11 @@ class TopdownDetectorApp:
                         f"turn {turn_deg:.2f}deg @ {turn_speed_pct}%"
                     )
                     self._controller().turn(round(turn_deg, 2), turn_speed_pct)
+                    log_event(
+                        "NEAR_ZONE", "servo_turn",
+                        iteration=self.runtime.near_zone_alignment_iterations,
+                        lateral_cm=lateral_cm, turn_deg=turn_deg, speed_pct=turn_speed_pct,
+                    )
                     return True
 
                 self.runtime.near_zone_alignment_settle_started_s = time.perf_counter()
@@ -1905,6 +1917,8 @@ class TopdownDetectorApp:
             return True
 
         if state == PickupExecutionState.REPLAN:
+            if self.telemetry._auto_dump_enabled:
+                self.telemetry.dump_csv(reason="pickup_complete")
             self.drive_guard.wheel_controller.reset()
             if self.optimistic_collection_complete() and self.runtime.route_plan.unload_pose is not None:
                 self.consume_completed_pickup_checkpoint()
@@ -2158,6 +2172,8 @@ class TopdownDetectorApp:
 
         # --- COMPLETE: advance route progress and return to IDLE ---
         if self.runtime.pivot_state == TankPivotState.COMPLETE:
+            if self.telemetry._auto_dump_enabled:
+                self.telemetry.dump_csv(reason="pivot_complete")
             pivot_idx = self.runtime.pivot_segment_index
             exit_hdg_err = math.degrees(
                 normalize_angle(
@@ -2457,6 +2473,8 @@ class TopdownDetectorApp:
             self.runtime.unload_state = UnloadExecutionState.IDLE
             return True
         if state == UnloadExecutionState.COMPLETE:
+            if self.telemetry._auto_dump_enabled:
+                self.telemetry.dump_csv(reason="unload_complete")
             self.drive_guard.wheel_controller.reset()
             message = state.value if state == UnloadExecutionState.COMPLETE else f"{state.value}: {self.unload_last_error}"
             drive_runtime.stop(DriveControlState.STOPPED, message)
@@ -2542,6 +2560,17 @@ class TopdownDetectorApp:
             self.runtime.route_cache_target_id = target.track_id
             self.runtime.route_cache_target_label = target.label
             self.runtime.route_cache_target_cm = (target.x_cm, target.y_cm)
+        points = route_plan.points
+        seg_types = route_plan.segment_types or []
+        type_counts = Counter(st.value for st in seg_types)
+        log_event(
+            "ROUTE", "installed",
+            segments=max(0, len(points) - 1),
+            transit=type_counts.get("TRANSIT", 0),
+            pivot=type_counts.get("PIVOT", 0),
+            creep=type_counts.get("CREEP", 0),
+            pickups=len(route_plan.pickup_poses),
+        )
 
     def mark_route_failed(
         self,
@@ -3303,6 +3332,10 @@ class TopdownDetectorApp:
             self.release_step_drive_pause(drive_runtime)
         if ascii_key == ord("w"):
             self.save_heading_tuning_to_robot_calibration(float(self.read_params()["heading_tuning_rad"]))
+        if ascii_key == ord("t"):
+            path = self.telemetry.dump_csv(reason="manual")
+            if path and drive_runtime:
+                drive_runtime.last_message = f"telemetry: {path}"
         self.handle_manual_robot_key(key, drive_runtime)
         return False
 
@@ -3604,6 +3637,17 @@ class TopdownDetectorApp:
                             drive_runtime,
                             clear_route_cache=self.runtime.clear_route,
                         )
+                        if drive_runtime.state == DriveControlState.REPLANNING:
+                            if self.telemetry._auto_dump_enabled:
+                                self.telemetry.dump_csv(reason="xte_replan")
+                            last_err = drive_runtime.last_error
+                            log_event(
+                                "XTE_GUARD", "replan",
+                                xte_cm=getattr(last_err, "xte_cm", None),
+                                segment=getattr(last_err, "segment_index", None),
+                                x=getattr(self.runtime.robot_pose, "x_cm", None) if self.runtime.robot_pose else None,
+                                y=getattr(self.runtime.robot_pose, "y_cm", None) if self.runtime.robot_pose else None,
+                            )
                         pivot_goal_poses = self._pivot_deceleration_poses()
                         all_goal_poses = list(self.runtime.route_plan.pickup_poses) + pivot_goal_poses
                         self.drive_guard.update_drive_control(
@@ -3615,6 +3659,14 @@ class TopdownDetectorApp:
                             dt_s=frame_dt_s,
                             robot_geometry=robot_geometry,
                         )
+                self.telemetry.record_frame(
+                    robot_pose=self.runtime.robot_pose,
+                    drive_runtime=drive_runtime,
+                    wheel_controller=self.drive_guard.wheel_controller,
+                    frame_dt_s=frame_dt_s,
+                    pickup_state=self.runtime.pickup_state.value,
+                    pivot_state=self.runtime.pivot_state.value,
+                )
                 fps = 1.0 / frame_dt_s
                 last_tick = now
                 combined, masks, schematic = self.render(result, params, fps=fps, drive_runtime=drive_runtime)

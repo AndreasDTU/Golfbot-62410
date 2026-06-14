@@ -1540,5 +1540,73 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(drive_runtime.state, DriveControlState.TANK_TURN)
 
 
+    def test_compute_stores_pd_intermediates_on_self(self) -> None:
+        config = DriveConfig()
+        controller = WheelCommandController(config)
+        error = RouteTrackingError(
+            xte_cm=2.0,
+            signed_xte_cm=2.0,
+            heading_error_rad=0.1,
+            closest_point_cm=(0.0, 0.0),
+            segment_heading_rad=0.0,
+            segment_index=0,
+        )
+        controller.compute(error, distance_to_goal_cm=50.0, dt_s=0.033)
+
+        self.assertGreater(controller.last_forward_scale, 0.0)
+        self.assertGreater(controller.last_desired_base_speed, 0.0)
+        self.assertGreater(controller.last_base_speed, 0.0)
+        self.assertEqual(controller.last_distance_to_goal_cm, 50.0)
+        self.assertNotEqual(controller.last_turn_speed, 0.0)
+
+    def test_pd_terms_sum_to_turn_speed(self) -> None:
+        config = DriveConfig()
+        controller = WheelCommandController(config)
+        error = RouteTrackingError(
+            xte_cm=3.0,
+            signed_xte_cm=-3.0,
+            heading_error_rad=0.2,
+            closest_point_cm=(0.0, 0.0),
+            segment_heading_rad=0.0,
+            segment_index=0,
+        )
+        controller.compute(error, distance_to_goal_cm=40.0, dt_s=0.033)
+
+        expected = (
+            controller.last_heading_p_term
+            + controller.last_heading_d_term
+            - controller.last_xte_p_term
+            - controller.last_xte_d_term
+        )
+        self.assertAlmostEqual(controller.last_turn_speed, expected, places=10)
+
+    def test_reset_clears_pd_intermediates(self) -> None:
+        config = DriveConfig()
+        controller = WheelCommandController(config)
+        error = RouteTrackingError(
+            xte_cm=2.0,
+            signed_xte_cm=2.0,
+            heading_error_rad=0.1,
+            closest_point_cm=(0.0, 0.0),
+            segment_heading_rad=0.0,
+            segment_index=0,
+        )
+        controller.compute(error, distance_to_goal_cm=50.0, dt_s=0.033)
+        controller.reset()
+
+        self.assertEqual(controller.last_forward_scale, 0.0)
+        self.assertEqual(controller.last_desired_base_speed, 0.0)
+        self.assertEqual(controller.last_base_speed, 0.0)
+        self.assertEqual(controller.last_edge_gain, 1.0)
+        self.assertEqual(controller.last_heading_derivative, 0.0)
+        self.assertEqual(controller.last_cross_track_derivative, 0.0)
+        self.assertEqual(controller.last_turn_speed, 0.0)
+        self.assertEqual(controller.last_heading_p_term, 0.0)
+        self.assertEqual(controller.last_heading_d_term, 0.0)
+        self.assertEqual(controller.last_xte_p_term, 0.0)
+        self.assertEqual(controller.last_xte_d_term, 0.0)
+        self.assertEqual(controller.last_distance_to_goal_cm, float("inf"))
+
+
 if __name__ == "__main__":
     unittest.main()

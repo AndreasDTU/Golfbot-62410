@@ -1629,11 +1629,15 @@ class DriveControlTests(unittest.TestCase):
         route = app._build_manual_route()
 
         self.assertIsNotNone(route)
-        self.assertEqual(len(route.points), 3)
-        self.assertAlmostEqual(route.points[0].theta_rad, 0.0)
-        self.assertAlmostEqual(route.points[1].theta_rad, math.pi / 2)
-        self.assertAlmostEqual(route.points[2].theta_rad, math.pi / 2)
-        self.assertTrue(all(st == RouteSegmentType.TRANSIT for st in route.segment_types))
+        # 3 waypoints → TRANSIT, PIVOT, TRANSIT → 4 points
+        self.assertEqual(len(route.points), 4)
+        self.assertAlmostEqual(route.points[0].theta_rad, 0.0)       # depart (0,0) heading east
+        self.assertAlmostEqual(route.points[1].theta_rad, 0.0)       # arrive (10,0) heading east
+        self.assertAlmostEqual(route.points[2].theta_rad, math.pi / 2)  # pivot at (10,0) to face north
+        self.assertAlmostEqual(route.points[3].theta_rad, math.pi / 2)  # arrive (10,10) heading north
+        self.assertEqual(route.segment_types, [
+            RouteSegmentType.TRANSIT, RouteSegmentType.PIVOT, RouteSegmentType.TRANSIT,
+        ])
 
     def test_manual_path_mode_suppresses_auto_planner(self) -> None:
         app = TopdownDetectorApp()

@@ -3062,19 +3062,27 @@ class TopdownDetectorApp:
             waypoints.insert(0, (robot.x_cm, robot.y_cm))
         if len(waypoints) < 2:
             return None
+        leg_headings = [
+            math.atan2(waypoints[i + 1][1] - waypoints[i][1], waypoints[i + 1][0] - waypoints[i][0])
+            for i in range(len(waypoints) - 1)
+        ]
         poses: list[HybridPose] = []
-        for i, (x, y) in enumerate(waypoints):
-            if i < len(waypoints) - 1:
-                nx, ny = waypoints[i + 1]
-                heading = math.atan2(ny - y, nx - x)
-            else:
-                heading = poses[-1].theta_rad
-            poses.append(HybridPose(x, y, heading))
+        segment_types: list[RouteSegmentType] = []
+        poses.append(HybridPose(waypoints[0][0], waypoints[0][1], leg_headings[0]))
+        for i in range(len(waypoints) - 1):
+            x_end, y_end = waypoints[i + 1]
+            arrival_heading = leg_headings[i]
+            poses.append(HybridPose(x_end, y_end, arrival_heading))
+            segment_types.append(RouteSegmentType.TRANSIT)
+            if i + 1 < len(waypoints) - 1:
+                departure_heading = leg_headings[i + 1]
+                poses.append(HybridPose(x_end, y_end, departure_heading))
+                segment_types.append(RouteSegmentType.PIVOT)
         return RoutePlan(
             points=poses,
             active_target=None,
             pickup_poses=[],
-            segment_types=[RouteSegmentType.TRANSIT] * len(poses),
+            segment_types=segment_types,
         )
 
     def _install_manual_route_if_ready(self) -> None:

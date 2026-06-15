@@ -2229,7 +2229,9 @@ class TopdownDetectorApp:
             self.drive_guard.wheel_controller.reset()
             message = state.value if state == UnloadExecutionState.COMPLETE else f"{state.value}: {self.unload_last_error}"
             drive_runtime.stop(DriveControlState.STOPPED, message)
-            drive_runtime.state = DriveControlState.TRACKING
+            self.runtime.reset_unload_alignment_state()
+            self.runtime.reset_pickup_state()
+            self.runtime.clear_route()
             return False
         if self.unload_thread is not None and self.unload_thread.is_alive():
             drive_runtime.stop(DriveControlState.STOPPED, self.runtime.unload_state.value)

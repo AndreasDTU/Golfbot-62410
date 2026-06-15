@@ -11,7 +11,7 @@ Motor layout:
 Commands:
   move <units> [speed]    - Drive forward N units
   back <units> [speed]    - Drive backward N units
-  turn <degrees> [speed]  - Tank turn (positive = right, negative = left)
+  turn <degrees> [speed]  - Tank turn (positive = CCW/left, negative = CW/right)
   pipe up <units> [speed] - Raise the pipe N units
   pipe down <units> [speed] - Lower the pipe N units
   pipe stop               - Stop pipe motor immediately
@@ -125,6 +125,26 @@ def set_drive_calibration(axle_track_mm, mm_per_unit):
 
 
 # ---------------------------------------------------------------------------
+# Motor mounting helpers — single point of negation for reversed motors
+# ---------------------------------------------------------------------------
+
+def _apply_wheel_speeds(left_pct, right_pct):
+    """Continuous drive — single point of motor-mounting negation."""
+    if abs(left_pct) < 1e-6 and abs(right_pct) < 1e-6:
+        tank.off()
+    else:
+        tank.on(left_speed=SpeedPercent(-left_pct), right_speed=SpeedPercent(-right_pct))
+
+
+def _apply_wheel_speeds_for_degrees(left_pct, right_pct, motor_degrees):
+    """Blocking drive — single point of motor-mounting negation."""
+    tank.on_for_degrees(
+        left_speed=SpeedPercent(-left_pct), right_speed=SpeedPercent(-right_pct),
+        degrees=motor_degrees, brake=True, block=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
@@ -135,8 +155,7 @@ def cmd_move(parts, forward=True):
     speed = float(parts[2]) if len(parts) > 2 else 50
     motor_deg = units_to_degrees(units)
     spd = speed if forward else -speed
-    tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(-spd),
-                        degrees=motor_deg, brake=True, block=True)
+    _apply_wheel_speeds_for_degrees(spd, spd, motor_deg)
     direction = "forward" if forward else "backward"
     return "ok: moved {} {} units".format(direction, units)
 
@@ -147,15 +166,12 @@ def cmd_turn(parts):
     angle = float(parts[1])
     speed = float(parts[2]) if len(parts) > 2 else 30
     motor_deg = turn_angle_to_motor_degrees(angle)
-    spd = speed
+    # Positive angle = CCW (left), negative = CW (right).
     if angle >= 0:
-        # Turn left (CCW): right motor forward, left motor backward
-        tank.on_for_degrees(left_speed=SpeedPercent(spd), right_speed=SpeedPercent(-spd),
-                            degrees=motor_deg, brake=True, block=True)
+        left_spd, right_spd = -speed, speed   # left backward, right forward = CCW
     else:
-        # Turn right (CW): left motor forward, right motor backward
-        tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(spd),
-                            degrees=motor_deg, brake=True, block=True)
+        left_spd, right_spd = speed, -speed   # left forward, right backward = CW
+    _apply_wheel_speeds_for_degrees(left_spd, right_spd, motor_deg)
     return "ok: turned {} degrees".format(angle)
 
 
@@ -265,10 +281,7 @@ def cmd_lr(parts):
     right = float(parts[2])
     if not (math.isfinite(left) and math.isfinite(right)):
         return "error: non-finite wheel speed"
-    if abs(left) < 1e-6 and abs(right) < 1e-6:
-        tank.off()
-        return "ok: wheel speeds 0.0 0.0"
-    tank.on(left_speed=SpeedPercent(-left), right_speed=SpeedPercent(-right))
+    _apply_wheel_speeds(left, right)
     return "ok: wheel speeds {} {}".format(left, right)
 
 

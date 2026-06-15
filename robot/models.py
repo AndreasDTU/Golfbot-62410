@@ -77,7 +77,7 @@ class DriveRuntime:
     """Live master-controller state shared by control, dispatch, and overlays."""
 
     enabled: bool
-    dispatcher: object | None = None
+    commander: object | None = None
     state: DriveControlState = DriveControlState.DISABLED
     last_error: object | None = None
     last_command: WheelCommand = field(default_factory=lambda: WheelCommand(0.0, 0.0))
@@ -86,6 +86,10 @@ class DriveRuntime:
     active_route_identity: int | None = None
     route_progress_segment_index: int = 0
 
+    @property
+    def dispatcher(self) -> object | None:
+        return self.commander.dispatcher if self.commander is not None else None
+
     def stop(self, state: DriveControlState, message: str = "") -> None:
         """Send a deterministic zero-speed command and update overlay state."""
         previous_command = self.last_command
@@ -93,13 +97,13 @@ class DriveRuntime:
         self.state = state
         self.last_message = message
         self.last_command = WheelCommand(0.0, 0.0)
-        if self.dispatcher is not None:
+        if self.commander is not None:
             force = (
                 previous_state != state
                 or abs(previous_command.left_pct) > 1e-6
                 or abs(previous_command.right_pct) > 1e-6
             )
-            self.dispatcher.send_wheel_speeds(0.0, 0.0, force=force)
+            self.commander.stop(force=force)
 
 
 @dataclass(frozen=True)

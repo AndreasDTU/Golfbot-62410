@@ -48,7 +48,7 @@ from robot.drive_calibration import (
     suggest_mm_per_unit,
     unwrapped_heading_delta,
 )
-from robot.io import TcpWheelDispatcher
+from robot.io import MotorCommander, TcpWheelDispatcher
 from robot.telemetry import DriveTelemetryRecorder, log_event
 from robot.localization import RobotCalibrationCollector, RobotPoseEstimator, image_yaw_rotation_matrix, normalize_angle
 from robot.models import (
@@ -687,12 +687,13 @@ class TopdownDetectorApp:
         return pipeline
 
     def _make_drive_runtime(self, drive_enabled: bool) -> tuple[DriveRuntime, TcpWheelDispatcher | None]:
-        dispatcher = (
-            TcpWheelDispatcher(controller=self._controller(), drive_config=self.config.drive)
-            if drive_enabled
-            else None
-        )
-        return DriveRuntime(enabled=True, dispatcher=dispatcher), dispatcher
+        if drive_enabled:
+            dispatcher = TcpWheelDispatcher(controller=self._controller(), drive_config=self.config.drive)
+            commander = MotorCommander(dispatcher)
+        else:
+            dispatcher = None
+            commander = None
+        return DriveRuntime(enabled=True, commander=commander), dispatcher
 
     def _pickup_distance_to_goal_cm(self) -> float:
         if self.runtime.robot_pose is None or len(self.runtime.route_plan.points) < 2:
@@ -975,14 +976,14 @@ class TopdownDetectorApp:
         def run_command() -> None:
             try:
                 if command == "turn":
-                    self._controller().turn(
+                    drive_runtime.commander.tank_turn(
                         round(float(self.config.drive.drive_calibration_turn_degrees), 1),
-                        int(round(self.config.drive.drive_calibration_turn_speed_pct)),
+                        self.config.drive.drive_calibration_turn_speed_pct,
                     )
                 elif command == "move":
-                    self._controller().move(
+                    drive_runtime.commander.drive_straight(
                         round(float(self.config.drive.drive_calibration_move_cm), 1),
-                        int(round(self.config.drive.drive_calibration_move_speed_pct)),
+                        self.config.drive.drive_calibration_move_speed_pct,
                     )
                 else:
                     raise ValueError(f"unknown drive calibration command: {command}")
@@ -1169,7 +1170,7 @@ class TopdownDetectorApp:
             if drive_runtime is not None:
                 drive_runtime.last_message = "drive calibration already active"
             return
-        if drive_runtime is None or drive_runtime.dispatcher is None:
+        if drive_runtime is None or drive_runtime.commander is None:
             if drive_runtime is not None:
                 drive_runtime.last_message = "drive calibration requires --drive"
             return
@@ -1588,9 +1589,9 @@ class TopdownDetectorApp:
                 tcp_turn_deg = -heading_error_deg
                 if abs(tcp_turn_deg) > 0.5:
                     drive_runtime.last_message = f"TCP turn {tcp_turn_deg:.1f}deg"
-                    self._controller().turn(
+                    drive_runtime.commander.tank_turn(
                         round(tcp_turn_deg, 1),
-                        int(round(self.config.drive.near_zone_turn_speed_pct)),
+                        self.config.drive.near_zone_turn_speed_pct,
                     )
                 self.runtime.near_zone_turn_fired = True
                 self.runtime.near_zone_turn_settle_started_s = time.perf_counter()
@@ -1654,7 +1655,7 @@ class TopdownDetectorApp:
                         f"Visual servo {abs(lateral_cm):.2f}cm lateral; "
                         f"turn {turn_deg:.2f}deg @ {turn_speed_pct}%"
                     )
-                    self._controller().turn(round(turn_deg, 2), turn_speed_pct)
+                    drive_runtime.commander.tank_turn(round(turn_deg, 2), turn_speed_pct)
                     log_event(
                         "NEAR_ZONE", "servo_turn",
                         iteration=self.runtime.near_zone_alignment_iterations,
@@ -1682,9 +1683,9 @@ class TopdownDetectorApp:
                 return True
 
             drive_runtime.last_message = f"TCP move {remaining_cm:.1f}cm after visual servo: {reason}"
-            self._controller().move(
+            drive_runtime.commander.drive_straight(
                 round(remaining_cm, 1),
-                int(round(self.config.drive.near_zone_move_speed_pct)),
+                self.config.drive.near_zone_move_speed_pct,
             )
             self.runtime.near_zone_move_fired = True
             self.mark_optimistic_pickup_complete()
@@ -1830,9 +1831,9 @@ class TopdownDetectorApp:
             self.drive_guard.wheel_controller.reset()
             self._force_drive_stop(drive_runtime, DriveControlState.POST_PICKUP_ESCAPE, "post-pickup reverse escape")
             try:
-                self._controller().back(
-                    round(float(self.config.drive.post_pickup_escape_back_cm), 1),
-                    int(round(self.config.drive.post_pickup_escape_speed_pct)),
+                drive_runtime.commander.drive_straight(
+                    -round(float(self.config.drive.post_pickup_escape_back_cm), 1),
+                    self.config.drive.post_pickup_escape_speed_pct,
                 )
             except Exception as exc:
                 drive_runtime.stop(DriveControlState.DISPATCH_ERROR, f"post-pickup reverse escape failed: {exc}")
@@ -1871,12 +1872,11 @@ class TopdownDetectorApp:
             self.runtime.reset_pickup_state()
             return True
         speed_pct = float(self.config.drive.post_pickup_align_speed_pct)
-        left_pct = -math.copysign(speed_pct, heading_error_rad)
-        right_pct = math.copysign(speed_pct, heading_error_rad)
+        turn = math.copysign(speed_pct, heading_error_rad)
         drive_runtime.state = DriveControlState.POST_PICKUP_ALIGN
         drive_runtime.last_message = f"Post-pickup pivot {math.degrees(heading_error_rad):.1f}deg"
-        drive_runtime.last_command = WheelCommand(left_pct, right_pct)
-        drive_runtime.dispatcher.send_wheel_speeds(left_pct, right_pct, force=True)
+        drive_runtime.last_command = WheelCommand(-turn, turn)
+        drive_runtime.commander.steer(0.0, turn, force=True)
         return True
 
     def _start_pickup_assist_command_thread(self) -> None:
@@ -1896,7 +1896,7 @@ class TopdownDetectorApp:
     def update_pickup_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
         """Run the near-zone TCP pickup handoff and return True when it owns motor output."""
         state = self.runtime.pickup_state
-        if state == PickupExecutionState.NAVIGATION and drive_runtime.dispatcher is None:
+        if state == PickupExecutionState.NAVIGATION and drive_runtime.commander is None:
             return False
         if state == PickupExecutionState.NAVIGATION:
             return self._run_near_zone_precise_move(drive_runtime)
@@ -2123,8 +2123,7 @@ class TopdownDetectorApp:
                 self.runtime.pivot_state = TankPivotState.COMPLETE
             else:
                 try:
-                    controller = RobotController(self.config.drive.robot_ip)
-                    controller.turn(turn_deg, int(round(self.config.drive.pivot_turn_speed_pct)))
+                    drive_runtime.commander.tank_turn(turn_deg, self.config.drive.pivot_turn_speed_pct)
                     print(f"PIVOT seg={self.runtime.pivot_segment_index} | turn_cmd={turn_deg:.1f}°")
                 except Exception as exc:
                     print(f"PIVOT turn error: {exc}")
@@ -2195,8 +2194,8 @@ class TopdownDetectorApp:
     def _force_drive_stop(self, drive_runtime: DriveRuntime, state: DriveControlState, message: str) -> None:
         """Send a deterministic zero-speed command, forcing a TCP stop packet."""
         drive_runtime.stop(state, message)
-        if drive_runtime.dispatcher is not None:
-            drive_runtime.dispatcher.send_wheel_speeds(0.0, 0.0, force=True)
+        if drive_runtime.commander is not None:
+            drive_runtime.commander.stop()
 
     def _unload_goal_center_cm(self) -> tuple[float, float]:
         if self.runtime.route_plan.unload_goal_cm is not None:
@@ -2310,14 +2309,13 @@ class TopdownDetectorApp:
 
         heading_error_rad = float(metrics["heading_error_rad"])
         speed_pct = float(self.config.drive.unload_pivot_speed_pct)
-        left_pct = -math.copysign(speed_pct, heading_error_rad)
-        right_pct = math.copysign(speed_pct, heading_error_rad)
+        turn = math.copysign(speed_pct, heading_error_rad)
         drive_runtime.state = DriveControlState.PRE_UNLOAD_PIVOT
         drive_runtime.last_message = (
             f"Pre-unload pivot {math.degrees(heading_error_rad):.1f}deg"
         )
-        drive_runtime.last_command = WheelCommand(left_pct, right_pct)
-        drive_runtime.dispatcher.send_wheel_speeds(left_pct, right_pct, force=True)
+        drive_runtime.last_command = WheelCommand(-turn, turn)
+        drive_runtime.commander.steer(0.0, turn, force=True)
         return True
 
     def _run_unload_precise_move(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
@@ -2401,7 +2399,7 @@ class TopdownDetectorApp:
                 drive_runtime.last_message = (
                     f"Unload servo turn {turn_deg:.2f}deg; rear error {float(metrics['distance_error_cm']):.2f}cm"
                 )
-                self._controller().turn(round(turn_deg, 2), turn_speed_pct)
+                drive_runtime.commander.tank_turn(round(turn_deg, 2), turn_speed_pct)
                 return True
 
             command, distance_cm, speed_pct = self._unload_alignment_distance_command(
@@ -2411,10 +2409,8 @@ class TopdownDetectorApp:
             drive_runtime.last_message = (
                 f"Unload servo {command} {distance_cm:.2f}cm; rear error {float(metrics['distance_error_cm']):.2f}cm"
             )
-            if command == "back":
-                self._controller().back(round(distance_cm, 2), speed_pct)
-            else:
-                self._controller().move(round(distance_cm, 2), speed_pct)
+            signed_distance = -distance_cm if command == "back" else distance_cm
+            drive_runtime.commander.drive_straight(round(signed_distance, 2), speed_pct)
             return True
         except Exception as exc:
             self.runtime.unload_state = UnloadExecutionState.FAILED
@@ -2466,7 +2462,7 @@ class TopdownDetectorApp:
 
     def update_unload_state(self, drive_runtime: DriveRuntime, now_s: float) -> bool:
         """Run the terminal pipe-only unload sequence once the unload endpoint is reached."""
-        if drive_runtime.dispatcher is None:
+        if drive_runtime.commander is None:
             return False
         state = self.runtime.unload_state
         if state == UnloadExecutionState.FAILED:
@@ -3324,7 +3320,7 @@ class TopdownDetectorApp:
 
     def handle_manual_robot_key(self, key: int, drive_runtime: DriveRuntime | None) -> None:
         """Map arrow/space keys to the legacy direct non-blocking wheel commands."""
-        if drive_runtime is None or drive_runtime.dispatcher is None:
+        if drive_runtime is None or drive_runtime.commander is None:
             return
         if self.drive_calibration_active():
             return
@@ -3341,29 +3337,13 @@ class TopdownDetectorApp:
         ):
             return
         if key in self.config.drive.key_up_arrow:
-            drive_runtime.dispatcher.send_wheel_speeds(
-                self.config.drive.manual_move_speed,
-                self.config.drive.manual_move_speed,
-                force=True,
-            )
+            drive_runtime.commander.steer(self.config.drive.manual_move_speed, 0, force=True)
         elif key in self.config.drive.key_down_arrow:
-            drive_runtime.dispatcher.send_wheel_speeds(
-                -self.config.drive.manual_move_speed,
-                -self.config.drive.manual_move_speed,
-                force=True,
-            )
+            drive_runtime.commander.steer(-self.config.drive.manual_move_speed, 0, force=True)
         elif key in self.config.drive.key_left_arrow:
-            drive_runtime.dispatcher.send_wheel_speeds(
-                -self.config.drive.manual_turn_speed,
-                self.config.drive.manual_turn_speed,
-                force=True,
-            )
+            drive_runtime.commander.steer(0, self.config.drive.manual_turn_speed, force=True)
         elif key in self.config.drive.key_right_arrow:
-            drive_runtime.dispatcher.send_wheel_speeds(
-                self.config.drive.manual_turn_speed,
-                -self.config.drive.manual_turn_speed,
-                force=True,
-            )
+            drive_runtime.commander.steer(0, -self.config.drive.manual_turn_speed, force=True)
 
     def handle_drive_calibration_key(self, ascii_key: int, drive_runtime: DriveRuntime | None) -> bool:
         """Handle optional drive calibration keys before normal manual dispatch."""
@@ -3693,7 +3673,7 @@ class TopdownDetectorApp:
                 frame_dt_s = max(1e-6, now - last_tick)
                 robot_geometry = self.robot_estimator.robot_geometry_from_params(params)
                 drive_waiting_for_ball_count = (
-                    drive_runtime.dispatcher is not None
+                    drive_runtime.commander is not None
                     and not self.ball_count_initialized()
                 )
                 calibration_owns_control = self.update_drive_calibration_state(drive_runtime, now)

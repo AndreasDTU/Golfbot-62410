@@ -92,3 +92,34 @@ class TcpWheelDispatcher:
         self.last_sent = (left, right)
         self.last_error = ""
         return True
+
+
+class MotorCommander:
+    """Single source of truth for all drive motor commands.
+
+    Sign convention:
+      - Positive base_speed = forward
+      - Positive turn_speed / positive degrees = CCW (left turn)
+      - steer() computes left = base - turn, right = base + turn
+    """
+
+    def __init__(self, dispatcher: TcpWheelDispatcher) -> None:
+        self.dispatcher = dispatcher
+
+    def steer(self, base_speed_pct: float, turn_speed_pct: float, force: bool = False) -> bool:
+        left = base_speed_pct - turn_speed_pct
+        right = base_speed_pct + turn_speed_pct
+        return self.dispatcher.send_wheel_speeds(left, right, force=force)
+
+    def tank_turn(self, degrees: float, speed_pct: float) -> str:
+        return self.dispatcher._controller().turn(degrees, int(round(abs(speed_pct))))
+
+    def drive_straight(self, distance_cm: float, speed_pct: float) -> str:
+        ctrl = self.dispatcher._controller()
+        if distance_cm >= 0:
+            return ctrl.move(round(distance_cm, 2), int(round(abs(speed_pct))))
+        else:
+            return ctrl.back(round(abs(distance_cm), 2), int(round(abs(speed_pct))))
+
+    def stop(self, force: bool = True) -> bool:
+        return self.dispatcher.send_wheel_speeds(0.0, 0.0, force=force)

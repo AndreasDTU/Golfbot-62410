@@ -450,12 +450,15 @@ class DriveSafetyGuard:
             edge_clearance_cm=edge_clearance_cm,
         )
         drive_runtime.last_command = command
-        if drive_runtime.dispatcher is None:
+        if drive_runtime.commander is None:
             drive_runtime.state = DriveControlState.DISABLED
             drive_runtime.last_message = "no dispatcher"
             return
 
-        dispatched = drive_runtime.dispatcher.send_wheel_speeds(command.left_pct, command.right_pct)
+        dispatched = drive_runtime.commander.steer(
+            self.wheel_controller.last_base_speed,
+            self.wheel_controller.last_turn_speed,
+        )
         if dispatched:
             drive_runtime.state = DriveControlState.TRACKING
             drive_runtime.last_message = ""

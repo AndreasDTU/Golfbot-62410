@@ -3054,7 +3054,12 @@ class TopdownDetectorApp:
         return "Waiting for ArUco markers 0,1,2,3"
 
     def _build_manual_route(self) -> RoutePlan | None:
-        waypoints = self.runtime.manual_path_waypoints_cm
+        waypoints = list(self.runtime.manual_path_waypoints_cm)
+        if not waypoints:
+            return None
+        robot = self.runtime.robot_pose
+        if robot is not None:
+            waypoints.insert(0, (robot.x_cm, robot.y_cm))
         if len(waypoints) < 2:
             return None
         poses: list[HybridPose] = []
@@ -3708,11 +3713,13 @@ class TopdownDetectorApp:
                         self.pause_step_drive_after_target(drive_runtime)
                         pickup_owns_control = True
                     if not pivot_owns_control and not pickup_owns_control and not unload_owns_control:
+                        manual = self.runtime.manual_path_mode
+                        xte_clear = None if manual else self.runtime.clear_route
                         self.drive_guard.enforce_xte_guard_before_replan(
                             self.runtime.robot_pose,
                             self.runtime.route_plan.points,
                             drive_runtime,
-                            clear_route_cache=self.runtime.clear_route,
+                            clear_route_cache=xte_clear,
                         )
                         if drive_runtime.state == DriveControlState.REPLANNING:
                             if self.telemetry._auto_dump_enabled:
@@ -3731,7 +3738,7 @@ class TopdownDetectorApp:
                             self.runtime.robot_pose,
                             self.runtime.route_plan.points,
                             drive_runtime,
-                            clear_route_cache=self.runtime.clear_route,
+                            clear_route_cache=xte_clear,
                             local_goal_poses=all_goal_poses,
                             dt_s=frame_dt_s,
                             robot_geometry=robot_geometry,

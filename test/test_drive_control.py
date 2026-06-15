@@ -1694,5 +1694,20 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(app.runtime.route_plan.points, [])
 
 
+    def test_manual_route_prepends_robot_pose(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.robot_pose = RobotPose(5.0, 5.0, 0.0, 5.0, 5.0)
+        app.runtime.manual_path_waypoints_cm = [(20.0, 5.0)]
+
+        route = app._build_manual_route()
+
+        self.assertIsNotNone(route)
+        self.assertEqual(len(route.points), 2)
+        self.assertAlmostEqual(route.points[0].x_cm, 5.0)
+        self.assertAlmostEqual(route.points[0].y_cm, 5.0)
+        self.assertAlmostEqual(route.points[1].x_cm, 20.0)
+        self.assertAlmostEqual(route.points[1].y_cm, 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1608,5 +1608,91 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(controller.last_distance_to_goal_cm, float("inf"))
 
 
+    def test_manual_path_mode_toggle_clears_route(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+
+        app.handle_key(ord("g"), drive_runtime)
+
+        self.assertTrue(app.runtime.manual_path_mode)
+        self.assertEqual(app.runtime.route_plan.points, [])
+        self.assertEqual(app.runtime.manual_path_waypoints_cm, [])
+
+    def test_manual_route_builds_correct_headings(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.manual_path_waypoints_cm = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+        ]
+
+        route = app._build_manual_route()
+
+        self.assertIsNotNone(route)
+        self.assertEqual(len(route.points), 3)
+        self.assertAlmostEqual(route.points[0].theta_rad, 0.0)
+        self.assertAlmostEqual(route.points[1].theta_rad, math.pi / 2)
+        self.assertAlmostEqual(route.points[2].theta_rad, math.pi / 2)
+        self.assertTrue(all(st == RouteSegmentType.TRANSIT for st in route.segment_types))
+
+    def test_manual_path_mode_suppresses_auto_planner(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.manual_path_mode = True
+        app.runtime.manual_path_waypoints_cm = [(0.0, 0.0), (10.0, 0.0)]
+        app._install_manual_route_if_ready()
+        original_route = app.runtime.route_plan
+
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        grid = np.zeros((app.config.field.grid_height_cm, app.config.field.grid_width_cm), dtype=np.uint8)
+        result = VisionFrameResult(
+            raw_frame=frame,
+            preprocessed=PreprocessedFrame(
+                undistorted=frame,
+                topdown=frame,
+                normalized=None,
+                calibration_state=CalibrationState.CALIBRATED_AUTO,
+                transform_matrix=None,
+                camera_ground_projection=None,
+            ),
+            frame_for_detection=frame,
+            red_zones=[],
+            red_mask=np.zeros((4, 4), dtype=np.uint8),
+            white_balls=[],
+            orange_balls=[],
+            ball_masks={},
+            smoothed_ball_coordinates=[],
+            occupancy_grid=grid,
+        )
+        app.update_route(result, {"unload_extension_cm": 15.0})
+
+        self.assertIs(app.runtime.route_plan, original_route)
+
+    def test_manual_route_installed_on_click(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.manual_path_mode = True
+        app.runtime.manual_path_waypoints_cm = [(0.0, 0.0)]
+
+        app.runtime.manual_path_waypoints_cm.append((20.0, 0.0))
+        app._install_manual_route_if_ready()
+
+        self.assertEqual(len(app.runtime.route_plan.points), 2)
+        self.assertAlmostEqual(app.runtime.route_plan.points[0].x_cm, 0.0)
+        self.assertAlmostEqual(app.runtime.route_plan.points[1].x_cm, 20.0)
+
+    def test_manual_path_mode_off_clears_waypoints(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+
+        app.handle_key(ord("g"), drive_runtime)
+        app.runtime.manual_path_waypoints_cm = [(0.0, 0.0), (10.0, 0.0)]
+        app._install_manual_route_if_ready()
+
+        app.handle_key(ord("g"), drive_runtime)
+
+        self.assertFalse(app.runtime.manual_path_mode)
+        self.assertEqual(app.runtime.manual_path_waypoints_cm, [])
+        self.assertEqual(app.runtime.route_plan.points, [])
+
+
 if __name__ == "__main__":
     unittest.main()

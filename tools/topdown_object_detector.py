@@ -184,6 +184,8 @@ class RuntimeState:
     stable_visible_balls: int | None = None
     step_mode_enabled: bool = False
     step_drive_paused: bool = False
+    manual_path_mode: bool = False
+    manual_path_waypoints_cm: list[tuple[float, float]] = field(default_factory=list)
     drive_calibration_state: DriveCalibrationExecutionState = DriveCalibrationExecutionState.IDLE
     drive_calibration_message: str = ""
     drive_calibration_values: DriveCalibrationValues | None = None
@@ -2700,6 +2702,8 @@ class TopdownDetectorApp:
 
     def update_route(self, result: VisionFrameResult, params: dict[str, object]) -> None:
         self.runtime.latest_smoothed_balls = result.smoothed_ball_coordinates
+        if self.runtime.manual_path_mode:
+            return
         if self.drive_calibration_active():
             return
         if self.runtime.pickup_state != PickupExecutionState.NAVIGATION:
@@ -2932,12 +2936,23 @@ class TopdownDetectorApp:
                 drive_runtime=drive_runtime,
                 num_intermediate_snapshots=self.config.planner.num_intermediate_snapshots,
                 route_heading_marker_interval=self.config.planner.route_heading_marker_interval,
+                manual_waypoints_cm=(
+                    self.runtime.manual_path_waypoints_cm
+                    if self.runtime.manual_path_mode
+                    else None
+                ),
             )
             combined = np.hstack(self.renderer.resize_to_match_height(placeholder, schematic))
             self.renderer.draw_drive_status(combined, drive_runtime)
             self.draw_ball_reconciliation_overlay(combined)
             self.draw_step_pause_overlay(combined)
             self.draw_drive_calibration_overlay(combined)
+            if self.runtime.manual_path_mode:
+                cv2.putText(
+                    combined, "MANUAL PATH",
+                    (combined.shape[1] // 2 - 80, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA,
+                )
             waiting_text = (
                 "Waiting for manual top-down selection"
                 if self.homography_calibrator is not None
@@ -3002,6 +3017,11 @@ class TopdownDetectorApp:
             drive_runtime=drive_runtime,
             num_intermediate_snapshots=self.config.planner.num_intermediate_snapshots,
             route_heading_marker_interval=self.config.planner.route_heading_marker_interval,
+            manual_waypoints_cm=(
+                self.runtime.manual_path_waypoints_cm
+                if self.runtime.manual_path_mode
+                else None
+            ),
         )
         masks = self.renderer.build_mask_preview(
             result.red_mask,
@@ -3013,6 +3033,12 @@ class TopdownDetectorApp:
         self.draw_ball_reconciliation_overlay(combined)
         self.draw_step_pause_overlay(combined)
         self.draw_drive_calibration_overlay(combined)
+        if self.runtime.manual_path_mode:
+            cv2.putText(
+                combined, "MANUAL PATH",
+                (combined.shape[1] // 2 - 80, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA,
+            )
         if video_paused:
             self.renderer.draw_video_pause_overlay(combined)
         return combined, masks, schematic
@@ -3027,7 +3053,44 @@ class TopdownDetectorApp:
             return "ArUco unavailable, press m for manual mode"
         return "Waiting for ArUco markers 0,1,2,3"
 
+    def _build_manual_route(self) -> RoutePlan | None:
+        waypoints = self.runtime.manual_path_waypoints_cm
+        if len(waypoints) < 2:
+            return None
+        poses: list[HybridPose] = []
+        for i, (x, y) in enumerate(waypoints):
+            if i < len(waypoints) - 1:
+                nx, ny = waypoints[i + 1]
+                heading = math.atan2(ny - y, nx - x)
+            else:
+                heading = poses[-1].theta_rad
+            poses.append(HybridPose(x, y, heading))
+        return RoutePlan(
+            points=poses,
+            active_target=None,
+            pickup_poses=[],
+            segment_types=[RouteSegmentType.TRANSIT] * len(poses),
+        )
+
+    def _install_manual_route_if_ready(self) -> None:
+        route = self._build_manual_route()
+        if route is not None:
+            self.runtime.route_plan = route
+        else:
+            self.runtime.clear_route()
+        self.drive_guard.wheel_controller.reset()
+
     def on_schematic_mouse(self, event: int, x: int, y: int, _flags: int, _userdata: Any) -> None:
+        if self.runtime.manual_path_mode:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                click_cm = self.mapper.schematic_to_field_metric_cm((x, y))
+                self.runtime.manual_path_waypoints_cm.append(click_cm)
+                self._install_manual_route_if_ready()
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                if self.runtime.manual_path_waypoints_cm:
+                    self.runtime.manual_path_waypoints_cm.pop()
+                    self._install_manual_route_if_ready()
+            return
         if event != cv2.EVENT_LBUTTONDOWN or not self.runtime.latest_smoothed_balls:
             return
         click_cm = self.mapper.schematic_to_field_metric_cm((x, y))
@@ -3336,6 +3399,20 @@ class TopdownDetectorApp:
             path = self.telemetry.dump_csv(reason="manual")
             if path and drive_runtime:
                 drive_runtime.last_message = f"telemetry: {path}"
+        if ascii_key == ord("g"):
+            self.runtime.manual_path_mode = not self.runtime.manual_path_mode
+            if self.runtime.manual_path_mode:
+                self.runtime.manual_path_waypoints_cm = []
+                self.runtime.clear_route()
+                self.drive_guard.wheel_controller.reset()
+                if drive_runtime:
+                    drive_runtime.last_message = "manual path mode ON \u2014 click schematic to add waypoints"
+            else:
+                self.runtime.manual_path_waypoints_cm = []
+                self.runtime.clear_route()
+                self.drive_guard.wheel_controller.reset()
+                if drive_runtime:
+                    drive_runtime.last_message = "manual path mode OFF"
         self.handle_manual_robot_key(key, drive_runtime)
         return False
 

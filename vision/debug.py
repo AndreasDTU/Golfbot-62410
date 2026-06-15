@@ -1026,6 +1026,7 @@ class DebugRenderer:
         drive_runtime: DriveRuntime | None = None,
         num_intermediate_snapshots: int = 0,
         route_heading_marker_interval: int = 20,
+        manual_waypoints_cm: list[tuple[float, float]] | None = None,
     ) -> np.ndarray:
         """Draw a clean synthetic field view containing detected objects and route state."""
         source_height, source_width = frame_shape[:2]
@@ -1192,7 +1193,28 @@ class DebugRenderer:
             2,
             cv2.LINE_AA,
         )
+        if manual_waypoints_cm:
+            self.draw_manual_waypoints(schematic, manual_waypoints_cm)
         return schematic
+
+    def draw_manual_waypoints(self, schematic: np.ndarray, waypoints_cm: list[tuple[float, float]]) -> None:
+        """Draw numbered cyan waypoints and connecting lines on the schematic."""
+        pts_px = [self.mapper.field_metric_cm_to_schematic(wp) for wp in waypoints_cm]
+        for i in range(len(pts_px) - 1):
+            cv2.line(schematic, pts_px[i], pts_px[i + 1], (255, 255, 0), 2, cv2.LINE_AA)
+        for i, px in enumerate(pts_px):
+            cv2.circle(schematic, px, 7, (255, 255, 0), -1, cv2.LINE_AA)
+            cv2.circle(schematic, px, 7, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                schematic,
+                str(i + 1),
+                (px[0] + 10, px[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
 
 
 SchematicRenderer = DebugRenderer

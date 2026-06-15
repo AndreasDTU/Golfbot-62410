@@ -3728,6 +3728,7 @@ class TopdownDetectorApp:
                             self.runtime.route_plan.points,
                             drive_runtime,
                             clear_route_cache=xte_clear,
+                            segment_types=self.runtime.route_plan.segment_types,
                         )
                         if drive_runtime.state == DriveControlState.REPLANNING:
                             if self.telemetry._auto_dump_enabled:
@@ -3750,6 +3751,7 @@ class TopdownDetectorApp:
                             local_goal_poses=all_goal_poses,
                             dt_s=frame_dt_s,
                             robot_geometry=robot_geometry,
+                            segment_types=self.runtime.route_plan.segment_types,
                         )
                 self.telemetry.record_frame(
                     robot_pose=self.runtime.robot_pose,

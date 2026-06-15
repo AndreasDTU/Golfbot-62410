@@ -7,7 +7,7 @@ from typing import Callable
 
 import numpy as np
 
-from pathfinding.models import HybridPose, RouteTrackingError
+from pathfinding.models import HybridPose, RouteSegmentType, RouteTrackingError
 from pathfinding.planner import RoutePlanningFacade
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose, WheelCommand
 from vision.config import DriveConfig, FieldConfig
@@ -320,6 +320,7 @@ class DriveSafetyGuard:
         robot_pose: RobotPose,
         route: list[HybridPose],
         drive_runtime: DriveRuntime,
+        segment_types: list[RouteSegmentType] | None = None,
     ) -> RouteTrackingError | None:
         """Project only onto the current/future route window to avoid path-intersection jumps."""
         self.reset_route_progress_if_needed(route, drive_runtime)
@@ -328,6 +329,11 @@ class DriveSafetyGuard:
             len(route) - 2,
             start_segment + max(0, int(self.config.route_tracking_lookahead_segments)),
         )
+        if segment_types is not None:
+            for idx in range(start_segment, end_segment + 1):
+                if idx < len(segment_types) and segment_types[idx] == RouteSegmentType.PIVOT:
+                    end_segment = max(start_segment, idx - 1)
+                    break
         tracking_error = self.route_facade.compute_route_tracking_error(
             robot_pose,
             route,
@@ -347,6 +353,7 @@ class DriveSafetyGuard:
         route: list[HybridPose] | None,
         drive_runtime: DriveRuntime | None,
         clear_route_cache: Callable[[], None] | None = None,
+        segment_types: list[RouteSegmentType] | None = None,
     ) -> None:
         """Stop on excessive XTE before route cache updates can hide the error."""
         if (
@@ -357,7 +364,9 @@ class DriveSafetyGuard:
         ):
             return
 
-        tracking_error = self.compute_progressive_tracking_error(robot_pose, route, drive_runtime)
+        tracking_error = self.compute_progressive_tracking_error(
+            robot_pose, route, drive_runtime, segment_types=segment_types,
+        )
         if tracking_error is None or tracking_error.xte_cm <= self.config.max_cross_track_error_cm:
             return
 
@@ -380,6 +389,7 @@ class DriveSafetyGuard:
         local_goal_poses: list[HybridPose] | None = None,
         dt_s: float | None = None,
         robot_geometry: RobotGeometry | None = None,
+        segment_types: list[RouteSegmentType] | None = None,
     ) -> None:
         """Run the master-controller step after perception and route-cache update."""
         if drive_runtime is None:
@@ -402,7 +412,9 @@ class DriveSafetyGuard:
             drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for route")
             return
 
-        tracking_error = self.compute_progressive_tracking_error(robot_pose, route, drive_runtime)
+        tracking_error = self.compute_progressive_tracking_error(
+            robot_pose, route, drive_runtime, segment_types=segment_types,
+        )
         drive_runtime.last_error = tracking_error
         if tracking_error is None:
             self.wheel_controller.reset()

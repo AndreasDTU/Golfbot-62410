@@ -149,12 +149,12 @@ def cmd_turn(parts):
     motor_deg = turn_angle_to_motor_degrees(angle)
     spd = speed
     if angle >= 0:
-        # Turn right: left motor forward, right motor backward
-        tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(spd),
+        # Turn left (CCW): right motor forward, left motor backward
+        tank.on_for_degrees(left_speed=SpeedPercent(spd), right_speed=SpeedPercent(-spd),
                             degrees=motor_deg, brake=True, block=True)
     else:
-        # Turn left: right motor forward, left motor backward
-        tank.on_for_degrees(left_speed=SpeedPercent(spd), right_speed=SpeedPercent(-spd),
+        # Turn right (CW): left motor forward, right motor backward
+        tank.on_for_degrees(left_speed=SpeedPercent(-spd), right_speed=SpeedPercent(spd),
                             degrees=motor_deg, brake=True, block=True)
     return "ok: turned {} degrees".format(angle)
 

@@ -29,6 +29,10 @@ class DriveControlState(Enum):
     NO_ROUTE = "NO ROUTE"
     TRACKING = "TRACKING"
     PRECISE_MOVE = "PRECISE MOVE"
+    PRE_UNLOAD_PIVOT = "PRE-UNLOAD PIVOT"
+    POST_PICKUP_ESCAPE = "POST-PICKUP ESCAPE"
+    POST_PICKUP_ALIGN = "POST-PICKUP ALIGN"
+    CALIBRATING = "CALIBRATING"
     BLIND_APPROACH = "BLIND APPROACH"
     PICKUP = "PICKUP"
     REPLANNING = "REPLANNING -> MOTORS HALTED"
@@ -78,6 +82,8 @@ class DriveRuntime:
     last_command: WheelCommand = field(default_factory=lambda: WheelCommand(0.0, 0.0))
     last_message: str = ""
     suppress_dispatch_this_frame: bool = False
+    active_route_identity: int | None = None
+    route_progress_segment_index: int = 0
 
     def stop(self, state: DriveControlState, message: str = "") -> None:
         """Send a deterministic zero-speed command and update overlay state."""

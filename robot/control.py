@@ -266,6 +266,44 @@ class DriveSafetyGuard:
         self.route_facade = route_facade or RoutePlanningFacade()
         self.wheel_controller = wheel_controller or WheelCommandController(self.config)
 
+    def reset_route_progress_if_needed(self, route: list[HybridPose], drive_runtime: DriveRuntime) -> None:
+        """Reset monotonic segment progress when a new route object is installed."""
+        route_identity = id(route)
+        if drive_runtime.active_route_identity == route_identity:
+            drive_runtime.route_progress_segment_index = max(
+                0,
+                min(drive_runtime.route_progress_segment_index, max(0, len(route) - 2)),
+            )
+            return
+        drive_runtime.active_route_identity = route_identity
+        drive_runtime.route_progress_segment_index = 0
+
+    def compute_progressive_tracking_error(
+        self,
+        robot_pose: RobotPose,
+        route: list[HybridPose],
+        drive_runtime: DriveRuntime,
+    ) -> RouteTrackingError | None:
+        """Project only onto the current/future route window to avoid path-intersection jumps."""
+        self.reset_route_progress_if_needed(route, drive_runtime)
+        start_segment = max(0, drive_runtime.route_progress_segment_index)
+        end_segment = min(
+            len(route) - 2,
+            start_segment + max(0, int(self.config.route_tracking_lookahead_segments)),
+        )
+        tracking_error = self.route_facade.compute_route_tracking_error(
+            robot_pose,
+            route,
+            start_segment_index=start_segment,
+            end_segment_index=end_segment,
+        )
+        if tracking_error is not None:
+            drive_runtime.route_progress_segment_index = max(
+                drive_runtime.route_progress_segment_index,
+                tracking_error.segment_index,
+            )
+        return tracking_error
+
     def enforce_xte_guard_before_replan(
         self,
         robot_pose: RobotPose | None,
@@ -282,7 +320,7 @@ class DriveSafetyGuard:
         ):
             return
 
-        tracking_error = self.route_facade.compute_route_tracking_error(robot_pose, route)
+        tracking_error = self.compute_progressive_tracking_error(robot_pose, route, drive_runtime)
         if tracking_error is None or tracking_error.xte_cm <= self.config.max_cross_track_error_cm:
             return
 
@@ -318,8 +356,6 @@ class DriveSafetyGuard:
             return
         if robot_pose is None:
             self.wheel_controller.reset()
-            if clear_route_cache is not None:
-                clear_route_cache()
             drive_runtime.last_error = None
             drive_runtime.stop(DriveControlState.NO_POSE, "robot marker missing")
             return
@@ -329,7 +365,7 @@ class DriveSafetyGuard:
             drive_runtime.stop(DriveControlState.NO_ROUTE, "waiting for route")
             return
 
-        tracking_error = self.route_facade.compute_route_tracking_error(robot_pose, route)
+        tracking_error = self.compute_progressive_tracking_error(robot_pose, route, drive_runtime)
         drive_runtime.last_error = tracking_error
         if tracking_error is None:
             self.wheel_controller.reset()

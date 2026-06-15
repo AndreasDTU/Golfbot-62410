@@ -2,7 +2,7 @@
 """Manual open-loop playground for the GolfBot collector pipe.
 
 This tool talks only to the EV3 TCP controller. It does not import or start the
-vision pipeline, route planner, detector shell, UDP wheel dispatcher, or any
+vision pipeline, route planner, detector shell, TCP wheel dispatcher, or any
 autonomous drive loop.
 """
 

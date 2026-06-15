@@ -71,6 +71,33 @@ class GridDijkstraHeuristicTests(unittest.TestCase):
 
 
 class SmallGoalUnloadRouteTests(unittest.TestCase):
+    def test_route_can_drive_directly_to_unload_when_no_ball_targets_remain(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=10.0,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        planner = HybridAStarPlanner(field_config=field)
+        route_planner = GreedyRoutePlanner(planner)
+        start_pose = HybridPose(40.0, field.height_cm * 0.5, 0.0)
+
+        route = route_planner.plan(grid, [], start_pose, geometry)
+
+        self.assertGreaterEqual(len(route.points), 2)
+        self.assertIsNone(route.active_target)
+        self.assertEqual(route.pickup_poses, [])
+        self.assertIsNotNone(route.unload_pose)
+        self.assertEqual(route.unload_goal_cm, (0.0, field.height_cm * 0.5))
+        assert route.unload_pose is not None
+        self.assertAlmostEqual(route.unload_pose.x_cm, geometry.rear_cm + geometry.unload_extension_cm + 2.0)
+        self.assertAlmostEqual(route.unload_pose.y_cm, field.height_cm * 0.5)
+        self.assertAlmostEqual(route.unload_pose.theta_rad, 0.0)
+
     def test_route_appends_small_goal_unload_after_pickup(self) -> None:
         field = FieldConfig()
         grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
@@ -98,6 +125,9 @@ class SmallGoalUnloadRouteTests(unittest.TestCase):
         self.assertIsNotNone(route.unload_pose)
         self.assertEqual(route.unload_goal_cm, (0.0, field.height_cm * 0.5))
         assert route.unload_pose is not None
+        self.assertAlmostEqual(route.unload_pose.x_cm, geometry.rear_cm + geometry.unload_extension_cm + 2.0)
+        self.assertAlmostEqual(route.unload_pose.y_cm, field.height_cm * 0.5)
+        self.assertAlmostEqual(route.unload_pose.theta_rad, 0.0)
         self.assertTrue(planner.is_unload_goal_reached(route.unload_pose, geometry))
 
 
@@ -656,6 +686,69 @@ class TightCornerPickupTests(unittest.TestCase):
         heading = planner.tight_corner_pickup_heading((field.width_cm - 6.0, field.height_cm - 6.0))
 
         self.assertIsNone(heading)
+
+    def test_near_wall_ball_prefers_perpendicular_standoff_goals(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.3,
+            rear_cm=10.1,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        config = HybridPlannerConfig(wall_pickup_prefer_distance_cm=12.0)
+        planner = HybridAStarPlanner(field_config=field, config=config)
+        ball_point = (field.width_cm - 4.0, field.height_cm * 0.5)
+
+        all_goals = planner.valid_pickup_standoff_goals(
+            grid,
+            (int(round(ball_point[0])), int(round(field.height_cm - ball_point[1]))),
+            geometry,
+            ball_point,
+        )
+        preferred_goals = planner.preferred_wall_pickup_standoff_goals(all_goals, ball_point, config)
+
+        self.assertTrue(preferred_goals)
+        self.assertLess(len(preferred_goals), len(all_goals))
+        self.assertTrue(
+            all(
+                planner.wall_pickup_heading_error(goal.final_pickup_pose, ball_point, config)
+                <= config.wall_pickup_perpendicular_tolerance_rad
+                for goal in preferred_goals
+            )
+        )
+
+    def test_bottom_left_deep_corner_ball_has_diagonal_pickup_pose(self) -> None:
+        field = FieldConfig()
+        grid = np.zeros((field.grid_height_cm, field.grid_width_cm), dtype=np.uint8)
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.3,
+            rear_cm=10.1,
+            tube_forward_cm=17.1,
+            tube_right_cm=0.0,
+            unload_extension_cm=15.0,
+        )
+        planner = HybridAStarPlanner(field_config=field)
+        start_pose = HybridPose(30.0, 30.0, math.radians(-135.0))
+        ball_point = (1.0, 1.0)
+
+        segment = planner.search_corner_pickup(
+            grid,
+            start_pose,
+            (1, int(round(field.height_cm - 1.0))),
+            geometry,
+            goal_point_cm=ball_point,
+        )
+
+        self.assertTrue(segment)
+        final_pose = segment[-1]
+        self.assertLessEqual(abs(final_pose.theta_rad - math.radians(-135.0)), math.radians(9.0))
+        tube = planner.tube_center_for_pose(final_pose, geometry)
+        capture_tolerance_cm = planner.robot_config.tube_width_cm * 0.5 + planner.config.ball_radius_cm
+        self.assertLessEqual(np.hypot(tube[0] - ball_point[0], tube[1] - ball_point[1]), capture_tolerance_cm)
 
     def test_four_tight_corner_balls_remain_reachable_in_sequence(self) -> None:
         field = FieldConfig()

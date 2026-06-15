@@ -265,6 +265,12 @@ Outputfiler:
 
 Hvis ellipse-ratioen bliver for hoej, viser scriptet en advarsel. Det betyder typisk, at robotten glider under spin, eller at top-down homographyen skal laves om.
 
+`topdown_object_detector.py --drive` kan ogsaa lave en begrænset robot-origin
+opdatering som del af `k` drive calibration. Den bruger 360-graders spin-testen
+til at fitte et nyt pivot/origin og foreslaar kun nye `dx`/`dy` vaerdier i
+`robot_calibration.json`; `alpha_rad` bevares, saa robot-heading ikke aendres
+uden en separat forward-alignment kalibrering.
+
 ## Main flow og ældre filer
 
 ### [Main.py](/Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo/Main.py)

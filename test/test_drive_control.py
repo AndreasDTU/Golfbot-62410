@@ -1,13 +1,20 @@
 import math
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import cv2
+import numpy as np
+
 from pathfinding.models import HybridPose, RoutePlan, RouteTrackingError
-from robot.control import WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
+from robot.control import DriveSafetyGuard, WheelCommandController, robot_body_edge_clearance_cm, route_goal_pose
+from robot.drive_calibration import DriveCalibrationValues
+from robot.io import TcpWheelDispatcher
 from robot.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose
 from tools.topdown_object_detector import (
     CollectorPositionState,
+    DriveCalibrationExecutionState,
     PickupExecutionState,
     RoutePlanningRequest,
     RoutePlanningResult,
@@ -16,6 +23,10 @@ from tools.topdown_object_detector import (
 )
 from vision.config import DriveConfig, FieldConfig
 from vision.debug import DebugRenderer
+from vision.models import CalibrationState
+from vision.models import SmoothedBallCoordinate
+from vision.pipeline import VisionFrameResult
+from vision.preprocessing import PreprocessedFrame
 
 
 class FakeDispatcher:
@@ -28,7 +39,64 @@ class FakeDispatcher:
         return True
 
 
+class FakeCapture:
+    def __init__(self) -> None:
+        self.values: dict[int, float] = {}
+        self.set_calls: list[tuple[int, float]] = []
+
+    def set(self, prop_id: int, value: float) -> bool:
+        self.values[prop_id] = value
+        self.set_calls.append((prop_id, value))
+        return True
+
+    def get(self, prop_id: int) -> float:
+        return self.values.get(prop_id, 0.0)
+
+
+class FakeTcpController:
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.commands: list[str] = []
+        self.closed = False
+
+    def _send(self, command: str) -> str:
+        self.commands.append(command)
+        return "ok"
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class DriveControlTests(unittest.TestCase):
+    def test_tcp_wheel_dispatcher_sends_lr_commands_and_deadbands_repeats(self) -> None:
+        controllers: list[FakeTcpController] = []
+
+        def make_controller(host: str, port: int) -> FakeTcpController:
+            controller = FakeTcpController(host, port)
+            controllers.append(controller)
+            return controller
+
+        now = [10.0]
+        with patch("robot.io.RobotController", make_controller):
+            dispatcher = TcpWheelDispatcher(
+                host="robot.local",
+                port=5555,
+                max_speed_pct=50.0,
+                min_send_interval_s=0.1,
+                command_deadband_pct=1.0,
+                time_fn=lambda: now[0],
+            )
+
+            self.assertTrue(dispatcher.send_wheel_speeds(80.0, -80.0))
+            self.assertTrue(dispatcher.send_wheel_speeds(50.2, -49.8))
+            now[0] += 0.2
+            self.assertTrue(dispatcher.send_wheel_speeds(25.0, 20.0))
+            dispatcher.close()
+
+        self.assertEqual(controllers[0].commands, ["LR 50.0 -50.0", "LR 25.0 20.0"])
+        self.assertTrue(controllers[0].closed)
+
     def test_body_edge_clearance_uses_main_body_footprint(self) -> None:
         pose = RobotPose(x_cm=20.0, y_cm=20.0, heading_rad=0.0, tube_x_cm=35.0, tube_y_cm=20.0)
         geometry = RobotGeometry(width_cm=20.0, front_cm=8.0, rear_cm=10.0, tube_forward_cm=18.0, tube_right_cm=0.0)
@@ -60,6 +128,28 @@ class DriveControlTests(unittest.TestCase):
         error = RouteTrackingError(0.0, 0.0, 0.0, (0.0, 0.0), 0.0, 0)
 
         self.assertEqual(route_goal_pose(route, error, pickup, include_final=False), route[1])
+
+    def test_progressive_tracking_ignores_previous_intersecting_segments(self) -> None:
+        guard = DriveSafetyGuard(DriveConfig(route_tracking_lookahead_segments=3))
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        route = [
+            HybridPose(0.0, 0.0, 0.0),
+            HybridPose(10.0, 0.0, 0.0),
+            HybridPose(20.0, 0.0, 0.0),
+            HybridPose(20.0, 20.0, math.pi * 0.5),
+            HybridPose(10.0, 20.0, math.pi),
+            HybridPose(10.0, 0.0, -math.pi * 0.5),
+        ]
+        drive_runtime.active_route_identity = id(route)
+        drive_runtime.route_progress_segment_index = 3
+        robot_pose = RobotPose(10.0, 0.5, -math.pi * 0.5, 10.0, 0.5)
+
+        tracking_error = guard.compute_progressive_tracking_error(robot_pose, route, drive_runtime)
+
+        assert tracking_error is not None
+        self.assertGreaterEqual(tracking_error.segment_index, 3)
+        self.assertNotEqual(tracking_error.segment_index, 0)
+        self.assertGreaterEqual(drive_runtime.route_progress_segment_index, 3)
 
     def test_route_heatmap_breaks_at_near_zone_boundary_for_each_pickup(self) -> None:
         renderer = DebugRenderer(drive_config=DriveConfig(near_zone_cm=15.0))
@@ -168,7 +258,123 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(drive_runtime.last_message, "step target complete; press n")
         self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
 
-    def test_near_zone_handoff_stops_udp_then_turns_and_runs_tcp_move(self) -> None:
+    def test_drive_calibration_key_requires_drive_and_pose(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=None)
+
+        app.handle_key(ord("k"), drive_runtime)
+
+        self.assertEqual(app.runtime.drive_calibration_state, DriveCalibrationExecutionState.IDLE)
+        self.assertEqual(drive_runtime.last_message, "drive calibration requires --drive")
+
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        app.latest_result = SimpleNamespace(frame_for_detection=object())
+
+        app.handle_key(ord("k"), drive_runtime)
+
+        self.assertEqual(app.runtime.drive_calibration_state, DriveCalibrationExecutionState.IDLE)
+        self.assertEqual(drive_runtime.last_message, "drive calibration waiting for robot pose")
+
+    def test_drive_calibration_start_owns_motor_output(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.latest_result = SimpleNamespace(frame_for_detection=object())
+        app.runtime.robot_pose = RobotPose(10.0, 20.0, 0.0, 27.0, 20.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+        )
+
+        class FakeDriveCalibrationController:
+            def get_drive_calibration(self) -> DriveCalibrationValues:
+                return DriveCalibrationValues(300.0, 12.5)
+
+            def turn(self, _degrees: float, _speed_percent: int) -> str:
+                return "OK"
+
+        app.controller = FakeDriveCalibrationController()
+
+        app.handle_key(ord("k"), drive_runtime)
+        owns_control = app.update_drive_calibration_state(drive_runtime, now_s=1.0)
+
+        self.assertTrue(owns_control)
+        self.assertEqual(drive_runtime.state, DriveControlState.CALIBRATING)
+        self.assertEqual(app.runtime.route_plan.points, [])
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+
+    def test_drive_calibration_turn_accumulation_handles_heading_wrap(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.drive_calibration_state = DriveCalibrationExecutionState.TURNING
+        app.runtime.drive_calibration_turn_last_heading_rad = math.radians(170.0)
+        app.runtime.robot_pose = RobotPose(0.0, 0.0, math.radians(-170.0), 0.0, 0.0)
+
+        app._record_drive_calibration_turn_pose()
+
+        self.assertAlmostEqual(math.degrees(app.runtime.drive_calibration_turn_accumulated_rad), 20.0)
+
+    def test_drive_calibration_origin_suggestion_preserves_heading_alpha(self) -> None:
+        app = TopdownDetectorApp()
+        center = (100.0, 100.0)
+        radius = 10.0
+        points = [
+            (
+                center[0] + math.cos(index * math.tau / 24.0) * radius,
+                center[1] + math.sin(index * math.tau / 24.0) * radius,
+            )
+            for index in range(24)
+        ]
+        app.robot_runtime.calibration = {
+            "version": 1,
+            "marker_ids": [4, 5],
+            "topdown_size": list(app.config.camera.topdown_warp_size),
+            "markers": {
+                "4": {"dx": 12.0, "dy": 0.0, "alpha_rad": 0.0, "alpha_deg": 0.0},
+                "5": {"dx": -12.0, "dy": 0.0, "alpha_rad": 0.0, "alpha_deg": 0.0},
+            },
+        }
+        app.runtime.drive_calibration_origin_points = {4: points, 5: points}
+        app.runtime.drive_calibration_origin_latest_observations = {
+            4: SimpleNamespace(ground_center=np.array([110.0, 100.0], dtype=np.float32), yaw_rad=math.radians(90.0)),
+            5: SimpleNamespace(ground_center=np.array([100.0, 110.0], dtype=np.float32), yaw_rad=0.0),
+        }
+
+        app._build_drive_calibration_origin_suggestion()
+
+        suggested = app.runtime.drive_calibration_origin_suggested_calibration
+        assert suggested is not None
+        self.assertEqual(suggested["markers"]["4"]["alpha_rad"], 0.0)
+        self.assertAlmostEqual(suggested["markers"]["4"]["dx"], 0.0, places=3)
+        self.assertAlmostEqual(suggested["markers"]["4"]["dy"], 10.0, places=3)
+        self.assertIsNotNone(app.runtime.drive_calibration_origin_shift_cm)
+
+    def test_drive_calibration_apply_requires_ready_result(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        applied: list[tuple[float, float]] = []
+
+        class FakeDriveCalibrationController:
+            def set_drive_calibration(self, axle_track_mm: float, mm_per_unit: float) -> DriveCalibrationValues:
+                applied.append((axle_track_mm, mm_per_unit))
+                return DriveCalibrationValues(axle_track_mm, mm_per_unit)
+
+        app.controller = FakeDriveCalibrationController()
+
+        app.handle_key(ord("y"), drive_runtime)
+
+        self.assertEqual(applied, [])
+
+        app.runtime.drive_calibration_state = DriveCalibrationExecutionState.READY_TO_APPLY
+        app.runtime.drive_calibration_suggested_values = DriveCalibrationValues(310.0, 11.0)
+        app.handle_key(ord("y"), drive_runtime)
+
+        self.assertEqual(applied, [(310.0, 11.0)])
+        self.assertEqual(app.runtime.drive_calibration_state, DriveCalibrationExecutionState.IDLE)
+        self.assertEqual(drive_runtime.last_message, "drive calibration applied")
+
+    def test_near_zone_handoff_stops_tcp_tracking_then_turns_and_runs_tcp_move(self) -> None:
         app = TopdownDetectorApp()
         dispatcher = FakeDispatcher()
         drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
@@ -190,13 +396,13 @@ class DriveControlTests(unittest.TestCase):
 
         def record_stop(left_pct: float, right_pct: float, force: bool = False) -> bool:
             dispatcher.commands.append((left_pct, right_pct, force))
-            events.append(("udp", left_pct, None))
+            events.append(("tcp_lr", left_pct, None))
             return True
 
         dispatcher.send_wheel_speeds = record_stop
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def turn(self, degrees: float, speed_percent: int) -> str:
@@ -209,14 +415,143 @@ class DriveControlTests(unittest.TestCase):
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
             owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
+            app.runtime.robot_pose = RobotPose(
+                x_cm=6.0,
+                y_cm=0.0,
+                heading_rad=0.0,
+                tube_x_cm=0.0,
+                tube_y_cm=0.0,
+            )
+            owns_control_after_vision = app.update_pickup_state(drive_runtime, now_s=1.1)
+            app.runtime.near_zone_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            owns_control_after_settle = app.update_pickup_state(drive_runtime, now_s=1.2)
 
         self.assertTrue(owns_control)
+        self.assertTrue(owns_control_after_vision)
+        self.assertTrue(owns_control_after_settle)
         self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
-        self.assertEqual(events[0], ("udp", 0.0, None))
+        self.assertEqual(events[0], ("tcp_lr", 0.0, None))
         self.assertEqual(events[1], ("turn", 10.0, int(round(app.config.drive.near_zone_turn_speed_pct))))
-        self.assertEqual(events[2], ("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))))
+        self.assertIn(("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
         self.assertEqual(app.runtime.balls_collected, 1)
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
+
+    def test_pickup_target_body_pose_uses_line_of_sight_not_stale_robot_heading(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.robot_pose = RobotPose(
+            x_cm=0.0,
+            y_cm=3.0,
+            heading_rad=math.radians(90.0),
+            tube_x_cm=0.0,
+            tube_y_cm=3.0,
+        )
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(1, "white", (0, 0), (0, 0), 4, 12.0, 3.0),
+        ]
+        params = {"tube_forward_cm": 4.0, "tube_right_cm": 0.0}
+
+        target_x_cm, target_y_cm = app._pickup_target_body_pose(
+            HybridPose(8.0, 3.0, 0.0),
+            params=params,
+        )
+
+        self.assertAlmostEqual(target_x_cm, 8.0)
+        self.assertAlmostEqual(target_y_cm, 3.0)
+
+    def test_near_zone_visual_servo_keeps_turning_until_noise_floor(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.robot_pose = RobotPose(6.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+            def move(self, distance: float, speed_percent: int) -> str:
+                events.append(("move", distance, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            app.update_pickup_state(drive_runtime, now_s=1.0)
+            app.runtime.robot_pose = RobotPose(6.0, 2.0, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.1)
+            app.runtime.robot_pose = RobotPose(6.0, 0.3, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.2)
+            app.runtime.robot_pose = RobotPose(6.0, 0.1, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.3)
+            app.runtime.near_zone_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            app.update_pickup_state(drive_runtime, now_s=1.4)
+
+        turn_events = [event for event in events if event[0] == "turn"]
+        self.assertGreaterEqual(len(turn_events), 2)
+        self.assertGreater(abs(turn_events[0][1]), abs(turn_events[-1][1]))
+        self.assertGreater(turn_events[0][2], turn_events[-1][2])
+        self.assertIn(("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.PICKUP_ASSIST)
+
+    def test_visual_servo_recorrects_when_settling_drifts_outside_noise_floor(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.robot_pose = RobotPose(6.0, 0.0, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(0.0, 0.0, 0.0), HybridPose(10.0, 0.0, 0.0)],
+            active_target=None,
+            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+            def move(self, distance: float, speed_percent: int) -> str:
+                events.append(("move", distance, speed_percent))
+                return "OK"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            app.update_pickup_state(drive_runtime, now_s=1.0)
+            app.runtime.robot_pose = RobotPose(6.0, 0.1, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.1)
+            app.runtime.near_zone_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            app.runtime.robot_pose = RobotPose(6.0, 2.0, 0.0, 0.0, 0.0)
+            app.update_pickup_state(drive_runtime, now_s=1.2)
+
+        self.assertIn(("turn", 8.0, int(round(app.config.drive.near_zone_turn_speed_pct))), events)
+        self.assertNotIn(("move", 4.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+
+    def test_visual_servo_converges_when_alignment_stops_improving(self) -> None:
+        app = TopdownDetectorApp()
+
+        for _index in range(app.config.drive.visual_servo_stall_frames + 1):
+            aligned, _turn_deg, _speed_pct, reason = app._near_zone_visual_servo_turn(4.0, 2.0)
+
+        self.assertTrue(aligned)
+        self.assertEqual(reason, "no further improvement")
 
     def test_autonomous_collection_runs_pickup_assist_not_full_unload(self) -> None:
         app = TopdownDetectorApp()
@@ -226,7 +561,7 @@ class DriveControlTests(unittest.TestCase):
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def pickup_assist(self) -> str:
@@ -235,6 +570,10 @@ class DriveControlTests(unittest.TestCase):
 
             def unload_full_cycle(self) -> str:
                 events.append("unload_full_cycle")
+                return "OK"
+
+            def turn(self, _degrees: float, _speed: int = 100) -> str:
+                events.append("turn")
                 return "OK"
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
@@ -263,7 +602,7 @@ class DriveControlTests(unittest.TestCase):
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def pickup_assist(self) -> str:
@@ -285,36 +624,134 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(events, ["pickup_assist"])
         self.assertEqual(app.runtime.collector_state, CollectorPositionState.TRAVEL)
 
-    def test_drive_start_requires_collector_travel_position_before_route_following(self) -> None:
+    def test_pickup_replan_state_keeps_cached_route_when_remaining_balls_match_plan(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        app.runtime.initial_total_balls = 2
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(40.0, 40.0, 0.0, 40.0, 40.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(30.0, 40.0, 0.0),
+                HybridPose(40.0, 40.0, 0.0),
+                HybridPose(55.0, 40.0, 0.0),
+            ],
+            active_target=SimpleNamespace(track_id=1),
+            pickup_poses=[HybridPose(40.0, 40.0, 0.0), HybridPose(55.0, 40.0, 0.0)],
+        )
+        app.runtime.route_cache_ball_signature = (
+            (1, "white", 2, 0),
+            (2, "white", 4, 0),
+        )
+        app.runtime.route_cache_unload_extension_cm = 15.0
+        app.runtime.route_cache_target_id = 1
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(2, "white", (0, 0), (0, 0), 4, 20.0, 0.0),
+        ]
+
+        owns_control = app.update_pickup_state(drive_runtime, now_s=1.0)
+
+        self.assertTrue(owns_control)
+        self.assertTrue(app.runtime.route_plan.points)
+        self.assertEqual(
+            app.runtime.route_plan.points,
+            [HybridPose(40.0, 40.0, 0.0), HybridPose(55.0, 40.0, 0.0)],
+        )
+        self.assertEqual(app.runtime.route_plan.pickup_poses, [HybridPose(55.0, 40.0, 0.0)])
+        self.assertIsNone(app.runtime.route_plan.active_target)
+        self.assertEqual(app.runtime.route_cache_target_id, -1)
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertAlmostEqual(app._pickup_distance_to_goal_cm(), 15.0)
+        self.assertEqual(drive_runtime.last_message, "pickup complete; continuing cached route")
+
+    def test_post_pickup_critical_edge_clearance_reverses_then_replans(self) -> None:
         app = TopdownDetectorApp()
         dispatcher = FakeDispatcher()
         drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 2
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(5.0, 40.0, 0.0, 5.0, 40.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(5.0, 40.0, 0.0), HybridPose(30.0, 40.0, 0.0)],
+            active_target=SimpleNamespace(track_id=1),
+            pickup_poses=[HybridPose(5.0, 40.0, 0.0), HybridPose(30.0, 40.0, 0.0)],
+        )
+        app.runtime.route_cache_ball_signature = ((2, "white", 6, 8),)
+        app.runtime.route_cache_unload_extension_cm = 15.0
+        app.runtime.route_cache_target_id = 1
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(2, "white", (0, 0), (0, 0), 4, 30.0, 40.0),
+        ]
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
-            def collector_travel_position(self) -> str:
-                events.append("collector_travel_position")
+            def back(self, distance: float, speed_percent: int) -> str:
+                events.append(("back", distance, speed_percent))
                 return "OK"
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
-            owns_control = app.ensure_collector_travel_position(drive_runtime)
+            self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.0))
+            self.assertEqual(app.runtime.pickup_state, PickupExecutionState.POST_PICKUP_ESCAPE)
+            self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.1))
 
-        self.assertTrue(owns_control)
-        self.assertEqual(events, ["collector_travel_position"])
-        self.assertEqual(app.runtime.collector_state, CollectorPositionState.TRAVEL)
-        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+        self.assertEqual(
+            events,
+            [("back", app.config.drive.post_pickup_escape_back_cm, int(round(app.config.drive.post_pickup_escape_speed_pct)))],
+        )
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertEqual(app.runtime.route_plan.points, [])
+        self.assertEqual(drive_runtime.state, DriveControlState.REPLANNING)
 
-    def test_route_following_not_blocked_after_collector_travel_confirmed(self) -> None:
+    def test_post_pickup_low_edge_clearance_tank_pivots_before_navigation(self) -> None:
         app = TopdownDetectorApp()
-        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
-        app.runtime.collector_state = CollectorPositionState.TRAVEL
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 2
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(20.0, 40.0, 0.0, 20.0, 40.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[
+                HybridPose(20.0, 10.0, math.pi * 0.5),
+                HybridPose(20.0, 40.0, 0.0),
+                HybridPose(20.0, 70.0, math.pi * 0.5),
+            ],
+            active_target=SimpleNamespace(track_id=1),
+            pickup_poses=[HybridPose(20.0, 40.0, 0.0), HybridPose(20.0, 70.0, math.pi * 0.5)],
+        )
+        app.runtime.route_cache_ball_signature = ((2, "white", 4, 14),)
+        app.runtime.route_cache_unload_extension_cm = 15.0
+        app.runtime.route_cache_target_id = 1
+        app.runtime.latest_smoothed_balls = [
+            SmoothedBallCoordinate(2, "white", (0, 0), (0, 0), 4, 20.0, 70.0),
+        ]
 
-        owns_control = app.ensure_collector_travel_position(drive_runtime)
+        self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.0))
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.POST_PICKUP_ALIGN)
+        self.assertEqual(
+            app.runtime.route_plan.points,
+            [HybridPose(20.0, 40.0, 0.0), HybridPose(20.0, 70.0, math.pi * 0.5)],
+        )
+        self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.1))
 
-        self.assertFalse(owns_control)
+        self.assertEqual(drive_runtime.state, DriveControlState.POST_PICKUP_ALIGN)
+        self.assertEqual(
+            dispatcher.commands[-1],
+            (
+                -app.config.drive.post_pickup_align_speed_pct,
+                app.config.drive.post_pickup_align_speed_pct,
+                True,
+            ),
+        )
+        app.runtime.robot_pose = RobotPose(20.0, 40.0, math.pi * 0.5, 20.0, 40.0)
+        self.assertTrue(app.update_pickup_state(drive_runtime, now_s=1.2))
+        self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
 
     def test_unload_endpoint_runs_pipe_only_double_unload_once(self) -> None:
         app = TopdownDetectorApp()
@@ -323,22 +760,28 @@ class DriveControlTests(unittest.TestCase):
         app.runtime.collector_state = CollectorPositionState.TRAVEL
         app.runtime.initial_total_balls = 1
         app.runtime.balls_collected = 1
-        app.runtime.robot_pose = RobotPose(25.0, 60.0, 0.0, 42.1, 60.0)
+        unload_x = app.config.robot.tuned_footprint_rear_from_origin_cm + app.config.robot.tuned_unload_extension_cm
+        unload_y = app.config.field.height_cm * 0.5
+        app.runtime.robot_pose = RobotPose(unload_x, unload_y, 0.0, 0.0, 0.0)
         app.runtime.route_plan = RoutePlan(
-            points=[HybridPose(40.0, 60.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
+            points=[HybridPose(unload_x + 10.0, unload_y, 0.0), HybridPose(unload_x, unload_y, 0.0)],
             active_target=None,
             pickup_poses=[],
-            unload_pose=HybridPose(25.0, 60.0, 0.0),
-            unload_goal_cm=(0.0, 60.0),
+            unload_pose=HybridPose(unload_x, unload_y, 0.0),
+            unload_goal_cm=(0.0, unload_y),
         )
         events = []
 
         class FakeRobotController:
-            def __init__(self, robot_ip: str) -> None:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
                 self.robot_ip = robot_ip
 
             def unload_full_cycle(self) -> str:
                 events.append("unload_full_cycle")
+                return "OK"
+
+            def turn(self, _degrees: float, _speed: int = 100) -> str:
+                events.append("turn")
                 return "OK"
 
             def pipe_down(self, units: float, speed: int) -> str:
@@ -363,12 +806,22 @@ class DriveControlTests(unittest.TestCase):
 
         with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
             owns_control = app.update_unload_state(drive_runtime, now_s=1.0)
+            self.assertIsNone(app.unload_thread)
+            self.assertEqual(app.runtime.unload_state, UnloadExecutionState.PRE_UNLOAD_PIVOT)
+            owns_after_pivot = app.update_unload_state(drive_runtime, now_s=1.05)
+            self.assertIsNone(app.unload_thread)
+            app.runtime.unload_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            owns_after_alignment = app.update_unload_state(drive_runtime, now_s=1.1)
             assert app.unload_thread is not None
             app.unload_thread.join(timeout=1.0)
-            owns_after_complete = app.update_unload_state(drive_runtime, now_s=1.1)
+            owns_after_complete = app.update_unload_state(drive_runtime, now_s=1.2)
 
         self.assertTrue(owns_control)
-        self.assertTrue(owns_after_complete)
+        self.assertTrue(owns_after_pivot)
+        self.assertTrue(owns_after_alignment)
+        self.assertFalse(owns_after_complete)
         self.assertEqual(
             events,
             ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
@@ -384,6 +837,92 @@ class DriveControlTests(unittest.TestCase):
         self.assertEqual(
             events,
             ["unload_full_cycle", "pipe_down 2.0 35", "pipe_up 2.0 35", "unload_full_cycle", "pipe_stop"],
+        )
+
+    def test_unload_visual_servo_recorrects_instead_of_dropping_after_settle_drift(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        unload_x = app.config.robot.tuned_footprint_rear_from_origin_cm + app.config.robot.tuned_unload_extension_cm
+        unload_y = app.config.field.height_cm * 0.5
+        app.runtime.robot_pose = RobotPose(unload_x, unload_y, 0.0, 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(unload_x + 10.0, unload_y, 0.0), HybridPose(unload_x, unload_y, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+            unload_pose=HybridPose(unload_x, unload_y, 0.0),
+            unload_goal_cm=(0.0, unload_y),
+        )
+        events = []
+
+        class FakeRobotController:
+            def __init__(self, robot_ip: str, **_kwargs: object) -> None:
+                self.robot_ip = robot_ip
+
+            def back(self, distance: float, speed_percent: int) -> str:
+                events.append(("back", distance, speed_percent))
+                return "OK"
+
+            def move(self, distance: float, speed_percent: int) -> str:
+                events.append(("move", distance, speed_percent))
+                return "OK"
+
+            def turn(self, degrees: float, speed_percent: int) -> str:
+                events.append(("turn", degrees, speed_percent))
+                return "OK"
+
+            def unload_full_cycle(self) -> str:
+                events.append(("unload_full_cycle",))
+                return "unexpected"
+
+        with patch("tools.topdown_object_detector.RobotController", FakeRobotController):
+            self.assertTrue(app.update_unload_state(drive_runtime, now_s=1.0))
+            self.assertEqual(app.runtime.unload_state, UnloadExecutionState.PRE_UNLOAD_PIVOT)
+            self.assertTrue(app.update_unload_state(drive_runtime, now_s=1.05))
+            app.runtime.unload_alignment_settle_started_s = (
+                time.perf_counter() - app.config.drive.visual_servo_settle_time_s - 0.01
+            )
+            app.runtime.robot_pose = RobotPose(unload_x + 5.0, unload_y, 0.0, 0.0, 0.0)
+            self.assertTrue(app.update_unload_state(drive_runtime, now_s=1.1))
+
+        self.assertIsNone(app.unload_thread)
+        self.assertEqual(app.runtime.unload_state, UnloadExecutionState.ALIGNING)
+        self.assertIn(("back", 3.0, int(round(app.config.drive.near_zone_move_speed_pct))), events)
+        self.assertNotIn(("unload_full_cycle",), events)
+
+    def test_unload_staging_pivot_suspends_xte_and_tank_turns(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        unload_y = app.config.field.height_cm * 0.5
+        app.runtime.robot_pose = RobotPose(55.0, unload_y, math.radians(90.0), 0.0, 0.0)
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(90.0, unload_y, 0.0), HybridPose(50.0, unload_y, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+            unload_pose=HybridPose(50.0, unload_y, 0.0),
+            unload_goal_cm=(0.0, unload_y),
+        )
+
+        owns_control = app.update_unload_state(drive_runtime, now_s=1.0)
+        pivot_owns_control = app.update_unload_state(drive_runtime, now_s=1.1)
+
+        self.assertTrue(owns_control)
+        self.assertTrue(pivot_owns_control)
+        self.assertEqual(app.runtime.unload_state, UnloadExecutionState.PRE_UNLOAD_PIVOT)
+        self.assertEqual(drive_runtime.state, DriveControlState.PRE_UNLOAD_PIVOT)
+        self.assertEqual(dispatcher.commands[0][:2], (0.0, 0.0))
+        self.assertEqual(
+            dispatcher.commands[-1],
+            (
+                app.config.drive.unload_pivot_speed_pct,
+                -app.config.drive.unload_pivot_speed_pct,
+                True,
+            ),
         )
 
     def test_unload_endpoint_waits_for_optimistic_collection_complete(self) -> None:
@@ -452,17 +991,119 @@ class DriveControlTests(unittest.TestCase):
 
         self.assertEqual(app.runtime.route_plan.points, [])
 
+    def test_collection_complete_routes_to_unload_even_if_balls_are_visible(self) -> None:
+        app = TopdownDetectorApp()
+        app.runtime.initial_total_balls = 1
+        app.runtime.balls_collected = 1
+        app.runtime.pickup_state = PickupExecutionState.NAVIGATION
+        app.runtime.robot_pose = RobotPose(40.0, 40.0, 0.0, 40.0, 40.0)
+        visible_ball = SmoothedBallCoordinate(7, "white", (0, 0), (0, 0), 4, 80.0, 80.0)
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        grid = np.zeros((app.config.field.grid_height_cm, app.config.field.grid_width_cm), dtype=np.uint8)
+        result = VisionFrameResult(
+            raw_frame=frame,
+            preprocessed=PreprocessedFrame(
+                undistorted=frame,
+                topdown=frame,
+                normalized=None,
+                calibration_state=CalibrationState.CALIBRATED_AUTO,
+                transform_matrix=None,
+                camera_ground_projection=None,
+            ),
+            frame_for_detection=frame,
+            red_zones=[],
+            red_mask=np.zeros((4, 4), dtype=np.uint8),
+            white_balls=[],
+            orange_balls=[],
+            ball_masks={},
+            smoothed_ball_coordinates=[visible_ball],
+            occupancy_grid=grid,
+        )
+        submitted_requests: list[RoutePlanningRequest] = []
+
+        class FakeAsyncRoutePlanner:
+            def is_busy(self) -> bool:
+                return False
+
+            def poll_completed(self) -> None:
+                return None
+
+            def submit(self, request: RoutePlanningRequest) -> bool:
+                submitted_requests.append(request)
+                return True
+
+        app.async_route_planner = FakeAsyncRoutePlanner()
+
+        app.update_route(result, {"unload_extension_cm": 15.0})
+
+        self.assertEqual(len(submitted_requests), 1)
+        self.assertEqual(submitted_requests[0].ball_targets, [])
+        self.assertEqual(submitted_requests[0].ball_signature, ())
+
+    def test_short_pose_loss_preserves_cached_route_and_stops(self) -> None:
+        app = TopdownDetectorApp()
+        dispatcher = FakeDispatcher()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=dispatcher)
+        route = [HybridPose(10.0, 10.0, 0.0), HybridPose(20.0, 10.0, 0.0)]
+        app.runtime.route_plan = RoutePlan(points=route, active_target=None, pickup_poses=[])
+        app.runtime.robot_pose = None
+        app.runtime.pose_missing_frames = app.config.camera.pose_loss_grace_frames
+
+        app.enforce_pose_loss_route_policy(drive_runtime)
+        app.drive_guard.update_drive_control(
+            None,
+            app.runtime.route_plan.points,
+            drive_runtime,
+            clear_route_cache=app.runtime.clear_route,
+        )
+
+        self.assertEqual(app.runtime.route_plan.points, route)
+        self.assertEqual(drive_runtime.state, DriveControlState.NO_POSE)
+        self.assertEqual(dispatcher.commands[-1][:2], (0.0, 0.0))
+
+    def test_sustained_pose_loss_clears_cached_route(self) -> None:
+        app = TopdownDetectorApp()
+        drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
+        app.runtime.route_plan = RoutePlan(
+            points=[HybridPose(10.0, 10.0, 0.0), HybridPose(20.0, 10.0, 0.0)],
+            active_target=None,
+            pickup_poses=[],
+        )
+        app.runtime.robot_pose = None
+        app.runtime.pose_missing_frames = app.config.camera.pose_loss_clear_route_frames + 1
+
+        app.enforce_pose_loss_route_policy(drive_runtime)
+
+        self.assertEqual(app.runtime.route_plan.points, [])
+        self.assertIn("route cleared", drive_runtime.last_message)
+
+    def test_camera_focus_locks_after_ball_count_prep(self) -> None:
+        app = TopdownDetectorApp()
+        cap = FakeCapture()
+
+        app.configure_camera_prep_focus(cap, "test camera")
+        self.assertEqual(cap.set_calls[-1], (cv2.CAP_PROP_AUTOFOCUS, 1.0))
+
+        app.lock_camera_focus_after_prep(cap, "test camera")
+        first_lock_calls = list(cap.set_calls)
+        app.lock_camera_focus_after_prep(cap, "test camera")
+
+        self.assertEqual(first_lock_calls, cap.set_calls)
+        self.assertIn((cv2.CAP_PROP_AUTOFOCUS, 0.0), cap.set_calls)
+        self.assertIn((cv2.CAP_PROP_FOCUS, app.config.camera.manual_focus_value), cap.set_calls)
+
     def test_final_pickup_preserves_existing_unload_route_when_collection_complete(self) -> None:
         app = TopdownDetectorApp()
         drive_runtime = DriveRuntime(enabled=True, dispatcher=FakeDispatcher())
         app.runtime.initial_total_balls = 1
         app.runtime.balls_collected = 1
         app.runtime.pickup_state = PickupExecutionState.REPLAN
+        app.runtime.robot_pose = RobotPose(40.0, 40.0, 0.0, 40.0, 40.0)
         app.runtime.route_plan = RoutePlan(
-            points=[HybridPose(10.0, 0.0, 0.0), HybridPose(25.0, 60.0, 0.0)],
+            points=[HybridPose(40.0, 40.0, 0.0), HybridPose(55.0, 60.0, 0.0)],
             active_target=None,
-            pickup_poses=[HybridPose(10.0, 0.0, 0.0)],
-            unload_pose=HybridPose(25.0, 60.0, 0.0),
+            pickup_poses=[HybridPose(40.0, 40.0, 0.0)],
+            unload_pose=HybridPose(55.0, 60.0, 0.0),
             unload_goal_cm=(0.0, 60.0),
         )
 
@@ -471,6 +1112,7 @@ class DriveControlTests(unittest.TestCase):
         self.assertTrue(owns_control)
         self.assertTrue(app.runtime.route_plan.points)
         self.assertIsNotNone(app.runtime.route_plan.unload_pose)
+        self.assertEqual(app.runtime.route_plan.pickup_poses, [])
         self.assertEqual(app.runtime.pickup_state, PickupExecutionState.NAVIGATION)
         self.assertEqual(drive_runtime.last_message, "pickup complete; routing to unload")
 

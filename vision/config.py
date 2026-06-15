@@ -76,6 +76,11 @@ class CameraConfig:
     lk_max_level: int = 3
     lk_criteria_count: int = 30
     lk_criteria_epsilon: float = 0.01
+    pose_loss_grace_frames: int = 3
+    pose_loss_clear_route_frames: int = 15
+    lock_focus_after_ball_count: bool = True
+    camera_autofocus_enabled_during_prep: bool = True
+    manual_focus_value: float = 0.0
 
     @property
     def lk_params(self) -> dict[str, object]:
@@ -128,7 +133,7 @@ class RobotGeometryConfig:
     tuned_tube_offset_cm: float = 17.1
     tuned_tube_right_offset_cm: float = 0.0
     tube_width_cm: float = 6.0
-    tuned_unload_extension_cm: float = 15.0
+    tuned_unload_extension_cm: float = 30.0
 
     @property
     def front_axle_from_origin_cm(self) -> float:
@@ -179,7 +184,7 @@ class DetectionConfig:
     yolo_conf_pct: int = 50
     yolo_min_area: int = 157
     yolo_max_area: int = 1580
-    cam_height_cm: int = 179
+    cam_height_cm: int = 184
     calib_z_cm: int = 7
     heading_tuning: int = 180
 
@@ -292,6 +297,9 @@ class PlannerConfig:
     flexible_standoff_max_cm: float = 15.0
     flexible_standoff_min_cm: float = 0.0
     flexible_standoff_heading_tolerance_rad: float = math.radians(10.0)
+    unload_staging_margin_cm: float = 2.0
+    wall_pickup_prefer_distance_cm: float = 12.0
+    wall_pickup_perpendicular_tolerance_rad: float = math.radians(35.0)
     num_intermediate_snapshots: int = 0
     route_heading_marker_interval: int = 20
     route_target_move_invalidate_cm: float = 5.0
@@ -312,10 +320,10 @@ class PlannerConfig:
 
 @dataclass(frozen=True)
 class DriveConfig:
-    """Integrated drive-control and UDP dispatch tuning."""
+    """Integrated drive-control and TCP dispatch tuning."""
 
-    robot_ip: str = "192.168.1.42"
-    robot_udp_port: int = 5556
+    robot_ip: str = "ev3dev"
+    robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     max_cross_track_error_cm: float = 8.0
     base_speed_pct: float = 38.0
@@ -330,6 +338,15 @@ class DriveConfig:
     near_zone_cm: float = 15.0
     near_zone_turn_speed_pct: float = 30.0
     near_zone_move_speed_pct: float = 7.0
+    visual_servo_noise_floor_cm: float = 0.25
+    visual_servo_min_improvement_cm: float = 0.08
+    visual_servo_stall_frames: int = 3
+    visual_servo_max_iterations: int = 12
+    visual_servo_turn_kp: float = 0.85
+    visual_servo_min_turn_deg: float = 0.25
+    visual_servo_max_turn_deg: float = 8.0
+    visual_servo_min_turn_speed_pct: float = 8.0
+    visual_servo_settle_time_s: float = 0.5
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
     edge_max_gain_scale: float = 1.6
@@ -346,6 +363,24 @@ class DriveConfig:
     manual_move_speed: int = 40
     manual_turn_degrees: int = 15
     manual_turn_speed: int = 30
+    drive_calibration_turn_degrees: float = 360.0
+    drive_calibration_move_cm: float = 10.0
+    drive_calibration_turn_speed_pct: float = 20.0
+    drive_calibration_move_speed_pct: float = 15.0
+    drive_calibration_settle_time_s: float = 0.5
+    drive_calibration_min_actual_turn_deg: float = 45.0
+    drive_calibration_min_actual_distance_cm: float = 1.0
+    drive_calibration_max_origin_disagreement_cm: float = 3.0
+    post_pickup_escape_clearance_cm: float = 4.0
+    post_pickup_align_clearance_cm: float = 12.0
+    post_pickup_escape_back_cm: float = 8.0
+    post_pickup_escape_speed_pct: float = 8.0
+    post_pickup_align_tolerance_deg: float = 15.0
+    post_pickup_align_speed_pct: float = 18.0
+    route_tracking_lookahead_segments: int = 12
+    unload_staging_distance_cm: float = 10.0
+    unload_pivot_tolerance_deg: float = 12.0
+    unload_pivot_speed_pct: float = 18.0
     unload_trigger_distance_cm: float = 8.0
     unload_pipe_shake_units: float = 2.0
     unload_pipe_shake_speed: int = 35

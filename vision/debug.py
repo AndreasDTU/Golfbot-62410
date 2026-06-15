@@ -9,7 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from pathfinding.models import HybridPose, RouteSegmentType
+from pathfinding.models import HybridPose, PlannedBallTarget, RouteSegmentType
 from pathfinding.planner import HybridAStarPlanner
 from robot.control import WheelCommandController, route_checkpoint_indices
 from robot.localization import RobotPoseEstimator
@@ -28,7 +28,7 @@ from vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinat
 
 @dataclass(frozen=True)
 class NearZoneVisualBreak:
-    """Rendered handoff point between UDP route tracking and TCP pickup motion."""
+    """Rendered handoff point between TCP route tracking and TCP pickup motion."""
 
     checkpoint_index: int
     segment_index: int
@@ -85,6 +85,45 @@ class DebugRenderer:
         for start, end in zip(route_points_cm[:-1], route_points_cm[1:]):
             cumulative.append(cumulative[-1] + math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm))
         return cumulative
+
+    @staticmethod
+    def closest_route_index(route_points_cm: list[HybridPose], pose: HybridPose) -> int | None:
+        """Return the closest route sample to a semantic route pose."""
+        if not route_points_cm:
+            return None
+        best_index = 0
+        best_distance_sq = float("inf")
+        for index, route_point in enumerate(route_points_cm):
+            dx = route_point.x_cm - pose.x_cm
+            dy = route_point.y_cm - pose.y_cm
+            distance_sq = dx * dx + dy * dy
+            if distance_sq < best_distance_sq:
+                best_index = index
+                best_distance_sq = distance_sq
+        return best_index
+
+    @staticmethod
+    def distance_sq_point_to_route_segment(
+        point_cm: tuple[float, float],
+        start: HybridPose,
+        end: HybridPose,
+    ) -> float:
+        """Return squared distance from a field point to a finite route segment."""
+        px, py = point_cm
+        dx = end.x_cm - start.x_cm
+        dy = end.y_cm - start.y_cm
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-9:
+            closest_x = start.x_cm
+            closest_y = start.y_cm
+        else:
+            t = ((px - start.x_cm) * dx + (py - start.y_cm) * dy) / length_sq
+            t = float(np.clip(t, 0.0, 1.0))
+            closest_x = start.x_cm + t * dx
+            closest_y = start.y_cm + t * dy
+        closest_dx = px - closest_x
+        closest_dy = py - closest_y
+        return closest_dx * closest_dx + closest_dy * closest_dy
 
     @staticmethod
     def segment_circle_intersection_t(
@@ -176,7 +215,7 @@ class DebugRenderer:
         route_segment_types: list[RouteSegmentType] | None = None,
         route_segment_speeds_pct: list[float] | None = None,
     ) -> None:
-        """Draw route heatmap as UDP tracking up to near-zone, then TCP straight pickup."""
+        """Draw route heatmap as TCP route tracking up to near-zone, then TCP straight pickup."""
         if len(route_points_cm) < 2:
             return
         if route_segment_speeds_pct is not None and len(route_segment_speeds_pct) >= len(route_points_cm) - 1:
@@ -262,6 +301,98 @@ class DebugRenderer:
             )
             cv2.circle(schematic, boundary_px, 6, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.circle(schematic, boundary_px, 8, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def draw_ball_avoidance_debug(
+        self,
+        schematic: np.ndarray,
+        route_points_cm: list[HybridPose] | None,
+        route_pickup_poses_cm: list[HybridPose] | None,
+        ball_obstacles: list[PlannedBallTarget] | None,
+        ball_obstacle_radius_cm: float,
+        geometry: RobotGeometry,
+    ) -> None:
+        """Draw soft ball-avoidance zones and route samples that enter them."""
+        if not ball_obstacles or ball_obstacle_radius_cm <= 0.0:
+            return
+
+        x_px_per_cm = (self.window.schematic_width_px - 1) / max(1.0, self.field.width_cm)
+        y_px_per_cm = (self.window.schematic_height_px - 1) / max(1.0, self.field.height_cm)
+        radius_px = max(1, int(round(ball_obstacle_radius_cm * min(x_px_per_cm, y_px_per_cm))))
+        route_points = route_points_cm or []
+        obstacle_by_id = {obstacle.track_id: obstacle for obstacle in ball_obstacles}
+        active_track_ids = set(obstacle_by_id)
+        collision_track_ids: set[int] = set()
+        radius_sq = ball_obstacle_radius_cm * ball_obstacle_radius_cm
+        pickup_match_threshold_sq = 2.0 * 2.0
+        pickup_events: dict[int, int | None] = {}
+
+        for pickup_pose in route_pickup_poses_cm or []:
+            pickup_index = self.closest_route_index(route_points, pickup_pose)
+            if pickup_index is None:
+                continue
+            tube_x, tube_y = HybridAStarPlanner.tube_center_for_pose(pickup_pose, geometry)
+            nearest_track_id: int | None = None
+            nearest_distance_sq = pickup_match_threshold_sq
+            for obstacle in ball_obstacles:
+                dx = tube_x - obstacle.x_cm
+                dy = tube_y - obstacle.y_cm
+                distance_sq = dx * dx + dy * dy
+                if distance_sq <= nearest_distance_sq:
+                    nearest_track_id = obstacle.track_id
+                    nearest_distance_sq = distance_sq
+            pickup_events[pickup_index] = nearest_track_id
+
+        target_by_segment_index: dict[int, int | None] = {}
+        sorted_pickups = sorted(pickup_events.items())
+        previous_pickup_index = -1
+        for pickup_index, track_id in sorted_pickups:
+            segment_start = max(0, previous_pickup_index)
+            for segment_index in range(segment_start, min(pickup_index, max(0, len(route_points) - 1))):
+                target_by_segment_index[segment_index] = track_id
+            previous_pickup_index = pickup_index
+
+        for segment_index, (start, end) in enumerate(zip(route_points[:-1], route_points[1:])):
+            current_target_track_id = target_by_segment_index.get(segment_index)
+
+            for track_id in list(active_track_ids):
+                if track_id == current_target_track_id or track_id in collision_track_ids:
+                    continue
+                obstacle = obstacle_by_id[track_id]
+                distance_sq = self.distance_sq_point_to_route_segment((obstacle.x_cm, obstacle.y_cm), start, end)
+                if distance_sq <= radius_sq:
+                    collision_track_ids.add(track_id)
+                    active_track_ids.discard(track_id)
+
+            pickup_route_index = segment_index + 1
+            if pickup_route_index in pickup_events:
+                picked_track_id = pickup_events[pickup_route_index]
+                if picked_track_id is not None:
+                    active_track_ids.discard(picked_track_id)
+
+        overlay = schematic.copy()
+        for obstacle in ball_obstacles:
+            center = self.mapper.field_metric_cm_to_schematic((obstacle.x_cm, obstacle.y_cm))
+            cv2.circle(overlay, center, radius_px, (0, 220, 255), 2, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.28, schematic, 0.72, 0.0, schematic)
+
+        for obstacle in ball_obstacles:
+            if obstacle.track_id not in collision_track_ids:
+                continue
+            center = self.mapper.field_metric_cm_to_schematic((obstacle.x_cm, obstacle.y_cm))
+            cv2.circle(schematic, center, radius_px + 4, (0, 0, 255), 4, cv2.LINE_AA)
+            cv2.drawMarker(schematic, center, (0, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 3, cv2.LINE_AA)
+            text = "COLLISION"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.55
+            thickness = 2
+            (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            text_x = center[0] + radius_px + 8
+            if text_x + text_width > self.window.schematic_width_px - 1:
+                text_x = max(0, center[0] - radius_px - 8 - text_width)
+            text_y = center[1] - radius_px - 8
+            if text_y < text_height + baseline:
+                text_y = min(self.window.schematic_height_px - baseline - 1, center[1] + radius_px + text_height + 8)
+            cv2.putText(schematic, text, (text_x, text_y), font, font_scale, (0, 0, 255), thickness, cv2.LINE_AA)
 
     def robot_footprint_metric_polygons(
         self,
@@ -886,6 +1017,8 @@ class DebugRenderer:
         route_segment_speeds_pct: list[float] | None = None,
         route_unload_pose_cm: HybridPose | None = None,
         route_unload_goal_cm: tuple[float, float] | None = None,
+        route_ball_obstacles: list[PlannedBallTarget] | None = None,
+        route_ball_obstacle_radius_cm: float = 0.0,
         selected_start_cm: tuple[int, int] | None = None,
         selected_ball_track_id: int | None = None,
         robot_pose: RobotPose | None = None,
@@ -940,6 +1073,14 @@ class DebugRenderer:
 
         geometry = self.robot_geometry_from_params(params)
         if route_points_cm:
+            self.draw_ball_avoidance_debug(
+                schematic,
+                route_points_cm,
+                route_pickup_poses_cm,
+                route_ball_obstacles,
+                route_ball_obstacle_radius_cm,
+                geometry,
+            )
             self.draw_velocity_profile_route(
                 schematic,
                 route_points_cm,

@@ -1,5 +1,7 @@
 import socket
 
+from robot.drive_calibration import DriveCalibrationValues, parse_drive_calibration_response
+
 class RobotController:
 
     def __init__(self, robot_ip = "ev3dev", port=5555, timeout=15.0, connect_retries=1):
@@ -30,12 +32,34 @@ class RobotController:
             return self.sock.recv(1024).decode('utf-8').strip()
         except OSError as exc:
             raise RuntimeError(f"EV3 command failed after send attempt ({cmd!r}): {exc}") from exc
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def send_wheel_speeds(self, left_pct, right_pct):
+        return self._send(f"LR {left_pct} {right_pct}")
     
     def move(self, distance, speedPercent = 100):
         return self._send(f"move {distance} {speedPercent}")
 
+    def back(self, distance, speedPercent = 100):
+        return self._send(f"back {distance} {speedPercent}")
+
     def turn(self, degrees, speedPercent = 100):
         return self._send(f"turn {degrees} {speedPercent}")
+
+    def get_drive_calibration(self):
+        """Read the active EV3 drive calibration constants."""
+        return parse_drive_calibration_response(self._send("drivecal get"))
+
+    def set_drive_calibration(self, axle_track_mm, mm_per_unit):
+        """Persist and apply EV3 drive calibration constants."""
+        values = DriveCalibrationValues(float(axle_track_mm), float(mm_per_unit))
+        response = self._send(f"drivecal set {values.axle_track_mm:.6f} {values.mm_per_unit:.6f}")
+        return parse_drive_calibration_response(response)
 
     def collector_travel_position(self):
         """Raise or keep the collector in its safe driving position."""

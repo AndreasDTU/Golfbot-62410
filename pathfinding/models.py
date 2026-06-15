@@ -87,6 +87,9 @@ class HybridPlannerConfig:
     flexible_standoff_max_cm: float = 15.0
     flexible_standoff_min_cm: float = 0.0
     flexible_standoff_heading_tolerance_rad: float = math.radians(10.0)
+    unload_staging_margin_cm: float = 2.0
+    wall_pickup_prefer_distance_cm: float = 12.0
+    wall_pickup_perpendicular_tolerance_rad: float = math.radians(35.0)
     avoid_non_target_balls_enabled: bool = True
     ball_radius_cm: float = 2.0
     non_target_ball_extra_clearance_cm: float = 0.0

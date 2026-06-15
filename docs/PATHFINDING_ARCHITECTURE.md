@@ -142,7 +142,7 @@ they are not part of the public route model.
 The route is expressed in robot body-center coordinates. Ball pickup goals are
 generated as paired poses:
 
-- a standoff pose where UDP route tracking stops
+- a standoff pose where TCP route tracking stops
 - a final pickup pose where the TCP encoder move ends and the tube center is on
   the ball
 
@@ -176,6 +176,19 @@ the planner accepts that pose as the handoff point. This lets the robot stop,
 pivot, and start the TCP sneak immediately when it is already close instead of
 backing up to exactly 15 cm.
 
+For balls close to a field wall, the pickup-standoff search first tries only
+wall-normal approach headings. This keeps the robot from choosing wall-parallel
+approaches when a perpendicular approach is available. If no wall-normal route
+can be found, the planner falls back to all hard-valid pickup approaches so a
+wall ball is not skipped merely because the preferred approach is blocked.
+
+Tightly cornered balls use a deterministic diagonal pickup fallback before the
+normal standoff ring. If the exact tube-center-over-ball pose would put the
+robot body outside the legal footprint, the corner fallback may back the body
+away by a few centimeters as long as the ball remains inside the intake-mouth
+capture tolerance. This keeps deepest-corner balls routeable without relaxing
+hard wall or robot-body collision checks.
+
 Before a route segment is returned, Hybrid A* applies a greedy pruning pass. A
 middle node is removed when the anchor node has a sampled collision-free straight
 segment to a later node and that shortcut does not enter a worse soft-cost band
@@ -194,17 +207,21 @@ target ball directly. The final pose is then the straight-line creep endpoint
 whose tube center lands on the ball. This keeps smoothing from removing the
 controlled TCP creep sequence.
 
-Pickup-standoff search uses progressive fallback when the standard soft-cost
-attempt exhausts its expansion budget:
+Pickup-standoff search uses progressive fallback when the preferred/standard
+soft-cost attempt exhausts its expansion budget:
 
-1. Standard weighted A* with normal soft ball costs.
+1. Wall-normal preferred weighted A* for near-wall balls, otherwise standard
+   weighted A* with normal soft ball costs.
 2. Relaxed soft costs, with the ball costmap scaled to 10% of its original
    values.
-3. Desperation mode, with no soft ball costs, `heuristic_weight = 1.0`, and the
+3. All hard-valid pickup approaches for near-wall balls whose wall-normal
+   preferred attempt failed.
+4. Desperation mode, with no soft ball costs, `heuristic_weight = 1.0`, and the
    flexible handoff heading tolerance widened to 30 degrees.
 
 These fallbacks never relax hard red-zone, wall, or robot-footprint validity.
-If no hard-valid standoff/final pickup pair exists, the target is still rejected
+If no hard-valid standoff/final pickup pair exists and the tight-corner fallback
+cannot produce a body-valid intake-mouth pose, the target is still rejected
 before search begins.
 
 ## Route Cache
@@ -224,41 +241,65 @@ external `autonomous_navigator.py` flow is not required for closed-loop driving.
 After the required vision pipeline and Hybrid A* route update, the detector:
 
 - estimates the live robot pose from calibrated ArUco markers
-- projects the robot origin onto the closest cached Hybrid A* route segment
-- computes cross-track error (XTE) as the shortest segment distance
+- projects the robot origin onto the current/future cached Hybrid A* route
+  window using a monotonic route-progress cursor
+- computes cross-track error (XTE) from that progress-aware segment projection
 - computes heading error against that segment heading
 - converts those errors into bounded left/right differential-drive speeds
 - dispatches the wheel-speed command directly to the robot microcontroller
 
-Dispatch uses best-effort non-blocking UDP so the OpenCV frame loop never waits
-for robot acknowledgements. The default command payload is:
+The route-progress cursor resets whenever a new route object is installed. While
+tracking a route, it only advances; the controller does not search previous
+segments again. This prevents old route geometry, loopbacks, or close
+intersections from stealing XTE control after the robot has already passed that
+part of the plan. `DriveConfig.route_tracking_lookahead_segments` controls how
+many future route segments remain eligible for projection.
+
+Dispatch uses the EV3 TCP command server for the entire `--drive` scenario,
+including continuous route-following wheel speeds and calibrated pickup moves.
+The default route-following command payload is:
 
 ```text
 LR <left_speed_pct> <right_speed_pct>
 ```
 
-The robot endpoint is configured in `topdown_object_detector.py` with
-`ROBOT_IP`, `ROBOT_UDP_PORT`, and `ROBOT_COMMAND_FORMAT`. The `--drive` flag is
-the only runtime switch for hardware dispatch. Without `--drive`, the controller
-still computes and visualizes XTE and motor commands, but no hardware packets
-are sent.
+The robot endpoint is configured through `DriveConfig.robot_ip`,
+`DriveConfig.robot_tcp_port`, and `DriveConfig.robot_command_format`. The
+`--drive` flag is the only runtime switch for hardware dispatch. Without
+`--drive`, the controller still computes and visualizes XTE and motor commands,
+but no hardware commands are sent.
 
 If XTE exceeds `MAX_CROSS_TRACK_ERROR_CM` (8 cm by default), the detector sends
 a zero-speed STOP command, invalidates the cached route, and immediately runs a
 fresh Hybrid A* search from the deviated robot pose. Motor output resumes only
 after a valid route is cached again.
 
-Near pickup targets, the drive loop switches from UDP velocity control to
-calibrated TCP position control:
+Near pickup targets, the drive loop switches from TCP wheel-speed tracking to
+calibrated TCP position control on the same command server:
 
-1. Confirm or command `collector_travel_position()` before route following.
-2. Stop UDP wheel output with `LR 0 0`.
-3. Compute the current heading error to the final pickup pose.
-4. Execute blocking TCP `turn(degrees, speedPercent)`.
-5. Execute blocking TCP `move(distance, speedPercent)`.
-6. Run the collection-only `pickup_assist()` pipe command.
-7. Return the collector state to `TRAVEL`.
-8. Continue to pickup/replan after the assist motion completes.
+1. Stop TCP wheel output with `LR 0 0`.
+2. Compute the current heading error to the final pickup pose.
+3. Execute blocking TCP `turn(degrees, speedPercent)`.
+4. Enter a visual-servo loop that consumes one refreshed pose/ball observation
+   per frame.
+5. While alignment is still improving, compute the lateral ball error in the
+   robot frame and execute proportional TCP micro-turns. Turn angle and speed
+   shrink as the measured error approaches zero.
+6. Stop aligning only when the lateral error reaches the configured camera
+   noise floor, improvement stalls for the configured number of frames, or the
+   bounded iteration limit is reached.
+7. Force a zero-speed TCP stop, wait for the configured settling interval, and
+   verify the lateral error on a fresh camera frame.
+8. Execute blocking TCP `move(distance, speedPercent)` only if post-settle
+   verification still passes.
+9. Run the collection-only `pickup_assist()` pipe command.
+10. Before normal XTE tracking resumes, run post-pickup wall recovery when the
+   body is near an edge. Critical edge clearance triggers one low-speed TCP
+   `back(...)`, clears the route cache, and requests a fresh route from the
+   backed-out pose. Less severe edge proximity triggers an in-place `LR +/-
+   speed` pivot toward the next pickup or unload goal.
+11. Continue along the cached global route unless visible remaining balls no
+   longer match the original plan.
 
 The near-zone TCP turn speed is configured through `DriveConfig`; the TCP move
 speed defaults to the same low creep speed used in planner segment metadata.
@@ -275,9 +316,54 @@ count. If stable visible balls exceed the expected visible count, the pickup is
 treated as missed and `balls_collected` is decremented so the ball can be routed
 again.
 
-When any of those checks fails, the cache is cleared and the next frame replans.
-This keeps the UI responsive while still reacting to target collection, target
-motion, and robot drift.
+During that same prep phase, live camera mode can leave webcam autofocus enabled
+so the field plane can settle. Once the initial ball count is stable, the
+detector makes a best-effort OpenCV request to disable autofocus and set the
+configured manual focus value. Backends that ignore these UVC controls are
+reported through the focus-lock readback print, but they do not abort the run.
+
+If ArUco robot pose is lost briefly during drive, the controller now sends
+zero-speed output and preserves the cached route for the configured pose-loss
+window. This handles short blur/autofocus dropouts without forcing a costly
+route reset. If pose remains missing beyond the configured clear-route frame
+count, the cached route is cleared and the robot stays stopped until a valid
+pose can seed a new route.
+
+Pickup completion no longer clears the route unconditionally. The detector
+keeps following the cached global route when the current visible balls remain a
+stationary subset of the balls used for the plan. It clears/replans only when a
+remaining ball crosses the configured target-move bucket, a new/previously
+hidden ball appears, robot drift invalidates the route, or route metadata no
+longer matches the active geometry.
+
+If `balls_collected >= initial_total_balls` and the robot pose is visible, route
+planning ignores any remaining visible ball detections and submits an empty
+target list as an explicit request to route directly from the current robot pose
+to the fixed small-goal staging pose. This keeps recalculation and noisy late
+detections from sending the robot back into collection mode after the internal
+state says collection is complete.
+
+The unload route no longer asks Hybrid A* to dock backwards into the goal. It
+targets one fixed robot body-center pose that is perpendicular to the left wall:
+`x = goal_x + rear_cm + unload_extension_cm + unload_staging_margin_cm`,
+`y = field.height_cm / 2`, `theta = 0`. This places the lowered pipe tip a small
+configurable margin away from the small-goal center while keeping the body
+square to the goal.
+
+Before the autonomous unload pipe sequence is allowed to run, the drive loop
+intercepts the final unload route once the robot body reaches that fixed staging
+pose. It stops normal XTE tracking with `LR 0 0`, enters `PRE_UNLOAD_PIVOT`,
+and tank-steers in place until the robot rear roughly faces the goal. This
+keeps XTE out of the final unload maneuver near the wall.
+
+After the rough stationary pivot, the drive loop performs reverse visual
+servoing. The controller computes the live rear unload tip from
+`rear_cm + unload_extension_cm`, turns so the robot rear faces the goal, and
+issues small TCP `move`/`back` corrections until the rear tip is within the
+configured visual-servo noise floor. The final drop is accepted only after a
+forced zero-speed stop, the configured settling interval, and a fresh-frame
+verification that the rear tip is still on the goal and the robot heading is
+within the allowed left-wall unload arc.
 
 If no ball is reachable, that negative result is cached too. The cache is still
 invalidated by ball-set changes or robot drift, which avoids repeating the most

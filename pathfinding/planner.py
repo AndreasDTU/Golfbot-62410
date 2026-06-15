@@ -354,12 +354,16 @@ class HybridAStarPlanner:
         """Return the fixed small-goal center on the left side of the field."""
         return 0.0, self.field.height_cm * 0.5
 
-    def small_goal_unload_pose(self, geometry: RobotGeometry) -> HybridPose:
-        """Return the base pose whose rear unload tip reaches the small goal."""
+    def small_goal_unload_pose(
+        self,
+        geometry: RobotGeometry,
+        margin_cm: float = 0.0,
+    ) -> HybridPose:
+        """Return the fixed perpendicular body-center pose for small-goal unloading."""
         goal_x, goal_y = self.small_goal_center_cm()
         reach_cm = geometry.rear_cm + geometry.unload_extension_cm
         return HybridPose(
-            x_cm=goal_x + reach_cm,
+            x_cm=goal_x + reach_cm + max(0.0, margin_cm),
             y_cm=goal_y,
             theta_rad=0.0,
         )
@@ -420,9 +424,9 @@ class HybridAStarPlanner:
         return max(0.0, cost - 3.0) + y_error_cm * 2.0 + heading_error_rad * 6.0
 
     def small_goal_staging_center_cm(self, geometry: RobotGeometry) -> tuple[float, float]:
-        """Return a broad staging target near the small goal but away from the wall."""
-        reach_cm = geometry.rear_cm + geometry.unload_extension_cm
-        return max(reach_cm + 18.0, 42.0), self.field.height_cm * 0.5
+        """Return the fixed robot-origin staging target for small-goal unloading."""
+        pose = self.small_goal_unload_pose(geometry, self.config.unload_staging_margin_cm)
+        return pose.x_cm, pose.y_cm
 
     def search_staging_region(
         self,
@@ -695,20 +699,38 @@ class HybridAStarPlanner:
         goal_node: tuple[int, int],
         geometry: RobotGeometry,
         goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig | None = None,
     ) -> list[HybridPose]:
         """Return deterministic diagonal pickup poses for a tightly cornered ball."""
         heading_rad = self.tight_corner_pickup_heading(goal_point_cm)
         if heading_rad is None:
             return []
-        return [
-            self.pickup_aligned_pose_for_theta(
-                goal_node,
-                normalize_planner_angle(heading_rad + math.radians(offset_deg)),
-                geometry,
-                goal_point_cm,
-            )
-            for offset_deg in self.CORNER_PICKUP_HEADING_OFFSETS_DEG
-        ]
+        cfg = config or self.config
+        max_backoff_cm = max(0.0, self.robot_config.tube_width_cm * 0.5 + cfg.ball_radius_cm)
+        backoff_steps = max(1, int(math.ceil(max_backoff_cm / 0.5)))
+        candidates: list[HybridPose] = []
+        seen: set[tuple[int, int, int]] = set()
+        for offset_deg in self.CORNER_PICKUP_HEADING_OFFSETS_DEG:
+            theta_rad = normalize_planner_angle(heading_rad + math.radians(offset_deg))
+            exact_pose = self.pickup_aligned_pose_for_theta(goal_node, theta_rad, geometry, goal_point_cm)
+            forward = (math.cos(theta_rad), math.sin(theta_rad))
+            for step in range(backoff_steps + 1):
+                backoff_cm = min(max_backoff_cm, step * 0.5)
+                pose = HybridPose(
+                    x_cm=exact_pose.x_cm - forward[0] * backoff_cm,
+                    y_cm=exact_pose.y_cm - forward[1] * backoff_cm,
+                    theta_rad=exact_pose.theta_rad,
+                )
+                key = (
+                    int(round(pose.x_cm * 10.0)),
+                    int(round(pose.y_cm * 10.0)),
+                    self.theta_bin(pose.theta_rad),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(pose)
+        return candidates
 
     def pickup_standoff_pose_candidates(
         self,
@@ -733,6 +755,54 @@ class HybridAStarPlanner:
             seen.add(key)
             candidates.append(pose)
         return candidates
+
+    def wall_normal_pickup_headings(
+        self,
+        goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig,
+    ) -> tuple[float, ...]:
+        """Return preferred wall-normal headings for balls close to field walls."""
+        x_cm, y_cm = goal_point_cm
+        threshold_cm = max(0.0, config.wall_pickup_prefer_distance_cm)
+        headings: list[float] = []
+        if x_cm <= threshold_cm:
+            headings.append(math.pi)
+        if self.field.width_cm - x_cm <= threshold_cm:
+            headings.append(0.0)
+        if y_cm <= threshold_cm:
+            headings.append(-math.pi * 0.5)
+        if self.field.height_cm - y_cm <= threshold_cm:
+            headings.append(math.pi * 0.5)
+        return tuple(headings)
+
+    def wall_pickup_heading_error(
+        self,
+        pose: HybridPose,
+        goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig,
+    ) -> float:
+        """Return smallest error to a wall-normal approach, or zero away from walls."""
+        headings = self.wall_normal_pickup_headings(goal_point_cm, config)
+        if not headings:
+            return 0.0
+        return min(abs(normalize_planner_angle(pose.theta_rad - heading)) for heading in headings)
+
+    def preferred_wall_pickup_standoff_goals(
+        self,
+        goals: list[PickupStandoffGoal],
+        goal_point_cm: tuple[float, float],
+        config: HybridPlannerConfig,
+    ) -> list[PickupStandoffGoal]:
+        """Prefer perpendicular approaches for near-wall balls without making them mandatory."""
+        if not self.wall_normal_pickup_headings(goal_point_cm, config):
+            return goals
+        tolerance_rad = max(0.0, config.wall_pickup_perpendicular_tolerance_rad)
+        preferred = [
+            goal
+            for goal in goals
+            if self.wall_pickup_heading_error(goal.final_pickup_pose, goal_point_cm, config) <= tolerance_rad
+        ]
+        return preferred or goals
 
     @staticmethod
     def standoff_pose_for_final_pickup(
@@ -928,7 +998,7 @@ class HybridAStarPlanner:
             return []
         cfg = config or self.config
         collision_checker = RobotFootprintCollisionChecker(raw_red_grid, geometry, self.field, self.robot_config)
-        for pickup_pose in self.corner_pickup_pose_candidates(goal_node, geometry, goal_point_cm):
+        for pickup_pose in self.corner_pickup_pose_candidates(goal_node, geometry, goal_point_cm, cfg):
             if not collision_checker.is_pose_valid(pickup_pose):
                 continue
             segment = self.search_pose_goal(raw_red_grid, start_pose, pickup_pose, geometry, cfg, costmap=costmap)
@@ -1410,14 +1480,29 @@ class HybridAStarPlanner:
         standoff_goals = self.valid_pickup_standoff_goals(raw_red_grid, goal_node, geometry, goal_point_cm)
         if not standoff_goals:
             return []
+        preferred_standoff_goals = self.preferred_wall_pickup_standoff_goals(standoff_goals, goal_point_cm, cfg)
+        use_preferred_first = len(preferred_standoff_goals) < len(standoff_goals)
 
-        attempts: tuple[tuple[str, HybridPlannerConfig, np.ndarray | None], ...] = (
-            ("standard", cfg, costmap),
+        attempts: list[tuple[str, HybridPlannerConfig, np.ndarray | None, list[PickupStandoffGoal]]] = []
+        attempts.append(
+            (
+                "wall-normal preferred" if use_preferred_first else "standard",
+                cfg,
+                costmap,
+                preferred_standoff_goals,
+            )
+        )
+        attempts.append(
             (
                 "relaxed soft costs",
                 cfg,
                 None if costmap is None else costmap.astype(np.float32, copy=False) * 0.1,
+                preferred_standoff_goals,
             ),
+        )
+        if use_preferred_first:
+            attempts.append(("all hard-valid approaches", cfg, costmap, standoff_goals))
+        attempts.append(
             (
                 "desperation",
                 replace(
@@ -1429,6 +1514,7 @@ class HybridAStarPlanner:
                     ),
                 ),
                 None,
+                standoff_goals,
             ),
         )
         ball_x, ball_y = self.goal_to_field_metric_cm(goal_node, goal_point_cm)
@@ -1437,7 +1523,7 @@ class HybridAStarPlanner:
             f"targeting ball at ({ball_x:.1f}, {ball_y:.1f}); "
             f"{len(standoff_goals)} hard-valid standoff candidates."
         )
-        for attempt_index, (attempt_name, attempt_config, attempt_costmap) in enumerate(attempts, start=1):
+        for attempt_index, (attempt_name, attempt_config, attempt_costmap, attempt_goals) in enumerate(attempts, start=1):
             segment = self._search_pickup_standoff_goal_once(
                 raw_red_grid,
                 start_pose,
@@ -1447,7 +1533,7 @@ class HybridAStarPlanner:
                 goal_point_cm,
                 attempt_costmap,
                 collision_checker,
-                standoff_goals,
+                attempt_goals,
                 attempt_name,
             )
             if segment:
@@ -1726,25 +1812,13 @@ class GreedyRoutePlanner:
         geometry: RobotGeometry,
         config: HybridPlannerConfig,
     ) -> tuple[list[HybridPose], HybridPose | None, tuple[float, float] | None]:
-        """Plan via a broad staging region, then dock into the small goal."""
-        staging_segment = self.hybrid_planner.search_staging_region(grid, current_pose, geometry, config)
-        if not staging_segment:
-            print("Hybrid A* could not route from current pose to the small goal staging region.")
-            return [], None, None
+        """Plan to the fixed perpendicular small-goal staging pose."""
+        unload_pose = self.hybrid_planner.small_goal_unload_pose(geometry, config.unload_staging_margin_cm)
+        unload_segment = self.hybrid_planner.search_pose_goal(grid, current_pose, unload_pose, geometry, config)
+        if unload_segment:
+            return unload_segment, unload_pose, self.hybrid_planner.small_goal_center_cm()
 
-        docking_config = replace(config, max_expansions=min(config.max_expansions, 6000))
-        docking_segment = self.hybrid_planner.search_unload_goal(
-            grid,
-            staging_segment[-1],
-            geometry,
-            docking_config,
-            timeout_s=1.0,
-        )
-        if docking_segment:
-            combined = staging_segment + docking_segment[1:]
-            return combined, combined[-1], self.hybrid_planner.small_goal_center_cm()
-
-        print("Hybrid A* could not route from current pose to the small goal unload region.")
+        print("Hybrid A* could not route from current pose to the fixed small goal staging pose.")
         return [], None, None
 
     def plan_target_segment(
@@ -1854,10 +1928,22 @@ class GreedyRoutePlanner:
         config: HybridPlannerConfig | None = None,
     ) -> RoutePlan:
         """Build an orange-first Hybrid A* collection route."""
-        if not ball_targets:
-            return RoutePlan(points=[], active_target=None, pickup_poses=[])
-
         cfg = config or self.config
+        if not ball_targets:
+            unload_segment, unload_pose, unload_goal_cm = self.plan_unload_segment(grid, start_pose, geometry, cfg)
+            segment_types = self.classify_route_segments(unload_segment, [])
+            segment_speeds_pct = self.hybrid_planner.segment_speeds_for_types(segment_types, cfg)
+            return RoutePlan(
+                points=unload_segment,
+                active_target=None,
+                pickup_poses=[],
+                unload_pose=unload_pose,
+                unload_goal_cm=unload_goal_cm,
+                ball_avoidance_mode="disabled" if not cfg.avoid_non_target_balls_enabled else "soft",
+                segment_types=segment_types,
+                segment_speeds_pct=segment_speeds_pct,
+            )
+
         unvisited = list(ball_targets)
         current_pose = start_pose
         route: list[HybridPose] = [current_pose]
@@ -2016,6 +2102,9 @@ class RoutePlanningFacade:
             flexible_standoff_max_cm=self.planner_config.flexible_standoff_max_cm,
             flexible_standoff_min_cm=self.planner_config.flexible_standoff_min_cm,
             flexible_standoff_heading_tolerance_rad=self.planner_config.flexible_standoff_heading_tolerance_rad,
+            unload_staging_margin_cm=self.planner_config.unload_staging_margin_cm,
+            wall_pickup_prefer_distance_cm=self.planner_config.wall_pickup_prefer_distance_cm,
+            wall_pickup_perpendicular_tolerance_rad=self.planner_config.wall_pickup_perpendicular_tolerance_rad,
             avoid_non_target_balls_enabled=self.planner_config.avoid_non_target_balls_enabled,
             ball_radius_cm=self.planner_config.ball_radius_cm,
             non_target_ball_extra_clearance_cm=self.planner_config.non_target_ball_extra_clearance_cm,
@@ -2048,7 +2137,12 @@ class RoutePlanningFacade:
         return min(math.hypot(pose.x_cm - point.x_cm, pose.y_cm - point.y_cm) for point in route)
 
     @staticmethod
-    def compute_route_tracking_error(robot_pose: RobotPose, route: list[HybridPose]) -> RouteTrackingError | None:
+    def compute_route_tracking_error(
+        robot_pose: RobotPose,
+        route: list[HybridPose],
+        start_segment_index: int = 0,
+        end_segment_index: int | None = None,
+    ) -> RouteTrackingError | None:
         """Project live robot pose onto the closest cached route segment."""
         if len(route) < 2:
             return None
@@ -2058,7 +2152,11 @@ class RoutePlanningFacade:
         best: RouteTrackingError | None = None
         best_distance = float("inf")
 
-        for index in range(len(route) - 1):
+        first_segment = max(0, min(int(start_segment_index), len(route) - 2))
+        last_segment = len(route) - 2 if end_segment_index is None else int(end_segment_index)
+        last_segment = max(first_segment, min(last_segment, len(route) - 2))
+
+        for index in range(first_segment, last_segment + 1):
             start = route[index]
             end = route[index + 1]
             sx, sy = float(start.x_cm), float(start.y_cm)
@@ -2085,7 +2183,7 @@ class RoutePlanningFacade:
             best = RouteTrackingError(
                 xte_cm=distance,
                 signed_xte_cm=signed_distance,
-                heading_error_rad=normalize_planner_angle(segment_heading - robot_pose.heading_rad),
+                heading_error_rad=normalize_planner_angle(robot_pose.heading_rad - segment_heading),
                 closest_point_cm=(cx, cy),
                 segment_heading_rad=segment_heading,
                 segment_index=index,

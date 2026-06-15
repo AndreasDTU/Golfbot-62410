@@ -2,13 +2,184 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-06-11
+
+### Added
+
+- Added an optional live `--drive` calibration sequence started with `k`.
+  - The top-down app now pauses route control, owns motor output with
+    `DriveControlState.CALIBRATING`, commands a measured 360 degree EV3 tank
+    turn and 10 cm move in background TCP calls, and keeps the vision loop alive
+    to measure ArUco heading/distance error.
+  - The calibration overlay reports expected vs actual turn and distance,
+    lateral drift, old EV3 constants, suggested corrected constants, robot
+    origin sample quality, pivot shift, and the `y` save / `x` discard controls.
+  - The 360 degree turn now also collects robot ArUco marker paths, fits the
+    actual pivot/origin, rejects insufficient or elliptical marker data, and
+    previews updated `robot_calibration.json` `dx/dy` offsets while preserving
+    existing marker `alpha_rad` heading calibration.
+  - The EV3 server now supports `drivecal get` and
+    `drivecal set <axle_track_mm> <mm_per_unit>`, persisting accepted values to
+    `robot/robot_drive_calibration.json` while preserving built-in defaults if
+    the file is missing or invalid.
+  - Added controller helpers and pure calibration tests for correction math,
+    heading unwrapping, JSON persistence, EV3 server validation, and command
+    formatting.
+
+- Added camera focus-lock and short ArUco pose-loss route preservation.
+  - Live camera mode now lets autofocus run during the initial ball-count prep
+    phase, then makes a best-effort OpenCV request to disable autofocus and set
+    the configured manual focus value.
+  - Brief robot-pose loss now stops motor output but preserves the cached route;
+    sustained pose loss clears the route after the configured frame threshold.
+
+### Changed
+
+- XTE route tracking is now monotonic and progress-aware.
+  - The drive loop keeps a route-progress segment cursor per active route and
+    projects only onto the current/future route window instead of the whole
+    cached route.
+  - This prevents intersecting or nearby old route segments from stealing XTE
+    control after the robot has already passed them.
+
+- Post-pickup cached route continuation now trims the consumed route prefix.
+  - Completing a pickup removes both the completed pickup checkpoint and the
+    route points leading up to it, then reseeds the remaining route from the
+    live robot pose.
+  - This prevents `POST_PICKUP_ALIGN` tank-steer recovery from handing control
+    back to stale pre-pickup path geometry near walls.
+
+- Route planning now treats `balls_collected >= initial_total_balls` as an
+  unconditional unload-routing state when robot pose is available.
+  - Visible ball detections are ignored in that state, so recalculation submits
+    an empty target list and routes to the fixed unload staging pose instead of
+    returning to ball collection.
+
+## 2026-06-10
+
+### Added
+
+- Added precision-seeking visual-servo alignment before the final near-zone TCP
+  pickup move.
+  - The robot now performs the initial TCP turn, then consumes fresh camera
+    pose/ball observations frame-by-frame while issuing proportional TCP
+    micro-turns.
+  - Alignment continues until the measured lateral error reaches the configured
+    camera noise floor, stops improving, or hits a bounded iteration limit.
+
+- Added visual-servo settling verification before the final near-zone pickup
+  move.
+  - When alignment converges or stalls, the drive loop now forces a zero-speed
+    TCP stop, waits for the configurable settling delay, then verifies alignment
+    again on a fresh camera frame before sending the final `move(...)`.
+  - If physical settling leaves the robot outside the configured visual-servo
+    noise floor, the loop resumes micro-correction instead of driving forward.
+
+- Added reverse visual-servo alignment before autonomous unloading.
+  - The unload state machine now enters an `UNLOAD_ALIGNING` phase at the
+    planned unload endpoint instead of immediately dropping the pipe.
+  - The controller aligns the rear unload tip to the fixed small-goal center
+    using live robot pose, `rear_cm + unload_extension_cm`, TCP micro-turns, and
+    small forward/back corrections.
+  - The pipe thread starts only after a forced stop, physical settle delay, and
+    fresh-frame verification that the rear tip remains inside the allowed goal
+    tolerance and heading arc.
+
+- Added a pre-unload stationary pivot before reverse unload visual servoing.
+  - The drive loop now intercepts terminal unload routing inside a configurable
+    staging radius, stops XTE tracking with `LR 0 0`, and enters
+    `PRE_UNLOAD_PIVOT`.
+  - The pivot tank-steers in place until the robot rear roughly faces the
+    static small-goal center, then hands directly to `UNLOAD_ALIGNING` for final
+    reverse visual-servo correction and pipe-drop verification.
+
+- Added wall-aware pickup approach prioritization.
+  - Balls close to a field wall now first try wall-normal pickup standoff goals
+    so the robot avoids wall-parallel approaches unless they are the only
+    routeable option.
+  - Tightly cornered balls now include backed-off diagonal candidates when the
+    exact tube-center-over-ball pose is body-invalid but the ball remains inside
+    the intake-mouth capture tolerance.
+
+- Added post-pickup wall recovery before resuming route tracking.
+  - Critical edge clearance now triggers a bounded TCP reverse escape, clears
+    the cached route, and requests a replan from the backed-out pose.
+  - Less severe edge proximity enters `POST_PICKUP_ALIGN`, tank-steers in place
+    toward the next route goal, and only then returns to normal XTE tracking.
+
+- Changed autonomous unload routing to target a fixed perpendicular staging
+  pose.
+  - After all balls are collected, Hybrid A* now routes to a body-center pose at
+    `rear_cm + unload_extension_cm + unload_staging_margin_cm` from the small
+    goal center, with heading perpendicular to the left wall.
+  - The planner no longer performs the final backwards unload docking search;
+    stationary pivot and reverse visual servoing own that final maneuver.
+
+- Corrected near-zone pickup alignment and cached-route pickup consumption.
+  - Initial pickup targeting now derives the tube-offset body target from the
+    intended line-of-sight approach to the observed ball centroid instead of the
+    robot's stale pre-turn heading.
+  - Successful cached-route pickup completion now consumes the completed pickup
+    checkpoint and clears stale active-target metadata before returning to
+    navigation, preventing immediate re-entry into the same pickup.
+
+## 2026-06-08
+
+### Added
+
+- Added state-driven route continuation and unload routing for autonomous
+  collection.
+  - Pickup completion now keeps the cached global route when the visible
+    remaining balls are still a stationary subset of the original plan.
+  - Cached routes are invalidated only when remaining balls move across the
+    configured target bucket, a new/hidden ball appears, robot drift exceeds
+    route tolerance, or geometry metadata changes.
+  - Empty visible-ball frames with `balls_collected > 0` now submit an explicit
+    direct-to-unload route instead of waiting for ball targets.
+  - The route planner treats an empty target list as a direct unload request
+    when invoked by that state.
+
+### Changed
+
+- Removed automatic autonomous `collector_travel_position()` gating from the
+  live drive loop. The collector safe position is now an operator precondition;
+  the command remains available for manual use.
+
+- Switched the autonomous `--drive` command transport to TCP-only.
+  - Replaced the PC-side wheel dispatcher with a TCP wheel dispatcher that
+    preserves finite-command validation, clipping, send interval/deadband
+    filtering, forced stops, and dispatch error reporting.
+  - Added TCP `LR <left> <right>` handling to `robot/robot_server.py` for
+    continuous route-following wheel speeds on the same command server used by
+    `move`, `turn`, and collector commands.
+  - Updated drive wiring, operator docs, and tests so the old hybrid transport
+    scenario is no longer part of `--drive`.
+
+## 2026-05-28
+
+### Added
+
+- Added schematic debug overlays for soft non-target ball avoidance.
+  - `vision/debug.py` now draws faint yellow avoidance halos from
+    `RoutePlan.ball_obstacles` and `ball_obstacle_radius_cm`.
+  - Planned route samples that enter a ball avoidance radius mark that ball with
+    a red warning ring and `COLLISION` label.
+  - Collision checks now evaluate the route chronologically and remove
+    intentional pickup balls only after their own tube-center pickup segment is
+    reached, so future targets remain active obstacles until their segment.
+  - Collision detection checks full route line segments against avoidance
+    circles instead of only sampled route points, catching sparse-waypoint
+    drive-throughs.
+  - The live detector and pathfinding sandbox now pass route ball-avoidance
+    metadata into the schematic renderer.
+
 ## 2026-05-24
 
 ### Added
 
 - Added a minimal autonomous terminal unload sequence after the robot reaches
   the planned unload endpoint.
-  - The drive loop stops UDP wheel output, preserves the final unload route
+  - The drive loop stops wheel output, preserves the final unload route
     after the last optimistic pickup, and runs a pipe-only double unload:
     `unload_full_cycle`, configurable `pipe_down`/`pipe_up` shake cycles,
     second `unload_full_cycle`, then `pipe_stop`.
@@ -176,8 +347,8 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
   - Hybrid A* now targets the standoff goal set dynamically instead of a single preselected pose.
 - Added near-zone route visualization in `vision/debug.py`.
   - Route heatmap stops at the near-zone handoff point.
-  - Red markers show UDP halt / TCP turn locations.
-  - Final TCP center-to-center approach segment is drawn using the same speed heatmap palette as the UDP route.
+  - Red markers show route-tracking halt / TCP turn locations.
+  - Final TCP center-to-center approach segment is drawn using the same speed heatmap palette as the tracked route.
   - Intermediate robot footprint clutter was removed; pickup footprints are shown only at collection poses.
 - Added global ball-count reconciliation in `tools/topdown_object_detector.py`.
   - Drive dispatch waits for a stable initial YOLO ball count.
@@ -187,8 +358,8 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
 
 ### Changed
 
-- Rewrote `AGENTS.md` to match the current top-down object detection,
-  Hybrid A*, and hybrid UDP/TCP robot-control architecture.
+- Rewrote `AGENTS.md` to match the top-down object detection, Hybrid A*, and
+  robot-control architecture active at that time.
   - Updated the expected file structure.
   - Replaced outdated vision-system assumptions with the current
     `vision/`, `pathfinding/`, `robot/`, `tools/`, `docs/`, and `test/`
@@ -200,7 +371,7 @@ env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test
 - Replaced the old blind open-loop pickup creep behavior with deterministic align-then-move TCP execution.
 - Updated the closed-loop controller tests to cover:
   - edge slowdown/gain scaling,
-  - near-zone UDP stop and TCP turn/move ordering,
+  - near-zone route-tracking stop and TCP turn/move ordering,
   - route heatmap near-zone breaks,
   - pickup standoff geometry,
   - global ball-count reconciliation and debounce behavior.

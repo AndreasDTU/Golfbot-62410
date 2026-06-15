@@ -7,7 +7,7 @@ from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from robot.telemetry import DriveTelemetryRecorder, TelemetryFrame, log_event
+from control.telemetry import DriveTelemetryRecorder, TelemetryFrame, log_event
 
 
 def _make_dummy_objects(

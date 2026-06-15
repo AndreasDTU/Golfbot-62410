@@ -6,7 +6,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - environment dependent
     cv2 = None
 
-from camera.calibration import (
+from perception.camera.calibration import (
     compute_inner_corner_quad,
     find_checkerboard_corners,
     warp_from_checkerboard_inner_corners,

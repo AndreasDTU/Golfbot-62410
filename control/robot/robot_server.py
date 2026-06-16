@@ -43,7 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from control.tools.drive_calibration import (
+from drive_calibration import (
     DEFAULT_AXLE_TRACK_MM,
     DEFAULT_MM_PER_UNIT,
     DriveCalibrationValues,
@@ -166,11 +166,13 @@ def cmd_turn(parts):
     angle = float(parts[1])
     speed = float(parts[2]) if len(parts) > 2 else 30
     motor_deg = turn_angle_to_motor_degrees(angle)
-    # Positive angle = CCW (left), negative = CW (right).
-    if angle >= 0:
+
+    # Positive angle = CW (right), negative = CCW (left).
+    if angle < 0:
         left_spd, right_spd = -speed, speed   # left backward, right forward = CCW
     else:
         left_spd, right_spd = speed, -speed   # left forward, right backward = CW
+
     _apply_wheel_speeds_for_degrees(left_spd, right_spd, motor_deg)
     return "ok: turned {} degrees".format(angle)
 

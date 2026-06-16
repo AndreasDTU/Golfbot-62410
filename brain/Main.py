@@ -68,6 +68,10 @@ TEST_ROUTES: dict[str, list[HybridPose]] = {
     "90_turn":  _route_waypoints([(40, 30), (120, 30), (120, 90)]),
     "L_shape":  _route_waypoints([(30, 30), (100, 30), (100, 90), (140, 90)]),
     "square": _route_waypoints([(30, 30), (100, 30), (100, 90), (30, 90), (30, 30)]),
+    "s": _route_waypoints([(30, 30), (137, 30), (137, 61), (30, 61), (30, 92), (137, 92)]),
+    "lightning": _route_waypoints([(30, 30), (65, 92), (100, 30), (137, 92), (137, 30)]),
+    "wave": _route_waypoints([(30, 61), (55, 30), (80, 92), (105, 30), (137, 61)]),
+    "star": _route_waypoints([(84, 30), (100, 68), (137, 68), (107, 92), (119, 61), (84, 80), (49, 61), (61, 92), (31, 68), (68, 68), (84, 30)]),
 }
 
 TEST_ROUTE_NAMES: list[str] = list(TEST_ROUTES.keys())

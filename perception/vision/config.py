@@ -326,9 +326,9 @@ class DriveConfig:
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     """IMPORTANT VALUES"""
-    drive_speed_pct: float = 100.0
-    max_heading_for_forward_rad: float = math.radians(10.0)
-    turn_speed_pct: float = 10.0
+    drive_speed_pct: float = 50.0
+    max_heading_for_forward_rad: float = math.radians(15.0)
+    turn_speed_pct: float = 25.0
 
     max_cross_track_error_cm: float = 8.0
     max_speed_pct: float = 100.0

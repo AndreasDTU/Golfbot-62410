@@ -325,8 +325,12 @@ class DriveConfig:
     robot_ip: str = "172.20.10.8"
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
+    """IMPORTANT VALUES"""
+    drive_speed_pct: float = 100.0
+    max_heading_for_forward_rad: float = math.radians(10.0)
+    turn_speed_pct: float = 10.0
+
     max_cross_track_error_cm: float = 8.0
-    base_speed_pct: float = 100.0
     max_speed_pct: float = 100.0
     heading_kp: float = 38.0
     xte_kp: float = 2.2
@@ -356,7 +360,6 @@ class DriveConfig:
     deceleration_limit_pct_per_s: float = 90.0
     blind_approach_trigger_cm: float = 8.0
     blind_approach_duration_s: float = 1.0
-    max_heading_for_forward_rad: float = math.radians(70.0)
     min_send_interval_s: float = 0.02
     command_deadband_pct: float = 1.0
     manual_move_units: int = 5
@@ -399,7 +402,6 @@ class DriveConfig:
     telemetry_auto_dump_enabled: bool = True
     telemetry_dump_dir: str = "telemetry"
     # Turn speed profile
-    turn_speed_pct: float = 25.0
     turn_creep_speed_pct: float = 8.0
     turn_cruise_angle_deg: float = 30.0
     turn_creep_angle_deg: float = 8.0

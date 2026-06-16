@@ -131,7 +131,7 @@ class MovementPlayground:
 
     def _parse_float_param(self, parts: list[str], name: str) -> float | str:
         if len(parts) != 2:
-            return f"Usage: {name} <value>"
+            return f"Usage: {name} <speed-input>"
         try:
             value = float(parts[1])
         except ValueError:
@@ -163,13 +163,16 @@ class MovementPlayground:
 
 def command_help() -> str:
     return """Commands:
-  turn <degrees>   In-place rotation (positive = CCW)
-  drive <cm>       Straight drive (positive = forward)
-  adjust <degrees> Arc correction on current base speed
-  stop             Zero wheel speeds
+  turn <value>     Set rotation wheel speed (higher = faster). Does NOT stop automatically.
+  drive <value>    Set forward wheel speed (higher = faster). Does NOT stop automatically.
+  adjust <value>   Set arc-correction differential on current base speed.
+  stop             Zero wheel speeds. You must call this after turn/drive.
   status           Show commander state
   help             Show this help
-  quit / exit      Stop and exit"""
+  quit / exit      Stop and exit
+
+Note: turn/drive/adjust set wheel speeds via a profiled speed curve. The robot
+keeps moving until you send 'stop'. There is no camera feedback in this tool."""
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +527,8 @@ class MovementPlaygroundGui:
 
         # Parameter display
         self.draw_text(image, "Movement Commands", (710, 150), 0.65, (35, 35, 35), 2)
-        self.draw_text(image, f"Parameter: {self.param_value:g}", (710, 215), 0.56)
-        self.draw_text(image, f"(degrees for turn/adjust, cm for drive)", (710, 235), 0.42, (100, 100, 100))
+        self.draw_text(image, f"Speed input: {self.param_value:g}", (710, 215), 0.56)
+        self.draw_text(image, "(controls wheel speed, not distance. Stop manually.)", (710, 235), 0.42, (100, 100, 100))
 
         # State readout
         if self.commander is not None:
@@ -601,7 +604,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print("Movement playground — Stage 1 manual driver for Control layer.")
-    print("This tool drives wheels only. No vision, route planning, or autonomy.")
+    print("Commands set wheel speed, not distance. The robot keeps moving until you send 'stop'.")
+    print("No vision feedback — this is open-loop speed control only.")
     if args.dummy:
         print("Dummy mode enabled; no EV3 connection will be opened.")
         commander = DummyCommander()

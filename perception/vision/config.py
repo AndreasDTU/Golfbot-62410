@@ -326,8 +326,8 @@ class DriveConfig:
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     max_cross_track_error_cm: float = 8.0
-    base_speed_pct: float = 38.0
-    max_speed_pct: float = 80.0
+    base_speed_pct: float = 100.0
+    max_speed_pct: float = 100.0
     heading_kp: float = 38.0
     xte_kp: float = 2.2
     heading_kd: float = 6.0

@@ -2,6 +2,37 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-06-15
+
+### Added
+
+- Added `docs/MOVEMENT_REWORK_STATUS.md` as the single source of truth for the
+  movement-layer rebuild.
+  - Audits all 6 layers (Perception, Path, Localization, Control, Guidance,
+    Brain/FSM) against the actual code in the repository.
+  - Records per-layer status (complete / partial / stub), key files,
+    working capabilities, gaps, boundary contracts, and test coverage.
+  - Documents the established units and frames contract (cm, radians,
+    bottom-left origin, CCW positive).
+  - Identifies cross-cutting gaps: boundary logging (missing everywhere),
+    sim/real backend (missing), and the blocking-vs-ticking resolution.
+  - Rewrites the 4-stage build plan to reflect current reality.
+  - Summarizes decisions made and work completed since the brainstorm
+    proposals in `docs/refactor/`.
+
+### Changed
+
+- Reorganized repository documentation around the current layer layout:
+  `perception/`, `path/`, `localization/`, `guidance/`, `control/`, and
+  `brain/`.
+  - Marked the previous autonomous top-down app as deleted and autonomous drive
+    as paused during the movement rework.
+  - Updated camera, pathfinding, collection, autonomous quickstart, and agent
+    guidance docs so they no longer describe old root folders or deleted
+    entrypoints as current.
+  - Preserved the movement rework plan as the source of truth for rebuilding
+    Control, Localization, Guidance, and Brain/FSM.
+
 ## 2026-06-11
 
 ### Added

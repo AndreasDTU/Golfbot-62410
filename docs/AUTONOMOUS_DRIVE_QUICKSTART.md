@@ -1,75 +1,75 @@
 # Autonomous Drive Quickstart
 
-Run from the repository root unless noted:
+Status: PAUSED DURING MOVEMENT REWORK
 
-```bash
-cd /Users/peterroland/Library/CloudStorage/OneDrive-DanmarksTekniskeUniversitet/DTU/4_Semester/62410_CDIO-Project/Repo
+The previous autonomous entrypoint, `tools/topdown_object_detector.py`, has been
+deleted. There is currently no complete laptop-side autonomous app that can run
+`--live`, `--drive`, or `--step`.
+
+Do not use this document as a claim that autonomous driving is currently
+available. It records the safe current state and the pieces that still exist.
+
+## Existing Hardware Pieces
+
+The EV3 TCP command server still exists:
+
+```text
+control/robot/robot_server.py
 ```
 
-1. Check required files exist:
+Run it from the repository root on the EV3 so imports resolve correctly:
 
 ```bash
-ls calibration_data.npz robot_calibration.json tools/best.pt
+PYTHONPATH=. python3 control/robot/robot_server.py
 ```
 
-2. On the EV3, start the TCP command server:
+The server supports movement and collector commands such as:
+
+```text
+move <units> [speed]
+back <units> [speed]
+turn <degrees> [speed]
+LR <left> <right>
+drivecal get
+drivecal set <axle_track_mm> <mm_per_unit>
+collector_travel_position
+pickup_assist
+unload_full_cycle
+stop
+ping
+```
+
+Drive calibration values are persisted beside the EV3 server as:
+
+```text
+control/robot/robot_drive_calibration.json
+```
+
+if the server creates or updates that file.
+
+## Existing Manual Tools
+
+Manual collector testing is still available through:
 
 ```bash
-cd <repo-on-ev3>
-python3 robot/robot_server.py
+PYTHONPATH=. python3 control/tools/collector_playground.py --host <EV3_IP>
+PYTHONPATH=. python3 control/tools/collector_playground.py --dummy
+PYTHONPATH=. python3 control/tools/collector_playground.py --cli --host <EV3_IP>
 ```
 
-The `--drive` path uses this TCP server for all autonomous wheel and collector
-commands; no UDP wheel server is required.
+The helper imports are cleaned for the new layer layout. Keep `PYTHONPATH=.`
+until these scripts are converted into proper package entrypoints.
 
-3. On the laptop, start live vision without motors first:
+## Autonomous Rebuild Prerequisites
 
-```bash
-python3 tools/topdown_object_detector.py --live --camera-index 0
-```
+Before restoring an autonomous quickstart, these layers need real contracts and
+hardware gates from `docs/refactor/movement_rework_integration_plan.md`:
 
-4. Confirm in the UI:
+1. Control command API with sim/real backend and boundary logging.
+2. Localization pose plus freshness/validity boundary.
+3. Guidance conversion from intent plus live pose to `turn` / `drive` /
+   `adjust`.
+4. Brain/FSM route cursor and arbitration.
 
-- top-down calibration is locked
-- robot pose is visible
-- balls/red zones look correct
-- route appears sane
-
-5. Start autonomous drive in step mode:
-
-```bash
-python3 tools/topdown_object_detector.py --live --camera-index 0 --drive --step
-```
-
-6. During the run:
-
-- press `n` to release each autonomous target in step mode
-- press `k` to start the optional drive calibration sequence when `--drive`
-  is active and robot ArUco pose is valid
-- press `space` to stop wheel output
-- press `q` or `Esc` to quit; shutdown sends wheel stop
-
-7. Optional drive calibration:
-
-- clear enough field space for a 360 degree tank turn and a 10 cm forward move
-- press `k`; the app stops route control, commands the EV3 turn and move in the
-  background, and keeps measuring ArUco pose in the live loop
-- review the overlay for expected vs actual turn, expected vs actual distance,
-  lateral drift, old values, suggested values, robot-origin sample counts, and
-  pivot/origin shift
-- press `y` to persist/apply the suggested EV3 drive calibration values and
-  robot-origin `dx/dy` offsets, or press `x` to discard/cancel
-
-Saved values are written by the EV3 command server to
-`robot/robot_drive_calibration.json`. If that file is missing or invalid, the
-server falls back to the built-in robot defaults. The robot pivot/origin update
-is written to `robot_calibration.json`; the existing marker heading `alpha_rad`
-is preserved.
-
-8. Full autonomous without per-target pauses:
-
-```bash
-python3 tools/topdown_object_detector.py --live --camera-index 0 --drive
-```
-
-Use full autonomous only after step mode has worked on the real field.
+Only after those gates pass should this quickstart describe a full autonomous
+run again.

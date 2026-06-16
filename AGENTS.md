@@ -1,4 +1,4 @@
-# AGENTS.md — Top-Down Detection, Routing & Robot Control
+# AGENTS.md — Layered GolfBot Repository
 
 Status: ACTIVE
 Purpose: Define rules, contracts, and expectations for coding agents operating on this repository.
@@ -8,28 +8,42 @@ Scope: Entire repository unless overridden by a deeper `AGENTS.md`.
 
 # System Summary
 
-This repository implements a contest-critical ping-pong ball collection system.
+This repository is being reorganized around a layered ping-pong ball collection
+robot architecture. The previous all-in-one autonomous detector app has been
+removed during the movement rework. There is currently no complete autonomous
+entrypoint equivalent to the deleted `tools/topdown_object_detector.py`.
 
-The current main application is:
-
-```text
-tools/topdown_object_detector.py
-```
-
-It owns the OpenCV UI shell, live/video/image execution modes, service wiring,
-route planning requests, robot pose updates, drive-state management, and
-keyboard dispatch.
-
-Domain behavior is split into:
+Current layer folders:
 
 ```text
-vision/       Camera calibration, preprocessing, detection, tracking, mapping, debug rendering
-pathfinding/ Hybrid A* route planning, robot-footprint collision checking, route models
-robot/        Robot localization, drive control, UDP wheel dispatch, TCP controller helpers
-tools/        Executable calibration, visualization, sandbox, and detector utilities
-docs/         Architecture, workflow, test, and pipeline documentation
-test/         Unit/smoke tests and test assets
+perception/    Kept camera, calibration, detection, tracking, mapping, and debug code
+path/          Kept Hybrid A* route-planning code and path sandbox
+localization/  Robot pose/localization code restored as reference for rebuild
+brain/         New FSM layer target; not rebuilt yet
+guidance/      Route-tracking/reference guidance code; not a clean new layer yet
+control/       EV3 controller/server/tooling plus reference dispatch/telemetry code
+docs/          Architecture, workflow, and rework documentation
+test/          Remaining kept unit/smoke tests and assets
 ```
+
+The movement rework status, layer audit, and updated stage plan are in:
+
+```text
+docs/MOVEMENT_REWORK_STATUS.md          — current source of truth
+```
+
+The original brainstorm proposals are kept for architectural intent but are
+no longer current for status tracking:
+
+```text
+docs/refactor/movement_layer_architecture.pdf
+docs/refactor/movement_rework_integration_plan.md
+```
+
+Grey layers from that architecture are kept code: Perception and Path. Green
+layers are rebuild targets: Localization, Brain/FSM, Guidance, and Control.
+Some green folders currently contain restored legacy/reference code; do not
+mistake that for a completed clean-layer implementation.
 
 Agents must treat this as a real-time robotics system where reliability,
 determinism, debuggability, and safe failure behavior matter more than elegance.
@@ -55,31 +69,37 @@ deterministic option.
 
 # Current Architecture
 
-## Vision Pipeline
+## Perception
 
-The extracted vision stack lives in `vision/`.
+Perception code lives under `perception/`.
 
 Important modules:
 
 ```text
-vision/calibration.py     Homography and camera calibration helpers
-vision/preprocessing.py   Undistortion, perspective transform, optional normalization
-vision/detection.py       Red-zone and ball detection
-vision/tracking.py        Ball smoothing/tracking
-vision/grid_mapping.py    Occupancy-grid construction
-vision/pipeline.py        Vision pipeline orchestration
-vision/debug.py           Debug overlays, schematic view, route heatmap
-vision/config.py          Typed configuration values
-vision/models.py          Vision data models
-vision/geometry.py        Coordinate mapping and geometry helpers
+perception/vision/calibration.py
+perception/vision/preprocessing.py
+perception/vision/detection.py
+perception/vision/tracking.py
+perception/vision/grid_mapping.py
+perception/vision/pipeline.py
+perception/vision/debug.py
+perception/vision/config.py
+perception/vision/models.py
+perception/vision/geometry.py
+perception/camera/
+perception/tools/
 ```
 
-The detector currently uses YOLO-backed ball detection through the existing
-local model file in `tools/best.pt`, plus classical OpenCV geometry,
-calibration, grid mapping, and debug rendering. Do not replace this stack with a
-new detector family unless explicitly asked.
+The YOLO model file is currently:
 
-The vision pipeline should continue to produce:
+```text
+perception/tools/best.pt
+```
+
+Do not replace the existing perception approach with a new detector family
+unless explicitly asked.
+
+The perception layer should continue to produce:
 
 - top-down/warped frame data,
 - red-zone detections and masks,
@@ -88,27 +108,20 @@ The vision pipeline should continue to produce:
 - occupancy grid,
 - debug visualization data.
 
-Agents MUST preserve debug visibility for:
+## Path
 
-- top-down/warped view,
-- segmentation masks,
-- ball/red-zone detections,
-- robot pose and calibration status,
-- route/occupancy visualization,
-- drive state, XTE/heading error, FPS, and timing/status overlays.
-
-## Pathfinding
-
-Routing lives in `pathfinding/`.
+Path planning code lives under `path/`.
 
 Important modules:
 
 ```text
-pathfinding/models.py   HybridPose, PlannedBallTarget, RoutePlan, RouteTrackingError
-pathfinding/planner.py  Hybrid A*, collision checking, route facade, greedy collection route
+path/pathfinding/models.py
+path/pathfinding/planner.py
+path/pathfinding/plancreation.py
+path/tools/pathfinding_sandbox.py
 ```
 
-The active route planner is Hybrid A* over:
+The active kept route planner is Hybrid A* over:
 
 ```text
 x_cm, y_cm, theta_rad
@@ -129,111 +142,66 @@ Pickup planning uses valid standoff/final-pickup pose pairs:
 Do not simplify pickup planning back to raw ball coordinates or a single
 hardcoded approach pose.
 
-## Robot Localization & Control
+## Localization, Brain, Guidance, And Control
 
-Robot-domain code lives in `robot/`.
+These are movement-rework layers.
 
-Important modules:
+Current status:
 
 ```text
-robot/localization.py  ArUco-based robot pose estimation and calibration collection
-robot/control.py       Route tracking, XTE/heading control, edge-aware wheel command computation
-robot/io.py            Non-blocking UDP left/right wheel-speed dispatch
-robot/controller.py    TCP command helper for calibrated encoder actions
-robot/models.py        Robot geometry, pose, command, runtime state models
-robot/robot_server.py  EV3-side TCP command server
+localization/localization.py       Restored legacy/reference localization
+localization/models.py             Restored legacy/reference robot models
+guidance/route_tracking.py         Restored legacy/reference route tracking
+control/controller.py              TCP controller helper
+control/io.py                      TCP wheel dispatch/reference commander
+control/telemetry.py               Drive telemetry helper
+control/robot/robot_server.py      EV3-side TCP command server
+control/tools/drive_calibration.py Drive calibration helper
+control/tools/collector_playground.py Manual collector playground
+brain/Main.py                      Legacy placeholder, not a rebuilt Brain layer
 ```
 
-Closed-loop driving under `--drive` uses a hybrid control architecture:
+The clean contracts required by the movement architecture are not complete yet:
 
-- UDP `LR <left> <right>` commands for continuous route tracking.
-- TCP `turn(...)` and `move(...)` commands for calibrated near-zone pickup.
+- Control command API, sim/real backend, and boundary logging.
+- Localization `RobotPose + valid/freshness` boundary.
+- Guidance `intent + live pose -> turn/drive/adjust` boundary.
+- Brain/FSM route cursor and arbitration layer.
 
-Agents MUST ensure robot commands are finite and validated. The robot must
-never receive NaN, undefined, random, or unvalidated coordinates/speeds.
-
-If pose, route, calibration, or detection is invalid, allowed behavior is:
-
-- send/keep zero wheel speed,
-- clear or preserve route cache as appropriate,
-- return empty detections,
-- replan from validated state.
-
-Not allowed:
-
-- fabricate detections,
-- fabricate robot position,
-- silently recalibrate during operation,
-- silently mutate homography during drive.
+Agents MUST NOT claim autonomous driving is currently available unless a new
+entrypoint has actually been implemented and tested.
 
 ---
 
 # File Structure Expectations
 
-The current expected structure is:
+The current source structure is layer-based:
 
 ```text
-AGENTS.md
-CHANGELOG.md
-
+brain/
+control/
 docs/
-    CAMERA_WORKFLOW_OVERVIEW.md
-    PATHFINDING_ARCHITECTURE.md
-    TEST_OVERVIEW.md
-    VISION_CV_CONTRACT.md
-
-vision/
-    __init__.py
-    calibration.py
-    config.py
-    debug.py
-    detection.py
-    geometry.py
-    grid_mapping.py
-    models.py
-    pipeline.py
-    preprocessing.py
-    tracking.py
-
-pathfinding/
-    models.py
-    planner.py
-    plancreation.py
-
-robot/
-    calibrate.py
-    control.py
-    controller.py
-    io.py
-    localization.py
-    models.py
-    pc.py
-    robot_server.py
-
-tools/
-    auto_topdown_aruco.py
-    calibrate_camera.py
-    checkerboard_smoke_test.py
-    color_quantization_detector.py
-    live_topdown_view.py
-    live_undistort.py
-    manual_topdown_view.py
-    pathfinding_sandbox.py
-    perspective_warp_test.py
-    robot_origin_calibration.py
-    topdown_object_detector.py
-    undistort_bane.py
-
+guidance/
+localization/
+path/
+perception/
 test/
-    test_checkerboard_smoke.py
-    test_drive_control.py
-    test_pathfinding_heuristic.py
-    test_perspective_warp.py
-    test_topdown_detector_app_shell.py
 ```
 
-Do not force the repository back into older placeholder structures. Add new
-files where they fit the current architecture.
+Old root packages such as `vision/`, `camera/`, `pathfinding/`, `robot/`, and
+`tools/` are not the current source locations. Do not add new code there unless
+the user explicitly asks to restore that layout.
+
+Imports should use current layer paths, for example:
+
+```text
+perception.vision.*
+perception.camera.*
+path.pathfinding.*
+localization.*
+guidance.route_tracking
+control.*
+```
 
 ---
 
@@ -243,7 +211,7 @@ Agents MUST:
 
 - make minimal necessary changes,
 - preserve existing module boundaries unless there is a clear reason,
-- preserve debug tools and overlays,
+- preserve debug tools and overlays in kept grey layers,
 - keep data flow explicit,
 - keep behavior deterministic,
 - avoid hidden global state,
@@ -258,7 +226,8 @@ Agents MUST NOT:
 - remove safety checks,
 - remove calibration/debug tools,
 - introduce training pipelines without approval,
-- silently modify calibration files, homography, or robot geometry defaults.
+- silently modify calibration files, homography, or robot geometry defaults,
+- reintroduce a fake autonomous shell just to satisfy old tests.
 
 External dependencies should remain conservative. OpenCV, NumPy, and standard
 Python libraries are already core dependencies. New runtime dependencies require
@@ -268,7 +237,7 @@ clear justification and user approval.
 
 # Performance Rules
 
-The detector and drive loop are intended for real-time operation.
+The final detector and drive loop are intended for real-time operation.
 
 Target:
 
@@ -276,29 +245,23 @@ Target:
 - stretch target: 30 FPS,
 - low-latency route/control updates.
 
-Agents SHOULD profile or reason explicitly before adding heavy per-frame work.
-Avoid expensive initialization inside the frame loop.
-
 Route planning may be more expensive than detection, but it should remain
-cached/asynchronous where possible and should not block every frame.
+cached/asynchronous where practical and should not block every frame in a final
+live loop.
 
 ---
 
 # Testing Requirements
 
-Agents MUST validate new behavior with relevant tests whenever practical.
+Use the Miniforge Python runtime when dependencies are needed:
 
-Common focused test commands:
-
-```text
-env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_drive_control
-env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_pathfinding_heuristic
-env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_topdown_detector_app_shell
-env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m unittest test.test_perspective_warp test.test_checkerboard_smoke
+```bash
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache /Users/alex/miniforge3/bin/python3 -m unittest discover -s test -p 'test_*.py'
 ```
 
-Use the `PYTHONPYCACHEPREFIX` form when the default Python cache path is outside
-the writable workspace.
+Current remaining kept tests cover perception utilities, pathfinding, drive
+calibration, telemetry, and the EV3 command server. Old autonomous app-shell and
+drive-loop tests were removed with the deleted top-down app.
 
 For docs-only changes, tests are optional, but agents should state that tests
 were not run because the change was documentation-only.
@@ -307,55 +270,22 @@ were not run because the change was documentation-only.
 
 # Documentation & Changelog
 
-Agents MUST update `CHANGELOG.md` whenever making a larger addition, behavioral
-change, architecture change, control change, or user-visible workflow change.
-
-Changelog entries SHOULD summarize:
-
-- what was added or changed,
-- why the change matters operationally,
-- which key files or subsystems were affected,
-- what validation or tests were run.
-
-Tiny typo fixes or purely local cleanup do not require a changelog entry.
+Agents MUST update `CHANGELOG.md` whenever making a larger addition,
+behavioral change, architecture change, control change, or user-visible
+workflow change.
 
 Agents SHOULD also update relevant docs when architecture or behavior changes:
 
-- `docs/PATHFINDING_ARCHITECTURE.md` for route planning, drive control, pickup
-  standoff, route visualization, and reconciliation behavior.
-- `docs/VISION_CV_CONTRACT.md` for vision pipeline contracts.
-- `docs/CAMERA_WORKFLOW_OVERVIEW.md` for calibration/camera workflow.
-- `docs/TEST_OVERVIEW.md` for test workflow changes.
+- `docs/MOVEMENT_REWORK_STATUS.md`
+- `docs/PATHFINDING_ARCHITECTURE.md`
+- `docs/VISION_CV_CONTRACT.md`
+- `docs/CAMERA_WORKFLOW_OVERVIEW.md`
+- `docs/COLLECTION_MECHANISM.md`
+- `docs/AUTONOMOUS_DRIVE_QUICKSTART.md`
 
-## Graphify workflow
-
-This repository uses Graphify for codebase navigation. Graphify output lives in
-`graphify-out/`, especially:
-
-- `graphify-out/GRAPH_REPORT.md`
-- `graphify-out/graph.json`
-- `graphify-out/graph.html`
-
-Before answering architecture questions, planning larger changes, or tracing
-dependencies, read `graphify-out/GRAPH_REPORT.md` and use
-`graphify-out/graph.json` as a navigation/context aid.
-
-Run:
-
-```bash
-graphify update .
-```
-
-after major structural changes, such as:
-
-- adding, removing, or moving files,
-- larger refactors,
-- changes to central classes or modules,
-- after `git pull`, merge, or branch switching when the graph may be stale.
-
-Do not run `graphify update .` after every tiny edit or one-line change.
-Graphify output is a navigation aid, not absolute truth; verify important
-conclusions against the actual source files.
+Graphify output is not currently present in this checkout. If `graphify-out/`
+is restored later, use it as a navigation aid for architecture questions and
+major structural changes.
 
 ---
 
@@ -367,24 +297,5 @@ or preserve safe prior state only when explicitly designed to do so.
 If robot pose is missing, route is invalid, XTE is unsafe, or calibration is not
 ready, the drive controller must stop or stay stopped.
 
-If pickup reconciliation detects a likely missed/nudged ball, it should correct
-the optimistic pickup count so the existing detector and planner can naturally
-route to the visible ball again.
-
 All safety fallbacks should be deterministic, visible in debug/status overlays,
 and easy to reason about during contest debugging.
-
----
-
-# Current Documentation
-
-Before making larger changes, read the relevant docs:
-
-- `docs/VISION_CV_CONTRACT.md`
-- `docs/PATHFINDING_ARCHITECTURE.md`
-- `docs/CAMERA_WORKFLOW_OVERVIEW.md`
-- `docs/TEST_OVERVIEW.md`
-- `CHANGELOG.md`
-
-These documents are part of the working contract. Update them when the contract
-or behavior changes.

@@ -4,9 +4,9 @@ from perception.camera.image import imagecapture
 from perception.camera.imageprocessing import imageprocessing
 import cv2
 
-from control.controller import RobotController
+from control.commander import RobotCommander
 
-robot = RobotController()
+robot = RobotCommander()
 
 def main():
     #Get picture from camera

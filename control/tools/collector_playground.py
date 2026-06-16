@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from control.controller import RobotController
+from control.commander import RobotCommander
 
 
 DEFAULT_MAX_MANUAL_UNITS = 5.0
@@ -282,7 +282,7 @@ class CollectorPlaygroundGui:
 
         def worker() -> None:
             try:
-                controller = RobotController(self.args.host, port=self.args.port, timeout=self.args.timeout)
+                controller = RobotCommander(self.args.host, port=self.args.port, timeout=self.args.timeout)
             except OSError as exc:
                 self.show_error(f"Could not connect to EV3 controller at {self.args.host}:{self.args.port}: {exc}")
                 self.busy = False
@@ -630,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         controller = DummyCollectorController()
     else:
         try:
-            controller = RobotController(args.host, port=args.port, timeout=args.timeout)
+            controller = RobotCommander(args.host, port=args.port, timeout=args.timeout)
         except OSError as exc:
             print(f"Could not connect to EV3 controller at {args.host}:{args.port}: {exc}", file=sys.stderr)
             return 1

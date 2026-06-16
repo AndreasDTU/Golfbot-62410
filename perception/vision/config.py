@@ -398,6 +398,13 @@ class DriveConfig:
     telemetry_ringbuffer_size: int = 300
     telemetry_auto_dump_enabled: bool = True
     telemetry_dump_dir: str = "telemetry"
+    # Turn speed profile
+    turn_speed_pct: float = 25.0
+    turn_creep_speed_pct: float = 8.0
+    turn_cruise_angle_deg: float = 30.0
+    turn_creep_angle_deg: float = 8.0
+    # Adjust gain (degrees of heading error -> speed% differential)
+    adjust_gain: float = 2.0
 
 
 @dataclass(frozen=True)

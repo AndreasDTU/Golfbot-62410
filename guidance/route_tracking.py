@@ -464,5 +464,5 @@ class DriveSafetyGuard:
             drive_runtime.last_message = ""
         else:
             drive_runtime.state = DriveControlState.DISPATCH_ERROR
-            drive_runtime.last_message = drive_runtime.dispatcher.last_error
+            drive_runtime.last_message = drive_runtime.commander.last_error
             drive_runtime.last_command = WheelCommand(0.0, 0.0)

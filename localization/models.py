@@ -86,10 +86,6 @@ class DriveRuntime:
     active_route_identity: int | None = None
     route_progress_segment_index: int = 0
 
-    @property
-    def dispatcher(self) -> object | None:
-        return self.commander.dispatcher if self.commander is not None else None
-
     def stop(self, state: DriveControlState, message: str = "") -> None:
         """Send a deterministic zero-speed command and update overlay state."""
         previous_command = self.last_command

@@ -38,7 +38,7 @@ class AppMode(str, Enum):
 
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
-STATUS_BAR_HEIGHT = 80
+STATUS_BAR_HEIGHT = 110
 
 
 @dataclass(frozen=True)
@@ -216,10 +216,14 @@ class MainGui:
         return self._left_w + self._right_w
 
     def _canvas_height(self) -> int:
-        return max(self._left_h, self._right_h) + STATUS_BAR_HEIGHT
+        return self._panel_height() + STATUS_BAR_HEIGHT
+
+    def _panel_height(self) -> int:
+        return max(self._left_h, self._right_h)
 
     def buttons(self) -> list[GuiButton]:
-        y = max(self._left_h, self._right_h) + 10
+        # Buttons sit on a row below the two status text lines
+        y = self._panel_height() + 70
         bw, bh = 110, 30
         gap = 10
         x0 = 20
@@ -364,7 +368,7 @@ class MainGui:
         )
 
     def _draw_status_bar(self, canvas: np.ndarray) -> None:
-        y0 = max(self._left_h, self._right_h)
+        y0 = self._panel_height()
         cv2.rectangle(canvas, (0, y0), (canvas.shape[1], canvas.shape[0]), (50, 50, 50), -1)
 
         cal_state = self.pipeline.preprocessor.homography_calibrator.calibration_state.value
@@ -374,15 +378,16 @@ class MainGui:
             pose_text = f"({p.x_cm:.1f}, {p.y_cm:.1f}) heading {math.degrees(p.heading_rad):.1f} deg"
 
         status = f"Cal: {cal_state} | Pose: {pose_text} | Mode: {self.mode.value} | FPS: {self.fps:.1f}"
-        cv2.putText(canvas, status, (20, y0 + 22),
+        cv2.putText(canvas, status, (20, y0 + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(canvas, self.message, (20, y0 + 48),
+        cv2.putText(canvas, self.message, (20, y0 + 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
         cv2.putText(canvas,
                     "Keys: q/Esc quit | f set corners | m manual | a auto | s stop",
-                    (20, y0 + 70),
+                    (20, y0 + 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
 
+        # Buttons drawn on their own row below text (y computed in buttons())
         for button in self.buttons():
             bx, by, bw, bh = button.rect
             is_active = (
@@ -431,15 +436,14 @@ class MainGui:
             cv2.putText(right, "No camera input", (30, self._right_h // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
 
-        # Match heights
-        if left.shape[0] != right.shape[0]:
-            target_h = max(left.shape[0], right.shape[0])
-            if left.shape[0] != target_h:
-                s = target_h / left.shape[0]
-                left = cv2.resize(left, (int(left.shape[1] * s), target_h))
-            if right.shape[0] != target_h:
-                s = target_h / right.shape[0]
-                right = cv2.resize(right, (int(right.shape[1] * s), target_h))
+        # Top-align: pad the shorter panel at the bottom with black
+        target_h = max(left.shape[0], right.shape[0])
+        if left.shape[0] < target_h:
+            pad = np.zeros((target_h - left.shape[0], left.shape[1], 3), dtype=np.uint8)
+            left = np.vstack([left, pad])
+        if right.shape[0] < target_h:
+            pad = np.zeros((target_h - right.shape[0], right.shape[1], 3), dtype=np.uint8)
+            right = np.vstack([right, pad])
 
         panels = np.hstack([left, right])
         canvas = np.zeros((panels.shape[0] + STATUS_BAR_HEIGHT, panels.shape[1], 3), dtype=np.uint8)

@@ -291,7 +291,7 @@ class PlannerConfig:
     heuristic_weight: float = 1.5
     gear_shift_penalty: float = 50.0
     steering_change_penalty: float = 3.0
-    transit_speed_pct: float = 38.0
+    transit_speed_pct: float = 8.0
     pivot_speed_pct: float = 30.0
     creep_speed_pct: float = 7.0
     flexible_standoff_max_cm: float = 15.0
@@ -326,7 +326,7 @@ class DriveConfig:
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     max_cross_track_error_cm: float = 8.0
-    base_speed_pct: float = 100.0
+    base_speed_pct: float = 50.0
     max_speed_pct: float = 100.0
     heading_kp: float = 38.0
     xte_kp: float = 2.2
@@ -404,7 +404,7 @@ class DriveConfig:
     turn_cruise_angle_deg: float = 30.0
     turn_creep_angle_deg: float = 8.0
     # Adjust gain (degrees of heading error -> speed% differential)
-    adjust_gain: float = 2.0
+    adjust_gain: float = 0.5
 
 
 @dataclass(frozen=True)

@@ -109,8 +109,8 @@ class TestDrive:
         c = make_commander()
         c.drive(100.0)
         left, right = last_lr(c)
-        assert left == pytest.approx(c._config.base_speed_pct, abs=0.5)
-        assert right == pytest.approx(c._config.base_speed_pct, abs=0.5)
+        assert left == pytest.approx(c._config.drive_speed_pct, abs=0.5)
+        assert right == pytest.approx(c._config.drive_speed_pct, abs=0.5)
 
     def test_close_distance_uses_creep_speed(self):
         c = make_commander()
@@ -124,7 +124,7 @@ class TestDrive:
         mid = (cfg.creep_distance_cm + cfg.cruise_distance_cm) / 2
         c.drive(mid)
         left, _ = last_lr(c)
-        assert cfg.creep_speed_pct < left < cfg.base_speed_pct
+        assert cfg.creep_speed_pct < left < cfg.drive_speed_pct
 
     def test_negative_drives_backward(self):
         c = make_commander()

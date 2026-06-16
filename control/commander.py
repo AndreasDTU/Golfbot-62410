@@ -164,10 +164,10 @@ class RobotCommander:
         if distance <= cfg.creep_distance_cm:
             return cfg.creep_speed_pct
         if distance >= cfg.cruise_distance_cm:
-            return cfg.base_speed_pct
+            return cfg.drive_speed_pct
         span = max(1e-6, cfg.cruise_distance_cm - cfg.creep_distance_cm)
         ratio = (distance - cfg.creep_distance_cm) / span
-        return cfg.creep_speed_pct + ratio * (cfg.base_speed_pct - cfg.creep_speed_pct)
+        return cfg.creep_speed_pct + ratio * (cfg.drive_speed_pct - cfg.creep_speed_pct)
 
     def _target_speed_for_angle(self, degrees: float) -> float:
         """Profiled rotation speed for a remaining angle."""

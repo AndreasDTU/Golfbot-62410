@@ -61,7 +61,7 @@ class DebugRenderer:
     def route_velocity_color_for_speed(self, speed_pct: float) -> tuple[int, int, int]:
         """Map a profiled speed to a BGR heatmap color."""
         creep = max(0.0, float(self.drive_config.creep_speed_pct))
-        cruise = max(creep + 1e-6, float(self.drive_config.base_speed_pct))
+        cruise = max(creep + 1e-6, float(self.drive_config.drive_speed_pct))
         ratio = float(np.clip((speed_pct - creep) / (cruise - creep), 0.0, 1.0))
         if ratio < 0.5:
             local = ratio / 0.5

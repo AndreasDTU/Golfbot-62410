@@ -85,16 +85,16 @@ class WheelCommandController:
         """Return the profiled forward speed target for a goal distance."""
         drive_config = config or DriveConfig()
         if not math.isfinite(distance_to_goal_cm):
-            return drive_config.base_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
+            return drive_config.drive_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
         distance = max(0.0, float(distance_to_goal_cm))
         if distance <= drive_config.creep_distance_cm:
             return drive_config.creep_speed_pct
         if distance >= drive_config.cruise_distance_cm:
-            return drive_config.base_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
+            return drive_config.drive_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
 
         span = max(1e-6, drive_config.cruise_distance_cm - drive_config.creep_distance_cm)
         ratio = (distance - drive_config.creep_distance_cm) / span
-        edge_base_speed = drive_config.base_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
+        edge_base_speed = drive_config.drive_speed_pct * WheelCommandController.edge_speed_multiplier(edge_clearance_cm, drive_config)
         return drive_config.creep_speed_pct + ratio * (edge_base_speed - drive_config.creep_speed_pct)
 
     def slew_limited_speed(self, desired_speed_pct: float, dt_s: float | None) -> float:

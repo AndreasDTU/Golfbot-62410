@@ -49,6 +49,7 @@ DEFAULT_TOLERANCE = 15
 DEFAULT_MIN_CIRCULARITY = 75
 DEFAULT_MIN_AREA = 20
 MAX_K = 15
+ANALYSIS_EVERY_N_FRAMES = 5
 
 CLASS_ORDER = ("white", "orange", "red", "floor")
 CLASS_KEYS = {
@@ -85,6 +86,7 @@ class AppState:
     active_class: str
     target_labs: dict[str, np.ndarray]
     current_frame: np.ndarray | None = None
+    frame_index: int = 0
     cached_k: int = -1
     cached_quantized: np.ndarray | None = None
     cached_label_map: np.ndarray | None = None
@@ -146,8 +148,8 @@ def quantize_image(image: np.ndarray, k_clusters: int) -> tuple[np.ndarray, np.n
     return quantized, label_map, centers, centers_lab
 
 
-def ensure_quantized_cache(state: AppState, frame: np.ndarray, k_clusters: int) -> None:
-    if state.cached_k == k_clusters and state.cached_quantized is not None:
+def ensure_quantized_cache(state: AppState, frame: np.ndarray, k_clusters: int, force_refresh: bool = False) -> None:
+    if not force_refresh and state.cached_k == k_clusters and state.cached_quantized is not None:
         return
 
     quantized, label_map, centers_bgr, centers_lab = quantize_image(frame, k_clusters)
@@ -529,8 +531,9 @@ def analyze_frame(
     frame: np.ndarray,
     state: AppState,
     settings: dict[str, float],
+    force_refresh: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[Detection], list[Detection], Detection | None, list[np.ndarray], dict[str, list[int]]]:
-    ensure_quantized_cache(state, frame, int(settings["k"]))
+    ensure_quantized_cache(state, frame, int(settings["k"]), force_refresh=force_refresh)
     assert state.cached_quantized is not None
     assert state.cached_label_map is not None
     assert state.cached_centers_lab is not None
@@ -651,6 +654,7 @@ def process_static_image(state: AppState) -> int:
             state.current_frame,
             state,
             settings,
+            force_refresh=True,
         )
         dashboard = build_dashboard(
             state.current_frame,
@@ -687,6 +691,7 @@ def process_live_feed(state: AppState) -> int:
         return 1
 
     previous_time = time.perf_counter()
+    last_analysis: tuple[np.ndarray, np.ndarray, list[Detection], list[Detection], Detection | None, list[np.ndarray], dict[str, list[int]]] | None = None
 
     try:
         while True:
@@ -702,16 +707,23 @@ def process_live_feed(state: AppState) -> int:
                 return 1
 
             state.current_frame = undistorted.copy()
+            state.frame_index += 1
             settings = get_trackbar_values()
             current_time = time.perf_counter()
             delta = max(current_time - previous_time, 1e-6)
             previous_time = current_time
 
-            _quantized, masks, white_balls, orange_balls, red_cross, red_borders, cluster_info = analyze_frame(
-                state.current_frame,
-                state,
-                settings,
-            )
+            refresh_analysis = last_analysis is None or state.frame_index % ANALYSIS_EVERY_N_FRAMES == 0
+            if refresh_analysis:
+                last_analysis = analyze_frame(
+                    state.current_frame,
+                    state,
+                    settings,
+                    force_refresh=True,
+                )
+
+            assert last_analysis is not None
+            _quantized, masks, white_balls, orange_balls, red_cross, red_borders, cluster_info = last_analysis
             dashboard = build_dashboard(
                 state.current_frame,
                 state,

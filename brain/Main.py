@@ -2,7 +2,7 @@
 
 Single-window OpenCV GUI: live top-down camera feed (left) beside the 2D
 schematic field view (right), with a status bar showing mode, pose, and FPS.
-View-only for now; robot control will be wired in later stages.
+Guidance isolation testing (Stage 2) is available via the Guide Test button.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -22,8 +23,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from control.commander import RobotCommander
+from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
 from localization.models import RobotPose
+from path.pathfinding.models import HybridPose
 from perception.vision.config import AppConfig
 from perception.vision.debug import DebugRenderer
 from perception.vision.models import CalibrationState
@@ -34,11 +38,38 @@ class AppMode(str, Enum):
     IDLE = "IDLE"
     MANUAL = "MANUAL"
     AUTO = "AUTO"
+    GUIDANCE_TEST = "GUIDANCE_TEST"
 
 
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
-STATUS_BAR_HEIGHT = 110
+STATUS_BAR_HEIGHT = 130
+
+
+# ---------------------------------------------------------------------------
+# Hardcoded test routes for Stage 2 guidance isolation testing
+# ---------------------------------------------------------------------------
+
+def _route_waypoints(coords: list[tuple[float, float]]) -> list[HybridPose]:
+    """Build a waypoint list with theta pointing toward the next waypoint."""
+    waypoints: list[HybridPose] = []
+    for i, (x, y) in enumerate(coords):
+        if i < len(coords) - 1:
+            nx, ny = coords[i + 1]
+            theta = math.atan2(ny - y, nx - x)
+        else:
+            theta = waypoints[-1].theta_rad if waypoints else 0.0
+        waypoints.append(HybridPose(x_cm=x, y_cm=y, theta_rad=theta))
+    return waypoints
+
+
+TEST_ROUTES: dict[str, list[HybridPose]] = {
+    "straight": _route_waypoints([(30, 60), (137, 60)]),
+    "90_turn":  _route_waypoints([(40, 30), (120, 30), (120, 90)]),
+    "L_shape":  _route_waypoints([(30, 30), (100, 30), (100, 90), (140, 90)]),
+}
+
+TEST_ROUTE_NAMES: list[str] = list(TEST_ROUTES.keys())
 
 
 @dataclass(frozen=True)
@@ -185,6 +216,15 @@ class MainGui:
     _corner_state: CornerSelectionState = field(default_factory=CornerSelectionState)
     _corner_window_open: bool = False
 
+    # Guidance test state
+    _commander: RobotCommander | None = None
+    _guidance: GuidanceController | None = None
+    _connecting: bool = False
+    _guidance_status: GuidanceStatus | None = None
+    _active_route_name: str = "L_shape"
+    _active_route: list[HybridPose] | None = None
+    _last_guidance_time: float | None = None
+
     # Dimensions derived from config
     _left_w: int = 0
     _left_h: int = 0
@@ -222,17 +262,18 @@ class MainGui:
         return max(self._left_h, self._right_h)
 
     def buttons(self) -> list[GuiButton]:
-        # Buttons sit on a row below the two status text lines
-        y = self._panel_height() + 70
-        bw, bh = 110, 30
-        gap = 10
+        # Buttons sit on a row below the status text lines
+        y = self._panel_height() + 90
+        bw, bh = 95, 30
+        gap = 8
         x0 = 20
         return [
             GuiButton("Set Corners", "set_corners", (x0, y, bw, bh)),
-            GuiButton("Manual", "manual", (x0 + (bw + gap), y, bw, bh)),
-            GuiButton("Auto", "auto", (x0 + 2 * (bw + gap), y, bw, bh)),
-            GuiButton("Stop", "stop", (x0 + 3 * (bw + gap), y, bw, bh)),
-            GuiButton("Quit", "quit", (x0 + 4 * (bw + gap), y, bw, bh)),
+            GuiButton("Guide Test", "guidance_test", (x0 + (bw + gap), y, bw, bh)),
+            GuiButton("Manual", "manual", (x0 + 2 * (bw + gap), y, bw, bh)),
+            GuiButton("Auto", "auto", (x0 + 3 * (bw + gap), y, bw, bh)),
+            GuiButton("Stop", "stop", (x0 + 4 * (bw + gap), y, bw, bh)),
+            GuiButton("Quit", "quit", (x0 + 5 * (bw + gap), y, bw, bh)),
         ]
 
     def handle_mouse(self, event: int, x: int, y: int, _flags: int, _userdata) -> None:
@@ -248,13 +289,21 @@ class MainGui:
     def _handle_button(self, action: str) -> None:
         if action == "set_corners":
             self._open_corner_window()
+        elif action == "guidance_test":
+            if self.mode == AppMode.GUIDANCE_TEST:
+                self._cycle_test_route()
+            else:
+                self._start_guidance_test()
         elif action == "manual":
+            self._disconnect_guidance()
             self.mode = AppMode.MANUAL
             self.message = "Manual mode (view only)"
         elif action == "auto":
+            self._disconnect_guidance()
             self.mode = AppMode.AUTO
             self.message = "Auto mode (view only)"
         elif action == "stop":
+            self._disconnect_guidance()
             self.mode = AppMode.IDLE
             self.message = "Stopped"
         elif action == "quit":
@@ -315,6 +364,90 @@ class MainGui:
             self._close_corner_window()
 
     # ------------------------------------------------------------------
+    # Guidance test (Stage 2 isolation testing)
+    # ------------------------------------------------------------------
+
+    def _start_guidance_test(self) -> None:
+        """Connect to the robot in a background thread and load a test route."""
+        if self._connecting:
+            self.message = "Already connecting..."
+            return
+        if self._commander is not None:
+            # Already connected — just load route
+            self._load_test_route(self._active_route_name)
+            return
+        self._connecting = True
+        self.message = "Connecting to robot..."
+
+        def connect() -> None:
+            try:
+                commander = RobotCommander(
+                    drive_config=self.config.drive,
+                    auto_connect=True,
+                )
+                self._commander = commander
+                self._guidance = GuidanceController(commander, config=self.config.drive)
+                self._load_test_route(self._active_route_name)
+                self.message = f"Connected — route: {self._active_route_name}"
+            except Exception as exc:
+                self.message = f"Connection failed: {exc}"
+                self._commander = None
+                self._guidance = None
+            finally:
+                self._connecting = False
+
+        thread = threading.Thread(target=connect, daemon=True)
+        thread.start()
+
+    def _load_test_route(self, name: str) -> None:
+        """Set a test route on the guidance controller."""
+        self._active_route_name = name
+        self._active_route = TEST_ROUTES[name]
+        self._last_guidance_time = None
+        self._guidance_status = None
+        if self._guidance is not None:
+            self._guidance.set_route(list(self._active_route))
+        self.mode = AppMode.GUIDANCE_TEST
+        self.message = f"Guidance test — route: {name}"
+
+    def _cycle_test_route(self) -> None:
+        """Advance to the next test route."""
+        idx = TEST_ROUTE_NAMES.index(self._active_route_name)
+        next_name = TEST_ROUTE_NAMES[(idx + 1) % len(TEST_ROUTE_NAMES)]
+        self._load_test_route(next_name)
+
+    def _disconnect_guidance(self) -> None:
+        """Clear route, stop robot, close socket, reset guidance state."""
+        if self._guidance is not None:
+            self._guidance.clear_route()
+        if self._commander is not None:
+            try:
+                self._commander.close()
+            except Exception:
+                pass
+        self._commander = None
+        self._guidance = None
+        self._guidance_status = None
+        self._active_route = None
+        self._last_guidance_time = None
+
+    def _tick_guidance(self) -> None:
+        """Run one guidance frame if in GUIDANCE_TEST mode."""
+        if self.mode != AppMode.GUIDANCE_TEST:
+            return
+        if self._guidance is None or self._connecting:
+            return
+
+        now = time.perf_counter()
+        if self._last_guidance_time is None:
+            dt_s = 0.033
+        else:
+            dt_s = max(0.001, min(0.5, now - self._last_guidance_time))
+        self._last_guidance_time = now
+
+        self._guidance_status = self._guidance.tick(self.robot_pose, dt_s)
+
+    # ------------------------------------------------------------------
     # Per-frame processing
     # ------------------------------------------------------------------
 
@@ -358,6 +491,14 @@ class MainGui:
             float(self.params.get("camera_center_x", self._left_w / 2)),
             float(self.params.get("camera_center_y", self._left_h / 2)),
         )
+
+        # Pass test route waypoints to the schematic when guidance is active
+        manual_wp: list[tuple[float, float]] | None = None
+        route_pts: list[HybridPose] | None = None
+        if self._active_route is not None and self.mode == AppMode.GUIDANCE_TEST:
+            manual_wp = [(wp.x_cm, wp.y_cm) for wp in self._active_route]
+            route_pts = self._active_route
+
         return self.renderer.draw_schematic(
             frame_shape=frame_shape,
             red_zones=result.red_zones,
@@ -365,6 +506,8 @@ class MainGui:
             camera_center_pixels=camera_center,
             robot_pose=self.robot_pose,
             params=self.params,
+            route_points_cm=route_pts,
+            manual_waypoints_cm=manual_wp,
         )
 
     def _draw_status_bar(self, canvas: np.ndarray) -> None:
@@ -380,11 +523,27 @@ class MainGui:
         status = f"Cal: {cal_state} | Pose: {pose_text} | Mode: {self.mode.value} | FPS: {self.fps:.1f}"
         cv2.putText(canvas, status, (20, y0 + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(canvas, self.message, (20, y0 + 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
+
+        # Guidance status line (line 2) — only when in guidance test mode
+        if self.mode == AppMode.GUIDANCE_TEST:
+            gs = self._guidance_status.value if self._guidance_status else "—"
+            cursor = self._guidance.cursor if self._guidance else 0
+            wp_count = self._guidance.waypoint_count if self._guidance else 0
+            connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
+            if self._connecting:
+                connected = "Connecting..."
+            guidance_line = f"Guidance: {gs} | WP: {cursor}/{wp_count} | Route: {self._active_route_name} | {connected}"
+            cv2.putText(canvas, guidance_line, (20, y0 + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, self.message, (20, y0 + 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
+        else:
+            cv2.putText(canvas, self.message, (20, y0 + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
+
         cv2.putText(canvas,
-                    "Keys: q/Esc quit | f set corners | m manual | a auto | s stop",
-                    (20, y0 + 62),
+                    "Keys: q/Esc quit | f set corners | g guidance test | s stop",
+                    (20, y0 + 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
 
         # Buttons drawn on their own row below text (y computed in buttons())
@@ -392,6 +551,7 @@ class MainGui:
             bx, by, bw, bh = button.rect
             is_active = (
                 (button.action == "set_corners" and self._corner_window_open)
+                or (button.action == "guidance_test" and self.mode == AppMode.GUIDANCE_TEST)
                 or (button.action == "manual" and self.mode == AppMode.MANUAL)
                 or (button.action == "auto" and self.mode == AppMode.AUTO)
                 or (button.action == "stop" and self.mode == AppMode.IDLE)
@@ -426,6 +586,7 @@ class MainGui:
         if raw_frame is not None:
             result = self._process_frame(raw_frame)
             self._estimate_pose(result)
+            self._tick_guidance()
             left = self._build_left_panel(result)
             right = self._build_right_panel(result)
         else:
@@ -463,6 +624,8 @@ class MainGui:
                 self.closed = True
         elif key == ord("f"):
             self._handle_button("set_corners")
+        elif key == ord("g"):
+            self._handle_button("guidance_test")
         elif key == ord("r") and self._corner_window_open:
             self._corner_state.points.clear()
         elif key == ord("m"):
@@ -486,6 +649,7 @@ class MainGui:
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 self.closed = True
 
+        self._disconnect_guidance()
         if self._corner_window_open:
             self._close_corner_window()
         if self.camera is not None:
@@ -493,6 +657,7 @@ class MainGui:
         cv2.destroyWindow(WINDOW_NAME)
 
     def close(self) -> None:
+        self._disconnect_guidance()
         self.closed = True
 
 

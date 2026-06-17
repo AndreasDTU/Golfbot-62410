@@ -53,6 +53,7 @@ HEADING_STEP_RAD = math.radians(1.0)
 
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
+CROSS_WINDOW_NAME = "Place Red Cross"
 STATUS_BAR_HEIGHT = 170
 
 
@@ -128,18 +129,30 @@ def _corner_on_mouse(event: int, x: int, y: int, _flags: int, state: CornerSelec
             state.done = True
 
 
-def _draw_corner_overlay(frame: np.ndarray, state: CornerSelectionState) -> np.ndarray:
-    """Draw point markers, polylines, loupe, and help text on the selector view."""
-    overlay = frame.copy()
-    h, w = overlay.shape[:2]
+def _cross_on_mouse(event: int, x: int, y: int, _flags: int, state: CornerSelectionState) -> None:
+    """Collect up to 2 corner clicks for the red-cross placement window."""
+    w, h = state.frame_size
+    if w > 0 and h > 0:
+        state.cursor = (int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1)))
 
-    # Loupe
-    crop_sz = 40
-    scale = 5
-    padding = 12
+    if event == cv2.EVENT_RBUTTONDOWN:
+        state.points.clear()
+        state.done = False
+        return
+
+    if event == cv2.EVENT_LBUTTONDOWN and len(state.points) < 2:
+        state.points.append(state.cursor)
+        if len(state.points) == 2:
+            state.done = True
+
+
+def _draw_loupe(overlay: np.ndarray, cursor: tuple[int, int],
+                crop_sz: int = 40, scale: int = 5, padding: int = 12) -> None:
+    """Draw a magnified crosshair loupe of the area under the cursor (top-right)."""
+    h, w = overlay.shape[:2]
     crop_w = min(crop_sz, w)
     crop_h = min(crop_sz, h)
-    cx, cy = state.cursor
+    cx, cy = cursor
     x0 = max(0, cx - crop_w // 2)
     x1 = x0 + crop_w
     if x1 > w:
@@ -165,6 +178,14 @@ def _draw_corner_overlay(frame: np.ndarray, state: CornerSelectionState) -> np.n
     lcy = dy0 + vis.shape[0] // 2
     cv2.line(overlay, (lcx, dy0), (lcx, dy1), (0, 255, 255), 1)
     cv2.line(overlay, (dx0, lcy), (dx1, lcy), (0, 255, 255), 1)
+
+
+def _draw_corner_overlay(frame: np.ndarray, state: CornerSelectionState) -> np.ndarray:
+    """Draw point markers, polylines, loupe, and help text on the selector view."""
+    overlay = frame.copy()
+    h, w = overlay.shape[:2]
+
+    _draw_loupe(overlay, state.cursor)
 
     # Points
     for i, pt in enumerate(state.points, start=1):
@@ -258,8 +279,8 @@ class MainGui:
 
     # Manual red-cross obstacle state
     _cross_spec: RedCrossSpec | None = None
-    _cross_placing: bool = False
-    _cross_clicks: list[tuple[float, float]] = field(default_factory=list)
+    _cross_window_open: bool = False
+    _cross_state: CornerSelectionState = field(default_factory=CornerSelectionState)
 
     # Dimensions derived from config
     _left_w: int = 0
@@ -298,30 +319,103 @@ class MainGui:
     # ------------------------------------------------------------------
 
     def _start_cross_placement(self) -> None:
-        """Begin placing the central red cross by clicking two arm corners."""
+        """Open the zoomed cross-placement window (top-down view + loupe)."""
         if self.pipeline.preprocessor.homography_calibrator.transform_matrix is None:
             self.message = "Set field corners before placing the cross"
             return
-        self._cross_placing = True
-        self._cross_clicks = []
-        self.message = "Cross: click an arm TIP corner, then that arm's inner ARMPIT corner"
+        if self.camera is None and self.static_image is None:
+            self.message = "No camera — cannot place cross"
+            return
+        self._cross_state.clear()
+        self._cross_window_open = True
+        cv2.namedWindow(CROSS_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(CROSS_WINDOW_NAME, _cross_on_mouse, self._cross_state)
+        self.message = "Cross window: click an arm TIP corner, then its inner ARMPIT corner"
 
-    def _add_cross_click(self, x: int, y: int) -> None:
-        """Record a left-panel click as a cross corner in field cm."""
-        topdown_w, topdown_h = self.config.camera.topdown_warp_size
-        topdown_px = (
-            x * topdown_w / max(1, self._left_w),
-            y * topdown_h / max(1, self._left_h),
-        )
-        self._cross_clicks.append(self.pipeline.mapper.topdown_px_to_field_cm(topdown_px))
-        if len(self._cross_clicks) >= 2:
-            tip_corner, armpit_corner = self._cross_clicks[0], self._cross_clicks[1]
-            self._cross_spec = RedCrossSpec.from_tip_and_armpit(tip_corner, armpit_corner)
-            self._cross_placing = False
-            self._cross_clicks = []
+    def _close_cross_window(self) -> None:
+        self._cross_window_open = False
+        try:
+            cv2.destroyWindow(CROSS_WINDOW_NAME)
+        except cv2.error:
+            pass
+
+    def _tick_cross_window(self, raw_frame: np.ndarray) -> None:
+        """Drive the zoomed cross-placement window for one frame."""
+        if not self._cross_window_open:
+            return
+
+        try:
+            if cv2.getWindowProperty(CROSS_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                self._close_cross_window()
+                self.message = "Cross placement cancelled"
+                return
+        except cv2.error:
+            self._close_cross_window()
+            self.message = "Cross placement cancelled"
+            return
+
+        # Show the top-down (warped) view, where the cross is rectified and pixels
+        # map linearly to field cm.
+        undistorted = self.pipeline.preprocessor.undistort(raw_frame)
+        topdown = self.pipeline.preprocessor.homography_calibrator.warp(undistorted)
+        if topdown is None:
+            self.message = "No top-down warp — set field corners first"
+            self._close_cross_window()
+            return
+
+        state = self._cross_state
+        state.frame_size = (topdown.shape[1], topdown.shape[0])
+        if state.cursor == (0, 0):
+            state.cursor = (topdown.shape[1] // 2, topdown.shape[0] // 2)
+
+        view = topdown.copy()
+        _draw_loupe(view, state.cursor)
+
+        # Live preview: anchor + (second click or current cursor)
+        if len(state.points) >= 1:
+            tip_px = state.points[0]
+            armpit_px = state.points[1] if len(state.points) == 2 else state.cursor
+            self._draw_cross_preview(view, tip_px, armpit_px)
+
+        labels = ["TIP corner", "ARMPIT corner"]
+        for i, point in enumerate(state.points):
+            cv2.circle(view, point, 5, (255, 0, 0), -1, cv2.LINE_AA)
+            cv2.putText(view, labels[i] if i < len(labels) else "", (point[0] + 8, point[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2, cv2.LINE_AA)
+
+        help_lines = [
+            f"Points: {len(state.points)}/2",
+            "1) Click an arm TIP corner",
+            "2) Click that arm's inner ARMPIT corner",
+            "Size scales with the gap. Right click/r: reset. q/Esc: cancel",
+        ]
+        for i, text in enumerate(help_lines):
+            cv2.putText(view, text, (16, 28 + i * 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.imshow(CROSS_WINDOW_NAME, view)
+
+        if state.done:
+            tip_cm = self.pipeline.mapper.topdown_px_to_field_cm(state.points[0])
+            armpit_cm = self.pipeline.mapper.topdown_px_to_field_cm(state.points[1])
+            self._cross_spec = RedCrossSpec.from_tip_and_armpit(tip_cm, armpit_cm)
             self._save_cross()
-        else:
-            self.message = "Cross: now click that arm's inner ARMPIT corner"
+            self._close_cross_window()
+
+    def _draw_cross_preview(self, image: np.ndarray, tip_px: tuple[int, int], armpit_px: tuple[int, int]) -> None:
+        """Draw a cross preview in the window from two top-down pixel corners."""
+        mapper = self.pipeline.mapper
+        spec = RedCrossSpec.from_tip_and_armpit(
+            mapper.topdown_px_to_field_cm(tip_px),
+            mapper.topdown_px_to_field_cm(armpit_px),
+        )
+        poly = np.array(
+            [mapper.field_cm_to_topdown_pixel(p) for p in spec.polygon_cm()],
+            dtype=np.int32,
+        ).reshape(-1, 1, 2)
+        cv2.polylines(image, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
+        center = mapper.field_cm_to_topdown_pixel(spec.center_cm)
+        cv2.drawMarker(image, (int(round(center[0])), int(round(center[1]))),
+                       (0, 255, 255), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
 
     def _save_cross(self) -> None:
         path = self.config.paths.red_cross_file
@@ -457,10 +551,6 @@ class MainGui:
     def handle_mouse(self, event: int, x: int, y: int, _flags: int, _userdata) -> None:
         self._mouse_pos = (x, y)
         if event != cv2.EVENT_LBUTTONUP:
-            return
-        # While placing the cross, left-panel clicks are cross corners, not buttons.
-        if self._cross_placing and 0 <= x < self._left_w and 0 <= y < self._left_h:
-            self._add_cross_click(x, y)
             return
         for button in self.buttons():
             bx, by, bw, bh = button.rect
@@ -1028,8 +1118,8 @@ class MainGui:
         return left
 
     def _draw_cross_overlay(self, image: np.ndarray) -> None:
-        """Draw the placed cross (and in-progress clicks) on the top-down feed."""
-        if self._cross_spec is None and not self._cross_placing:
+        """Draw the placed cross on the top-down camera feed."""
+        if self._cross_spec is None:
             return
         mapper = self.pipeline.mapper
         topdown_w, topdown_h = self.config.camera.topdown_warp_size
@@ -1040,23 +1130,12 @@ class MainGui:
             px, py = mapper.field_cm_to_topdown_pixel(point_cm)
             return int(round(px * scale_x)), int(round(py * scale_y))
 
-        if self._cross_spec is not None:
-            poly = np.array([to_px(p) for p in self._cross_spec.polygon_cm()], dtype=np.int32).reshape(-1, 1, 2)
-            overlay = image.copy()
-            cv2.fillPoly(overlay, [poly], (0, 0, 255))
-            cv2.addWeighted(overlay, 0.35, image, 0.65, 0.0, image)
-            cv2.polylines(image, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
-            cv2.drawMarker(image, to_px(self._cross_spec.center_cm), (0, 255, 255), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
-
-        if self._cross_placing:
-            labels = ["TIP corner", "ARMPIT corner"]
-            for i, click_cm in enumerate(self._cross_clicks):
-                p = to_px(click_cm)
-                cv2.circle(image, p, 6, (255, 0, 0), -1, cv2.LINE_AA)
-                cv2.putText(image, labels[i] if i < len(labels) else "", (p[0] + 8, p[1] - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(image, "Place cross: click TIP corner, then ARMPIT corner",
-                        (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        poly = np.array([to_px(p) for p in self._cross_spec.polygon_cm()], dtype=np.int32).reshape(-1, 1, 2)
+        overlay = image.copy()
+        cv2.fillPoly(overlay, [poly], (0, 0, 255))
+        cv2.addWeighted(overlay, 0.35, image, 0.65, 0.0, image)
+        cv2.polylines(image, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.drawMarker(image, to_px(self._cross_spec.center_cm), (0, 255, 255), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
 
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.
@@ -1191,7 +1270,7 @@ class MainGui:
             bx, by, bw, bh = button.rect
             is_active = (
                 (button.action == "set_corners" and self._corner_window_open)
-                or (button.action == "set_cross" and self._cross_placing)
+                or (button.action == "set_cross" and self._cross_window_open)
                 or (button.action == "calib_robot" and self.mode == AppMode.CALIBRATE)
                 or (button.action == "guidance_test" and self.mode == AppMode.GUIDANCE_TEST)
                 or (button.action == "manual" and self.mode == AppMode.MANUAL)
@@ -1224,6 +1303,10 @@ class MainGui:
         # Drive the corner-selection window if open
         if self._corner_window_open and raw_frame is not None:
             self._tick_corner_window(raw_frame)
+
+        # Drive the cross-placement window if open
+        if self._cross_window_open and raw_frame is not None:
+            self._tick_cross_window(raw_frame)
 
         if raw_frame is not None:
             result = self._process_frame(raw_frame)
@@ -1265,6 +1348,9 @@ class MainGui:
             if self._corner_window_open:
                 self._close_corner_window()
                 self.message = "Corner selection cancelled"
+            elif self._cross_window_open:
+                self._close_cross_window()
+                self.message = "Cross placement cancelled"
             else:
                 self.closed = True
         elif key == ord("f"):
@@ -1273,6 +1359,9 @@ class MainGui:
             self._handle_button("guidance_test")
         elif key == ord("r") and self._corner_window_open:
             self._corner_state.points.clear()
+        elif key == ord("r") and self._cross_window_open:
+            self._cross_state.points.clear()
+            self._cross_state.done = False
         elif key == ord("m"):
             self._handle_button("manual")
         elif key == ord("a"):
@@ -1303,6 +1392,8 @@ class MainGui:
         self._disconnect_guidance()
         if self._corner_window_open:
             self._close_corner_window()
+        if self._cross_window_open:
+            self._close_cross_window()
         if self.camera is not None:
             self.camera.release()
         cv2.destroyWindow(WINDOW_NAME)

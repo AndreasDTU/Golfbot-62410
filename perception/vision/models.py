@@ -109,26 +109,30 @@ class RedCrossSpec:
         cls,
         tip_corner_cm: tuple[float, float],
         armpit_corner_cm: tuple[float, float],
-        length_cm: float = 20.0,
-        arm_width_cm: float = 3.0,
+        length_to_width_ratio: float = 20.0 / 3.0,
     ) -> "RedCrossSpec":
         """Build a cross from one arm's outer tip corner and its inner armpit corner.
 
-        The two corners lie on the same arm side-edge, so ``tip - armpit`` points
-        outward along the arm axis (a long, precise baseline).  The center is the
-        tip corner stepped back by a half-length along the axis and a half-width
-        across it (the armpit/tip sit on the +perpendicular side by convention).
+        The two corners lie on the same arm side-edge, so ``tip - armpit`` is the
+        arm axis and its length equals one side edge, ``(length - width) / 2``.
+        The cross is sized *relative to that clicked distance* (preserving the
+        plus proportion ``length_to_width_ratio``) rather than fixed centimetres,
+        so it scales to whatever cross you click.  The center is the tip corner
+        stepped back a half-length along the axis and a half-width across it.
         """
-        half_len = length_cm / 2.0
-        half_w = arm_width_cm / 2.0
         tx, ty = tip_corner_cm
         ax, ay = armpit_corner_cm
         dx, dy = tx - ax, ty - ay
-        norm = math.hypot(dx, dy)
-        if norm < 1e-6:
-            angle = 0.0
-        else:
-            angle = math.atan2(dy, dx)
+        edge = math.hypot(dx, dy)
+        angle = math.atan2(dy, dx) if edge > 1e-6 else 0.0
+
+        # edge = (length - width) / 2  and  length = ratio * width
+        ratio = max(1.0 + 1e-6, float(length_to_width_ratio))
+        arm_width_cm = 2.0 * edge / (ratio - 1.0)
+        length_cm = ratio * arm_width_cm
+
+        half_len = length_cm / 2.0
+        half_w = arm_width_cm / 2.0
         ex, ey = math.cos(angle), math.sin(angle)   # outward arm axis
         nx, ny = -math.sin(angle), math.cos(angle)   # +90 deg perpendicular
         center = (

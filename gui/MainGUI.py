@@ -268,11 +268,23 @@ class MainGui:
         self.params = self.pipeline.default_params()
         self._seed_geometry_params()
         self._load_robot_calibration()
+        self._load_field_corners()
         self._route_planner = RoutePlanningFacade(
             field_config=self.config.field,
             robot_config=self.config.robot,
             planner_config=self.config.planner,
         )
+
+    def _load_field_corners(self) -> None:
+        """Restore the saved manual top-down warp, if a corners file exists."""
+        corners_path = self.config.paths.field_corners_file
+        if corners_path is None or not corners_path.exists():
+            return
+        calibrator = self.pipeline.preprocessor.homography_calibrator
+        if calibrator.load_manual_corners(corners_path):
+            self.message = f"Field corners loaded from {corners_path.name} — warp active"
+        else:
+            self.message = "Saved field corners file invalid — press Set Corners"
 
     def _seed_geometry_params(self) -> None:
         """Ensure live geometry keys exist in params, defaulting from config."""
@@ -473,10 +485,16 @@ class MainGui:
         cv2.imshow(CORNER_WINDOW_NAME, view)
 
         if self._corner_state.done:
-            # Feed the 4 corners into the pipeline's HomographyCalibrator
+            # Feed the 4 corners into the pipeline's HomographyCalibrator and persist
+            # them so the warp is restored automatically on the next launch.
             calibrator = self.pipeline.preprocessor.homography_calibrator
             calibrator.set_manual_points(self._corner_state.points)
-            self.message = "Field corners set — top-down warp active"
+            corners_path = self.config.paths.field_corners_file
+            try:
+                calibrator.save_manual_corners(corners_path, self._corner_state.frame_size)
+                self.message = f"Field corners set and saved to {corners_path.name} — warp active"
+            except OSError as exc:
+                self.message = f"Field corners set — warp active (save failed: {exc})"
             self._close_corner_window()
 
     # ------------------------------------------------------------------

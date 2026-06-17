@@ -314,43 +314,83 @@ class RobotCalibrationCollector:
         return major / minor
 
     def compute_spin_centers(self, runtime: RobotCalibrationRuntime) -> bool:
-        """Finalize spin collection by fitting one circle center per marker."""
+        """Finalize spin collection by fitting one circle center per marker.
+
+        Tolerant of a missing marker: any marker with enough collected points is
+        fitted, and the calibration only fails when *no* marker qualifies.  This
+        lets the robot self-calibrate (or refresh) from a single visible marker
+        when the other is occluded during the spin.
+        """
         runtime.fitted_centers.clear()
         runtime.ellipse_ratios.clear()
-        warnings: list[str] = []
+        ellipse_warnings: list[str] = []
+        skipped: list[int] = []
 
         for marker_id in self.robot_config.marker_ids:
             points = runtime.collected_points.get(marker_id, [])
             if len(points) < self.calibration_config.min_robot_spin_points:
-                runtime.warning = (
-                    f"Need {self.calibration_config.min_robot_spin_points} spin points "
-                    f"for ID {marker_id}; got {len(points)}."
-                )
-                return False
+                skipped.append(marker_id)
+                continue
             xc, yc, _radius = self.fit_circle(points)
             runtime.fitted_centers[marker_id] = (xc, yc)
             ratio = self.ellipse_ratio(points)
             if ratio is not None:
                 runtime.ellipse_ratios[marker_id] = ratio
                 if ratio > self.calibration_config.ellipse_warning_ratio:
-                    warnings.append(f"ID {marker_id} ellipse ratio {ratio:.2f}")
+                    ellipse_warnings.append(f"ID {marker_id} ellipse ratio {ratio:.2f}")
 
-        runtime.warning = "WARNING: Elliptical spin path. Check floor slip or homography." if warnings else ""
+        if not runtime.fitted_centers:
+            runtime.warning = (
+                f"Need {self.calibration_config.min_robot_spin_points} spin points "
+                f"for at least one marker {self.robot_config.marker_ids}."
+            )
+            return False
+
+        messages: list[str] = []
+        if skipped:
+            messages.append(f"Skipped marker(s) {skipped}: too few spin points")
+        if ellipse_warnings:
+            messages.append(
+                "WARNING: Elliptical spin path (" + ", ".join(ellipse_warnings) + "). "
+                "Check floor slip or homography."
+            )
+        runtime.warning = " | ".join(messages)
         return True
 
-    def save_robot_calibration(
+    @staticmethod
+    def _read_existing_calibration(path: Path) -> dict[str, Any]:
+        """Return the parsed calibration JSON, or an empty dict if absent/corrupt."""
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def build_robot_calibration(
         self,
-        path: Path,
         runtime: RobotCalibrationRuntime,
         observations: dict[int, RobotMarkerObservation],
         parallax_config: ParallaxConfig,
         topdown_size: tuple[int, int],
+        existing: dict[str, Any] | None = None,
+        geometry: RobotGeometry | None = None,
+        heading_tuning_rad: float = 0.0,
     ) -> dict[str, Any]:
-        """Save marker-to-robot-origin offsets from the alignment frame."""
-        markers: dict[str, dict[str, float]] = {}
-        for marker_id in self.robot_config.marker_ids:
-            observation = observations[marker_id]
-            origin = runtime.fitted_centers[marker_id]
+        """Build a calibration dict in memory (no disk write).
+
+        Merges with ``existing``: markers that were not re-fit this run (e.g. one
+        marker was occluded) keep their previously saved offsets, and the
+        geometry tuning block is preserved unless ``geometry`` is given.  Only
+        markers that were both fitted *and* currently observed are updated, since
+        computing the offset needs a live observation at the aligned pose.
+        """
+        existing = existing or {}
+        markers: dict[str, dict[str, float]] = dict(existing.get("markers", {}))
+        for marker_id, origin in runtime.fitted_centers.items():
+            observation = observations.get(marker_id)
+            if observation is None:
+                continue
             dx = float(observation.ground_center[0] - origin[0])
             dy = float(observation.ground_center[1] - origin[1])
             alpha_rad = float(observation.yaw_rad)
@@ -376,5 +416,88 @@ class RobotCalibrationCollector:
             "topdown_size": [int(topdown_size[0]), int(topdown_size[1])],
             "markers": markers,
         }
+
+        geometry_block = existing.get("geometry")
+        if geometry is not None:
+            geometry_block = self.geometry_to_dict(geometry, heading_tuning_rad)
+        if isinstance(geometry_block, dict) and geometry_block:
+            calibration["geometry"] = geometry_block
+
+        return calibration
+
+    def save_robot_calibration(
+        self,
+        path: Path,
+        runtime: RobotCalibrationRuntime,
+        observations: dict[int, RobotMarkerObservation],
+        parallax_config: ParallaxConfig,
+        topdown_size: tuple[int, int],
+        geometry: RobotGeometry | None = None,
+        heading_tuning_rad: float = 0.0,
+    ) -> dict[str, Any]:
+        """Build (merging with any on-disk calibration) and persist to ``path``."""
+        existing = self._read_existing_calibration(path)
+        calibration = self.build_robot_calibration(
+            runtime,
+            observations,
+            parallax_config,
+            topdown_size,
+            existing=existing,
+            geometry=geometry,
+            heading_tuning_rad=heading_tuning_rad,
+        )
         path.write_text(json.dumps(calibration, indent=2, sort_keys=True), encoding="utf-8")
         return calibration
+
+    @staticmethod
+    def geometry_to_dict(geometry: RobotGeometry, heading_tuning_rad: float = 0.0) -> dict[str, float]:
+        """Serialize live robot body geometry (cm) plus heading tuning for JSON."""
+        return {
+            "width_cm": float(geometry.width_cm),
+            "front_cm": float(geometry.front_cm),
+            "rear_cm": float(geometry.rear_cm),
+            "tube_forward_cm": float(geometry.tube_forward_cm),
+            "tube_right_cm": float(geometry.tube_right_cm),
+            "unload_extension_cm": float(geometry.unload_extension_cm),
+            "heading_tuning_rad": float(heading_tuning_rad),
+            "heading_tuning_deg": math.degrees(float(heading_tuning_rad)),
+        }
+
+    def save_geometry_tuning(
+        self,
+        path: Path,
+        geometry: RobotGeometry,
+        heading_tuning_rad: float = 0.0,
+    ) -> dict[str, Any]:
+        """Persist only the geometry/heading tuning, preserving spin offsets.
+
+        Lets the operator nudge the virtual body to match the physical robot and
+        save without re-running a spin.
+        """
+        calibration = self._read_existing_calibration(path)
+        calibration["geometry"] = self.geometry_to_dict(geometry, heading_tuning_rad)
+        path.write_text(json.dumps(calibration, indent=2, sort_keys=True), encoding="utf-8")
+        return calibration
+
+    @staticmethod
+    def apply_geometry_to_params(
+        params: dict[str, object],
+        geometry_block: dict[str, Any] | None,
+    ) -> dict[str, object]:
+        """Seed live detector params from a saved geometry block, in place."""
+        if not isinstance(geometry_block, dict):
+            return params
+        mapping = {
+            "width_cm": "robot_width_cm",
+            "front_cm": "robot_front_cm",
+            "rear_cm": "robot_rear_cm",
+            "tube_forward_cm": "tube_forward_cm",
+            "tube_right_cm": "tube_right_cm",
+            "unload_extension_cm": "unload_extension_cm",
+            "heading_tuning_rad": "heading_tuning_rad",
+        }
+        for source_key, param_key in mapping.items():
+            value = geometry_block.get(source_key)
+            if isinstance(value, (int, float)):
+                params[param_key] = float(value)
+        return params

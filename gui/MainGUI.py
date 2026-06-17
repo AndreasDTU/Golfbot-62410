@@ -19,9 +19,10 @@ import numpy as np
 from brain.brain import BrainController
 from brain.models import BrainState
 from control.commander import RobotCommander
+from control.spin_calibration import SpinController, SpinStatus
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
-from localization.models import RobotPose
+from localization.models import RobotCalibrationRuntime, RobotMarkerObservation, RobotPose
 from path.pathfinding.models import HybridPose, PlannedBallTarget
 from path.pathfinding.planner import RoutePlanningFacade
 from config import AppConfig
@@ -35,11 +36,23 @@ class AppMode(str, Enum):
     MANUAL = "MANUAL"
     AUTO = "AUTO"
     GUIDANCE_TEST = "GUIDANCE_TEST"
+    CALIBRATE = "CALIBRATE"
+
+
+# Robot self-calibration sub-phases (within AppMode.CALIBRATE)
+CALIB_IDLE = "idle"
+CALIB_CONNECTING = "connecting"
+CALIB_SPIN = "spin"
+CALIB_ALIGN = "align"
+
+# Geometry nudge step sizes
+GEOM_STEP_CM = 0.5
+HEADING_STEP_RAD = math.radians(1.0)
 
 
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
-STATUS_BAR_HEIGHT = 130
+STATUS_BAR_HEIGHT = 170
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +246,15 @@ class MainGui:
     _brain_route_points: list[HybridPose] | None = None
     _last_result: VisionFrameResult | None = None
 
+    # Robot self-calibration state
+    _calib_collector: RobotCalibrationCollector | None = None
+    _calib_runtime: RobotCalibrationRuntime | None = None
+    _spin: SpinController | None = None
+    _calib_phase: str = CALIB_IDLE
+    _calib_backup: dict | None = None
+    _latest_observations: dict[int, RobotMarkerObservation] = field(default_factory=dict)
+    _latest_parallax: object | None = None
+
     # Dimensions derived from config
     _left_w: int = 0
     _left_h: int = 0
@@ -244,12 +266,23 @@ class MainGui:
         self._right_w = self.config.windows.schematic_width_px
         self._right_h = self.config.windows.schematic_height_px
         self.params = self.pipeline.default_params()
+        self._seed_geometry_params()
         self._load_robot_calibration()
         self._route_planner = RoutePlanningFacade(
             field_config=self.config.field,
             robot_config=self.config.robot,
             planner_config=self.config.planner,
         )
+
+    def _seed_geometry_params(self) -> None:
+        """Ensure live geometry keys exist in params, defaulting from config."""
+        robot = self.config.robot
+        self.params.setdefault("robot_width_cm", robot.tuned_footprint_width_cm)
+        self.params.setdefault("robot_front_cm", robot.tuned_footprint_front_from_origin_cm)
+        self.params.setdefault("robot_rear_cm", robot.tuned_footprint_rear_from_origin_cm)
+        self.params.setdefault("tube_forward_cm", robot.tuned_tube_offset_cm)
+        self.params.setdefault("tube_right_cm", robot.tuned_tube_right_offset_cm)
+        self.params.setdefault("heading_tuning_rad", 0.0)
 
     def _load_robot_calibration(self) -> None:
         cal_path = self.config.paths.robot_calibration_file
@@ -259,6 +292,9 @@ class MainGui:
                 cal_path, self.config.camera.topdown_warp_size,
             )
             if self.calibration is not None:
+                RobotCalibrationCollector.apply_geometry_to_params(
+                    self.params, self.calibration.get("geometry"),
+                )
                 self.message = "Robot calibration loaded"
             else:
                 self.message = "Robot calibration file found but invalid"
@@ -280,13 +316,41 @@ class MainGui:
         bw, bh = 95, 30
         gap = 8
         x0 = 20
-        return [
+        rows = [
             GuiButton("Set Corners", "set_corners", (x0, y, bw, bh)),
-            GuiButton("Guide Test", "guidance_test", (x0 + (bw + gap), y, bw, bh)),
-            GuiButton("Manual", "manual", (x0 + 2 * (bw + gap), y, bw, bh)),
-            GuiButton("Auto", "auto", (x0 + 3 * (bw + gap), y, bw, bh)),
-            GuiButton("Stop", "stop", (x0 + 4 * (bw + gap), y, bw, bh)),
-            GuiButton("Quit", "quit", (x0 + 5 * (bw + gap), y, bw, bh)),
+            GuiButton("Calib Robot", "calib_robot", (x0 + (bw + gap), y, bw, bh)),
+            GuiButton("Guide Test", "guidance_test", (x0 + 2 * (bw + gap), y, bw, bh)),
+            GuiButton("Manual", "manual", (x0 + 3 * (bw + gap), y, bw, bh)),
+            GuiButton("Auto", "auto", (x0 + 4 * (bw + gap), y, bw, bh)),
+            GuiButton("Stop", "stop", (x0 + 5 * (bw + gap), y, bw, bh)),
+            GuiButton("Quit", "quit", (x0 + 6 * (bw + gap), y, bw, bh)),
+        ]
+        # Second row: calibration controls (depends on sub-phase)
+        if self.mode == AppMode.CALIBRATE:
+            if self._calib_phase == CALIB_ALIGN:
+                rows.extend(self._calibration_menu_buttons(y + bh + gap))
+            elif self._calib_phase == CALIB_SPIN:
+                rows.append(self._calib_button(0, "Cancel", "calib_cancel", y + bh + gap))
+        return rows
+
+    @staticmethod
+    def _calib_button(index: int, label: str, action: str, y: int) -> GuiButton:
+        bw, gap, x0 = 64, 6, 20
+        return GuiButton(label, action, (x0 + index * (bw + gap), y, bw, 28))
+
+    def _calibration_menu_buttons(self, y: int) -> list[GuiButton]:
+        specs = [
+            ("Spin", "calib_spin"),
+            ("Front+", "front_inc"), ("Front-", "front_dec"),
+            ("Rear+", "rear_inc"), ("Rear-", "rear_dec"),
+            ("Width+", "width_inc"), ("Width-", "width_dec"),
+            ("Pipe+", "pipe_inc"), ("Pipe-", "pipe_dec"),
+            ("Head+", "head_inc"), ("Head-", "head_dec"),
+            ("Save", "calib_save"), ("Cancel", "calib_cancel"),
+        ]
+        return [
+            self._calib_button(i, label, action, y)
+            for i, (label, action) in enumerate(specs)
         ]
 
     def handle_mouse(self, event: int, x: int, y: int, _flags: int, _userdata) -> None:
@@ -299,26 +363,67 @@ class MainGui:
                 self._handle_button(button.action)
                 return
 
+    _GEOMETRY_NUDGES = {
+        "front_inc": ("robot_front_cm", GEOM_STEP_CM),
+        "front_dec": ("robot_front_cm", -GEOM_STEP_CM),
+        "rear_inc": ("robot_rear_cm", GEOM_STEP_CM),
+        "rear_dec": ("robot_rear_cm", -GEOM_STEP_CM),
+        "width_inc": ("robot_width_cm", GEOM_STEP_CM),
+        "width_dec": ("robot_width_cm", -GEOM_STEP_CM),
+        "pipe_inc": ("tube_forward_cm", GEOM_STEP_CM),
+        "pipe_dec": ("tube_forward_cm", -GEOM_STEP_CM),
+        "head_inc": ("heading_tuning_rad", HEADING_STEP_RAD),
+        "head_dec": ("heading_tuning_rad", -HEADING_STEP_RAD),
+    }
+
     def _handle_button(self, action: str) -> None:
+        if action in self._GEOMETRY_NUDGES:
+            param_key, delta = self._GEOMETRY_NUDGES[action]
+            self._geometry_nudge(param_key, delta)
+            return
         if action == "set_corners":
             self._open_corner_window()
+        elif action == "calib_robot":
+            self._start_calibration()
+        elif action == "calib_spin":
+            self._start_spin()
+        elif action == "calib_save":
+            self._save_calibration()
+        elif action == "calib_cancel":
+            self._cancel_calibration()
         elif action == "guidance_test":
+            if self._block_during_calibration():
+                return
             if self.mode == AppMode.GUIDANCE_TEST:
                 self._cycle_test_route()
             else:
                 self._start_guidance_test()
         elif action == "manual":
+            if self._block_during_calibration():
+                return
             self._disconnect_guidance()
             self.mode = AppMode.MANUAL
             self.message = "Manual mode (view only)"
         elif action == "auto":
+            if self._block_during_calibration():
+                return
             self._start_brain()
         elif action == "stop":
-            self._disconnect_guidance()
-            self.mode = AppMode.IDLE
-            self.message = "Stopped"
+            if self.mode == AppMode.CALIBRATE:
+                self._cancel_calibration()
+            else:
+                self._disconnect_guidance()
+                self.mode = AppMode.IDLE
+                self.message = "Stopped"
         elif action == "quit":
             self.closed = True
+
+    def _block_during_calibration(self) -> bool:
+        """Refuse mode switches while a calibration is in progress."""
+        if self.mode == AppMode.CALIBRATE:
+            self.message = "Finish or cancel robot calibration first"
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Corner selection window
@@ -571,6 +676,202 @@ class MainGui:
         self._brain_state = self._brain.tick(self.robot_pose, dt_s)
 
     # ------------------------------------------------------------------
+    # Robot self-calibration (spin -> fit center -> align body -> save)
+    # ------------------------------------------------------------------
+
+    def _start_calibration(self) -> None:
+        """Connect to the robot and begin an auto-spin origin calibration."""
+        if self.mode == AppMode.CALIBRATE:
+            self.message = "Calibration already running"
+            return
+        if self._connecting:
+            self.message = "Already connecting..."
+            return
+        if self.pipeline.preprocessor.homography_calibrator.transform_matrix is None:
+            self.message = "Set field corners before calibrating the robot"
+            return
+
+        self._calib_backup = self.calibration
+        self._calib_collector = RobotCalibrationCollector(self.config.robot, self.config.robot_calibration)
+        self._calib_runtime = RobotCalibrationRuntime(
+            collected_points={marker_id: [] for marker_id in self.config.robot.marker_ids}
+        )
+        self.mode = AppMode.CALIBRATE
+        self._calib_phase = CALIB_CONNECTING
+        self._connecting = True
+        self.message = "Connecting to robot for calibration..."
+
+        def connect() -> None:
+            try:
+                if self._commander is None:
+                    self._commander = RobotCommander(drive_config=self.config.drive, auto_connect=True)
+                self._spin = SpinController(
+                    self._commander,
+                    turn_speed_pct=self.config.drive.turn_speed_pct,
+                )
+                self._calib_phase = CALIB_ALIGN
+                self.message = "Connected. Press Spin to find center, adjust body, then Save."
+            except Exception as exc:
+                self.message = f"Calibration connect failed: {exc}"
+                self._end_calibration(disconnect=True)
+            finally:
+                self._connecting = False
+
+        threading.Thread(target=connect, daemon=True).start()
+
+    def _start_spin(self) -> None:
+        """Begin the auto-spin from the calibration menu (Spin button)."""
+        if self.mode != AppMode.CALIBRATE or self._connecting:
+            return
+        if self._spin is None:
+            self.message = "Still connecting — try Spin again in a moment"
+            return
+        if self._calib_phase == CALIB_SPIN:
+            return
+        self._calib_runtime = RobotCalibrationRuntime(
+            collected_points={marker_id: [] for marker_id in self.config.robot.marker_ids}
+        )
+        self._spin.start()
+        self._calib_phase = CALIB_SPIN
+        self.message = "Spinning robot — keep markers visible (sweeping past 360 deg)"
+
+    def _tick_calibration(self) -> None:
+        """Drive the auto-spin and point collection while in CALIBRATE/spin."""
+        if self.mode != AppMode.CALIBRATE or self._calib_phase != CALIB_SPIN:
+            return
+        if self._spin is None or self._connecting or self._calib_runtime is None:
+            return
+
+        marker_yaws: dict[int, float] = {}
+        for marker_id, observation in self._latest_observations.items():
+            self._calib_runtime.collected_points.setdefault(marker_id, []).append(
+                (float(observation.ground_center[0]), float(observation.ground_center[1]))
+            )
+            marker_yaws[marker_id] = float(observation.yaw_rad)
+
+        status = self._spin.tick(marker_yaws)
+        if status in (SpinStatus.COMPLETE, SpinStatus.TIMED_OUT):
+            self._finish_spin(status)
+
+    def _finish_spin(self, status: SpinStatus) -> None:
+        """Fit turning centers and enter the body-alignment phase."""
+        runtime = self._calib_runtime
+        collector = self._calib_collector
+        if runtime is None or collector is None:
+            return
+
+        if not collector.compute_spin_centers(runtime):
+            self.message = f"Spin calibration failed: {runtime.warning}"
+            self._cancel_calibration()
+            return
+
+        if self._latest_parallax is None or not self._latest_observations:
+            self.message = "Lost markers right after spin — show a marker and retry"
+            self._cancel_calibration()
+            return
+
+        # Provisional (in-memory) calibration so the live pose + overlay work
+        # immediately during alignment; only written to disk on Save.
+        self.calibration = collector.build_robot_calibration(
+            runtime,
+            self._latest_observations,
+            self._latest_parallax,
+            self.config.camera.topdown_warp_size,
+            existing=self._calib_backup or {},
+        )
+        self._calib_phase = CALIB_ALIGN
+        swept = self._spin.swept_deg if self._spin else 0.0
+        timeout_note = " (timed out)" if status == SpinStatus.TIMED_OUT else ""
+        extra = f" — {runtime.warning}" if runtime.warning else ""
+        self.message = (
+            f"Spin done: {swept:.0f} deg{timeout_note}. Align body with +/- buttons, then Save.{extra}"
+        )
+
+    def _geometry_nudge(self, param_key: str, delta: float) -> None:
+        """Adjust one live geometry/heading parameter and refresh the summary."""
+        if self.mode != AppMode.CALIBRATE or self._calib_phase != CALIB_ALIGN:
+            return
+        current = float(self.params.get(param_key, 0.0))
+        updated = current + delta
+        if param_key != "heading_tuning_rad":
+            updated = max(0.0, updated)
+        self.params[param_key] = updated
+        self.message = self._geometry_summary()
+
+    def _geometry_summary(self) -> str:
+        p = self.params
+        return (
+            f"Front {float(p['robot_front_cm']):.1f}  Rear {float(p['robot_rear_cm']):.1f}  "
+            f"Width {float(p['robot_width_cm']):.1f}  Pipe {float(p['tube_forward_cm']):.1f} cm  "
+            f"Head {math.degrees(float(p['heading_tuning_rad'])):+.1f} deg"
+        )
+
+    def _save_calibration(self) -> None:
+        """Persist calibration to robot_calibration.json.
+
+        If a spin was run this session, save the new turning-center offsets plus
+        geometry. Otherwise save only the geometry/pipe/heading tuning, preserving
+        the existing marker offsets on disk (adjust-without-respin).
+        """
+        if self._calib_collector is None:
+            return
+        geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+        heading_tuning = float(self.params.get("heading_tuning_rad", 0.0))
+        path = self.config.paths.robot_calibration_file
+        runtime = self._calib_runtime
+        has_spin = runtime is not None and bool(runtime.fitted_centers)
+
+        if has_spin:
+            if self._latest_parallax is None:
+                self.message = "Cannot save: no marker geometry this frame"
+                return
+            visible = [m for m in runtime.fitted_centers if m in self._latest_observations]
+            if not visible:
+                self.message = "Cannot save: show a calibrated marker to the camera, then Save"
+                return
+            self._calib_collector.save_robot_calibration(
+                path,
+                runtime,
+                self._latest_observations,
+                self._latest_parallax,
+                self.config.camera.topdown_warp_size,
+                geometry=geometry,
+                heading_tuning_rad=heading_tuning,
+            )
+            saved_message = f"Saved spin + geometry to {path.name}"
+        else:
+            self._calib_collector.save_geometry_tuning(path, geometry, heading_tuning)
+            saved_message = f"Saved geometry tuning to {path.name}"
+
+        self._end_calibration(disconnect=True)
+        self._load_robot_calibration()
+        self.message = saved_message
+
+    def _cancel_calibration(self) -> None:
+        """Abort calibration and restore the pre-calibration state."""
+        self.calibration = self._calib_backup
+        self.message = "Calibration cancelled"
+        self._end_calibration(disconnect=True)
+
+    def _end_calibration(self, disconnect: bool) -> None:
+        """Stop the spin, release calibration state, and return to idle."""
+        if self._spin is not None:
+            self._spin.stop()
+        self._spin = None
+        self._calib_runtime = None
+        self._calib_collector = None
+        self._calib_backup = None
+        self._calib_phase = CALIB_IDLE
+        if disconnect and self._commander is not None:
+            try:
+                self._commander.stop(force=True)
+                self._commander.close()
+            except Exception:
+                pass
+            self._commander = None
+        self.mode = AppMode.IDLE
+
+    # ------------------------------------------------------------------
     # Per-frame processing
     # ------------------------------------------------------------------
 
@@ -581,11 +882,15 @@ class MainGui:
         topdown = result.preprocessed.topdown
         if topdown is None or self.params is None:
             self.robot_pose = None
+            self._latest_observations = {}
+            self._latest_parallax = None
             return
-        pose, _origin_px, _obs, _parallax = self.pose_estimator.estimate(
+        pose, _origin_px, observations, parallax = self.pose_estimator.estimate(
             topdown, self.params, self.calibration,
         )
         self.robot_pose = pose
+        self._latest_observations = observations
+        self._latest_parallax = parallax
 
     def _build_left_panel(self, result: VisionFrameResult) -> np.ndarray:
         topdown = result.preprocessed.topdown
@@ -602,7 +907,47 @@ class MainGui:
 
         if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
             left = cv2.resize(left, (self._left_w, self._left_h), interpolation=cv2.INTER_LINEAR)
+        if self.mode == AppMode.CALIBRATE:
+            self._draw_calibration_overlay(left)
         return left
+
+    def _draw_calibration_overlay(self, image: np.ndarray) -> None:
+        """Overlay the spin turning-centers and the live virtual body on the feed.
+
+        Drawn on the top-down camera panel (left) so the operator can align the
+        virtual footprint with the physical robot. Top-down pixel space matches
+        ``field_cm_to_topdown_pixel`` output.
+        """
+        mapper = self.pipeline.mapper
+
+        if self._calib_phase == CALIB_ALIGN and self._calib_runtime is not None:
+            for marker_id, center_px in self._calib_runtime.fitted_centers.items():
+                cx, cy = int(round(center_px[0])), int(round(center_px[1]))
+                cv2.drawMarker(image, (cx, cy), (0, 165, 255), cv2.MARKER_TILTED_CROSS, 18, 2, cv2.LINE_AA)
+                cv2.putText(image, f"center {marker_id}", (cx + 10, cy - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1, cv2.LINE_AA)
+
+        if self.robot_pose is not None:
+            geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+            live_pose = HybridPose(self.robot_pose.x_cm, self.robot_pose.y_cm, self.robot_pose.heading_rad)
+            base_cm, intake_cm = self.renderer.robot_footprint_metric_polygons(live_pose, geometry)
+            base_px = np.array([mapper.field_cm_to_topdown_pixel(p) for p in base_cm], dtype=np.int32).reshape(-1, 1, 2)
+            intake_px = np.array([mapper.field_cm_to_topdown_pixel(p) for p in intake_cm], dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(image, [base_px], True, (255, 90, 30), 2, cv2.LINE_AA)
+            cv2.polylines(image, [intake_px], True, (0, 255, 255), 2, cv2.LINE_AA)
+            origin = mapper.field_cm_to_topdown_pixel((self.robot_pose.x_cm, self.robot_pose.y_cm))
+            tube = mapper.field_cm_to_topdown_pixel((self.robot_pose.tube_x_cm, self.robot_pose.tube_y_cm))
+            origin_xy = (int(round(origin[0])), int(round(origin[1])))
+            tube_xy = (int(round(tube[0])), int(round(tube[1])))
+            cv2.circle(image, origin_xy, 5, (255, 90, 30), -1, cv2.LINE_AA)
+            cv2.arrowedLine(image, origin_xy, tube_xy, (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.3)
+
+        if self._calib_phase == CALIB_SPIN and self._spin is not None:
+            cv2.putText(image, f"SPINNING {self._spin.swept_deg:.0f}/{self._spin.target_sweep_deg:.0f} deg",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+        elif self._calib_phase == CALIB_ALIGN:
+            cv2.putText(image, "Spin to find center | match box to robot | Save",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2, cv2.LINE_AA)
 
     def _build_right_panel(self, result: VisionFrameResult) -> np.ndarray:
         frame_shape = (
@@ -675,12 +1020,22 @@ class MainGui:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 220), 1, cv2.LINE_AA)
             cv2.putText(canvas, self.message, (20, y0 + 62),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
+        elif self.mode == AppMode.CALIBRATE:
+            connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
+            if self._connecting:
+                connected = "Connecting..."
+            markers = ",".join(str(m) for m in sorted(self._latest_observations)) or "none"
+            calib_line = f"Calibrate: phase={self._calib_phase} | markers={markers} | {connected}"
+            cv2.putText(canvas, calib_line, (20, y0 + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, self.message, (20, y0 + 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
         else:
             cv2.putText(canvas, self.message, (20, y0 + 42),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
 
         cv2.putText(canvas,
-                    "Keys: q/Esc quit | f set corners | g guidance test | a auto | s stop",
+                    "Keys: q/Esc quit | f set corners | c calib robot | g guidance test | a auto | s stop",
                     (20, y0 + 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
 
@@ -689,6 +1044,7 @@ class MainGui:
             bx, by, bw, bh = button.rect
             is_active = (
                 (button.action == "set_corners" and self._corner_window_open)
+                or (button.action == "calib_robot" and self.mode == AppMode.CALIBRATE)
                 or (button.action == "guidance_test" and self.mode == AppMode.GUIDANCE_TEST)
                 or (button.action == "manual" and self.mode == AppMode.MANUAL)
                 or (button.action == "auto" and self.mode == AppMode.AUTO)
@@ -727,6 +1083,7 @@ class MainGui:
             self._estimate_pose(result)
             self._tick_guidance()
             self._tick_brain()
+            self._tick_calibration()
             left = self._build_left_panel(result)
             right = self._build_right_panel(result)
         else:
@@ -772,6 +1129,8 @@ class MainGui:
             self._handle_button("manual")
         elif key == ord("a"):
             self._handle_button("auto")
+        elif key == ord("c"):
+            self._handle_button("calib_robot")
         elif key == ord("s"):
             self._handle_button("stop")
 
@@ -789,6 +1148,8 @@ class MainGui:
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 self.closed = True
 
+        if self.mode == AppMode.CALIBRATE:
+            self._cancel_calibration()
         self._disconnect_guidance()
         if self._corner_window_open:
             self._close_corner_window()
@@ -797,5 +1158,7 @@ class MainGui:
         cv2.destroyWindow(WINDOW_NAME)
 
     def close(self) -> None:
+        if self.mode == AppMode.CALIBRATE:
+            self._cancel_calibration()
         self._disconnect_guidance()
         self.closed = True

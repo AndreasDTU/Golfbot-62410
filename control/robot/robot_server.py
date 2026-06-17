@@ -347,17 +347,27 @@ def handle_command(cmd):
 
 def handle_client(conn, addr):
     print("[+] Connected: {}".format(addr))
+    # Newline-framed parsing: a single recv() can carry several commands when the
+    # client streams wheel speeds fire-and-forget (e.g. "LR 30 30\nLR 35 35\n").
+    # Splitting on '\n' processes each one in order (last wheel command wins)
+    # instead of merging them into a single mangled token.
+    buffer = ""
     with conn:
         while True:
             try:
                 data = conn.recv(1024)
                 if not data:
                     break
-                cmd = data.decode('utf-8').strip()
-                print("[>] {}: {}".format(addr, cmd))
-                response = handle_command(cmd)
-                print("[<] {}".format(response))
-                conn.sendall((response + '\n').encode('utf-8'))
+                buffer += data.decode('utf-8')
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    cmd = line.strip()
+                    if not cmd:
+                        continue
+                    print("[>] {}: {}".format(addr, cmd))
+                    response = handle_command(cmd)
+                    print("[<] {}".format(response))
+                    conn.sendall((response + '\n').encode('utf-8'))
             except ConnectionResetError:
                 break
     print("[-] Disconnected: {}".format(addr))

@@ -29,6 +29,10 @@ class FakeCommander(RobotCommander):
         self.sent_commands.append(cmd)
         return "ok"
 
+    def _send_nowait(self, cmd: str) -> bool:
+        self.sent_commands.append(cmd)
+        return True
+
 
 def _counter(start: float = 0.0, step: float = 1.0):
     t = [start]

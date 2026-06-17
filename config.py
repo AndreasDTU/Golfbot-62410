@@ -35,6 +35,7 @@ class PathConfig:
     calibration_file: Path | None = None
     robot_calibration_file: Path | None = None
     field_corners_file: Path | None = None
+    red_cross_file: Path | None = None
     yolo_model_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -42,6 +43,7 @@ class PathConfig:
         object.__setattr__(self, "calibration_file", self.calibration_file or root / "calibration_data.npz")
         object.__setattr__(self, "robot_calibration_file", self.robot_calibration_file or root / "robot_calibration.json")
         object.__setattr__(self, "field_corners_file", self.field_corners_file or root / "field_corners.json")
+        object.__setattr__(self, "red_cross_file", self.red_cross_file or root / "red_cross.json")
         object.__setattr__(self, "yolo_model_path", self.yolo_model_path or Path("best.pt"))
 
 

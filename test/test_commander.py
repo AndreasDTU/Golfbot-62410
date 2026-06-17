@@ -26,6 +26,10 @@ class FakeCommander(RobotCommander):
         self.sent_commands.append(cmd)
         return "ok"
 
+    def _send_nowait(self, cmd: str) -> bool:
+        self.sent_commands.append(cmd)
+        return True
+
 
 def make_commander(**overrides) -> FakeCommander:
     config = DriveConfig(**overrides)

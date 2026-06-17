@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import select
 import socket
 import time
 from typing import Callable
@@ -86,6 +87,9 @@ class RobotCommander:
             sock.settimeout(self.timeout)
             try:
                 sock.connect((self.host, self.port))
+                # Disable Nagle so fire-and-forget wheel commands ship immediately
+                # instead of being coalesced into one TCP segment.
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 return sock
             except OSError as exc:
                 last_error = exc
@@ -94,7 +98,36 @@ class RobotCommander:
             f"Could not connect to EV3 controller at {self.host}:{self.port}: {last_error}"
         ) from last_error
 
+    def _drain_replies(self) -> None:
+        """Discard any pending reply bytes without blocking.
+
+        Fire-and-forget wheel commands still get an ``ok``/``error`` reply from
+        the EV3 server.  We never read those synchronously, so we drain them here
+        to stop the socket receive buffer from filling — a full buffer would
+        eventually block the server's ``sendall`` and re-introduce the stall.
+        """
+        sock = self.sock
+        if sock is None:
+            return
+        try:
+            while True:
+                ready, _, _ = select.select((sock,), (), (), 0)
+                if not ready:
+                    return
+                chunk = sock.recv(4096)
+                if not chunk:  # peer closed the connection
+                    self.close()
+                    return
+        except OSError:
+            self.close()
+
     def _send(self, cmd: str) -> str:
+        """Send a command and block until the EV3 replies (one reply per command)."""
+        if self.sock is None:
+            self.sock = self._connect()
+        # Clear any un-read fire-and-forget acks so recv() below returns *this*
+        # command's reply rather than a stale wheel-command ack.
+        self._drain_replies()
         if self.sock is None:
             self.sock = self._connect()
         payload = (cmd + "\n").encode("utf-8")
@@ -103,6 +136,27 @@ class RobotCommander:
             return self.sock.recv(1024).decode("utf-8").strip()
         except OSError as exc:
             raise RuntimeError(f"EV3 command failed after send attempt ({cmd!r}): {exc}") from exc
+
+    def _send_nowait(self, cmd: str) -> bool:
+        """Send a command without waiting for the reply (fire-and-forget).
+
+        Used for high-frequency wheel commands so the caller's loop never blocks
+        on the EV3 round-trip.  Pending replies are drained first to keep the
+        socket buffer clear.
+        """
+        if self.sock is None:
+            self.sock = self._connect()
+        self._drain_replies()
+        if self.sock is None:
+            self.sock = self._connect()
+        payload = (cmd + "\n").encode("utf-8")
+        try:
+            self.sock.sendall(payload)
+            return True
+        except OSError as exc:
+            self.last_error = f"EV3 send failed ({cmd!r}): {exc}"
+            self.close()
+            return False
 
     def close(self) -> None:
         if self.sock is not None:
@@ -136,16 +190,11 @@ class RobotCommander:
             return True
 
         command = self.command_format.format(left=left, right=right)
-        try:
-            response = self._send(command)
-        except RuntimeError as exc:
-            self.last_error = str(exc)
-            log_event("DISPATCH", "tcp exception", error=str(exc))
-            self.close()
-            return False
-        if response.lower().startswith("error"):
-            self.last_error = response
-            log_event("DISPATCH", "error response", response=response)
+        # Fire-and-forget: never block the caller (the vision loop) on the EV3
+        # round-trip.  Wheel speeds are already validated/clipped client-side, so
+        # we forgo the server's reply; any error reply is drained, not parsed.
+        if not self._send_nowait(command):
+            log_event("DISPATCH", "tcp exception", error=self.last_error)
             return False
 
         self.last_send_time = now

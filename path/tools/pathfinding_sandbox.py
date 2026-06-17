@@ -22,7 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 from path.pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
 from path.pathfinding.planner import RoutePlanningFacade
 from localization.models import RobotPose
-from perception.vision.config import AppConfig
+from config import AppConfig
 from perception.vision.debug import SchematicRenderer
 from perception.vision.grid_mapping import OccupancyGridBuilder
 from perception.vision.models import RedZoneDetection, SmoothedBallCoordinate

@@ -20,7 +20,7 @@ from path.pathfinding.models import (
     RouteTrackingError,
 )
 from localization.models import RobotGeometry, RobotPose
-from perception.vision.config import FieldConfig, PlannerConfig, RobotGeometryConfig
+from config import FieldConfig, PlannerConfig, RobotGeometryConfig
 
 SearchKey = tuple[int, int, int]
 FORWARD_GEAR = 1

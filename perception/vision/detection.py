@@ -14,7 +14,7 @@ from typing import Protocol
 import cv2
 import numpy as np
 
-from perception.vision.config import FieldConfig
+from config import FieldConfig
 from perception.vision.geometry import ParallaxCorrector
 from perception.vision.models import BallDetection, HSVRange, RedZoneDetection
 

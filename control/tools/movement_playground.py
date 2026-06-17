@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from control.commander import RobotCommander
 from control.telemetry import log_event
-from perception.vision.config import DriveConfig
+from config import DriveConfig
 
 _DEFAULT_CONFIG = DriveConfig()
 

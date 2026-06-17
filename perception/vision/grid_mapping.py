@@ -5,7 +5,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from perception.vision.config import FieldConfig, RobotGeometryConfig
+from config import FieldConfig, RobotGeometryConfig
 from perception.vision.geometry import CoordinateMapper
 from perception.vision.models import RedZoneDetection
 

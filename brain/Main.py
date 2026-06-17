@@ -28,7 +28,7 @@ from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
 from localization.models import RobotPose
 from path.pathfinding.models import HybridPose
-from perception.vision.config import AppConfig
+from config import AppConfig
 from perception.vision.debug import DebugRenderer
 from perception.vision.models import CalibrationState
 from perception.vision.pipeline import VisionPipeline, VisionFrameResult

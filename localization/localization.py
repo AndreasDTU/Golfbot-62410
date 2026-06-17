@@ -20,7 +20,7 @@ import numpy as np
 
 from localization.models import RobotCalibrationRuntime, RobotGeometry, RobotMarkerObservation, RobotPose
 from perception.vision.calibration import HomographyCalibrator
-from perception.vision.config import CameraConfig, FieldConfig, RobotCalibrationConfig, RobotGeometryConfig
+from config import CameraConfig, FieldConfig, RobotCalibrationConfig, RobotGeometryConfig
 from perception.vision.geometry import CoordinateMapper, ParallaxCorrector
 from perception.vision.models import ParallaxConfig
 

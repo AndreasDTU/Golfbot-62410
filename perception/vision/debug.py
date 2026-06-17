@@ -21,7 +21,7 @@ from localization.models import (
     RobotMarkerObservation,
     RobotPose,
 )
-from perception.vision.config import DriveConfig, FieldConfig, RobotGeometryConfig, WindowConfig
+from config import DriveConfig, FieldConfig, RobotGeometryConfig, WindowConfig
 from perception.vision.geometry import CoordinateMapper
 from perception.vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinate
 

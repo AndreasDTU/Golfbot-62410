@@ -498,6 +498,7 @@ class MainGui:
         def connect() -> None:
             try:
                 commander = RobotCommander(
+                    connection_config=self.config.connection,
                     drive_config=self.config.drive,
                     auto_connect=True,
                 )
@@ -605,6 +606,7 @@ class MainGui:
         def connect_and_plan() -> None:
             try:
                 commander = RobotCommander(
+                    connection_config=self.config.connection,
                     drive_config=self.config.drive,
                     auto_connect=True,
                 )

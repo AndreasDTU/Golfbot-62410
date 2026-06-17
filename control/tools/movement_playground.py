@@ -27,9 +27,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from control.commander import RobotCommander
 from control.telemetry import log_event
-from config import DriveConfig
+from config import ConnectionConfig, DriveConfig
 
-_DEFAULT_CONFIG = DriveConfig()
+_DEFAULT_CONNECTION = ConnectionConfig()
 
 GUI_WINDOW_NAME = "GolfBot Movement Playground"
 
@@ -583,8 +583,8 @@ class MovementPlaygroundGui:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manual movement playground for GolfBot drive layer.")
-    parser.add_argument("--host", default=_DEFAULT_CONFIG.robot_ip, help="EV3 hostname or IP address.")
-    parser.add_argument("--port", type=int, default=_DEFAULT_CONFIG.robot_tcp_port, help="EV3 TCP command port.")
+    parser.add_argument("--host", default=_DEFAULT_CONNECTION.robot_ip, help="EV3 hostname or IP address.")
+    parser.add_argument("--port", type=int, default=_DEFAULT_CONNECTION.robot_tcp_port, help="EV3 TCP command port.")
     parser.add_argument("--timeout", type=float, default=15.0, help="TCP connect/read timeout in seconds.")
     parser.add_argument("--cli", "--terminal", action="store_true", help="Run terminal REPL instead of GUI.")
     parser.add_argument("--dummy", action="store_true", help="No-network mock mode.")

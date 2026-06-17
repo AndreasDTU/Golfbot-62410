@@ -12,7 +12,7 @@ import numpy as np
 
 from control.telemetry import log_event
 from control.tools.drive_calibration import DriveCalibrationValues, parse_drive_calibration_response
-from config import DriveConfig
+from config import ConnectionConfig, DriveConfig
 
 
 class RobotCommander:
@@ -45,23 +45,25 @@ class RobotCommander:
         port: int | None = None,
         timeout: float = 15.0,
         connect_retries: int = 1,
+        connection_config: ConnectionConfig | None = None,
         drive_config: DriveConfig | None = None,
         time_fn: Callable[[], float] | None = None,
         *,
         auto_connect: bool = True,
     ) -> None:
+        conn = connection_config or ConnectionConfig()
         config = drive_config or DriveConfig()
-        self.host: str = robot_ip or config.robot_ip
-        self.port: int = port if port is not None else config.robot_tcp_port
+        self.host: str = robot_ip or conn.robot_ip
+        self.port: int = port if port is not None else conn.robot_tcp_port
         self.timeout: float = timeout
         self.connect_retries: int = max(0, int(connect_retries))
         self._config: DriveConfig = config
 
         # Dispatch state
-        self.command_format: str = config.robot_command_format
-        self.min_send_interval_s: float = config.min_send_interval_s
+        self.command_format: str = conn.robot_command_format
+        self.min_send_interval_s: float = conn.min_send_interval_s
         self.max_speed_pct: float = config.max_speed_pct
-        self.command_deadband_pct: float = config.command_deadband_pct
+        self.command_deadband_pct: float = conn.command_deadband_pct
         self.last_send_time: float = 0.0
         self.last_sent: tuple[float, float] | None = None
         self.last_error: str = ""

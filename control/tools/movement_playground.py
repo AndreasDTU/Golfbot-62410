@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Manual movement playground for the GolfBot drive layer.
 
-Stage 1 failure-isolation tool: exercises RobotCommander.turn/drive/adjust/stop
+Stage 1 failure-isolation tool: exercises RobotCommander.turn/drive/drive_adjusted/stop
 in isolation before Guidance is wired up. Provides both a terminal REPL and an
 OpenCV GUI, with dummy-mode support for no-network testing.
 
@@ -79,8 +79,8 @@ class MovementPlayground:
             return True, self._run_turn(parts)
         if command == "drive":
             return True, self._run_drive(parts)
-        if command == "adjust":
-            return True, self._run_adjust(parts)
+        if command == "drive_adjusted":
+            return True, self._run_drive_adjusted(parts)
 
         return True, f"Unknown command '{command}'. Type 'help' for commands."
 
@@ -100,18 +100,19 @@ class MovementPlayground:
         ok = self.commander.drive(param)
         return self._log_boundary("drive", param, ok)
 
-    def _run_adjust(self, parts: list[str]) -> str:
-        param = self._parse_float_param(parts, "adjust")
-        if isinstance(param, str):
-            return param
-        ok = self.commander.adjust(param)
-        return self._log_boundary("adjust", param, ok)
+    def _run_drive_adjusted(self, parts: list[str]) -> str:
+        result = self._parse_two_float_params(parts, "drive_adjusted")
+        if isinstance(result, str):
+            return result
+        cm, heading_error = result
+        ok = self.commander.drive_adjusted(cm, None, heading_error)
+        return self._log_boundary("drive_adjusted", f"{cm:g}, {heading_error:g}", ok)
 
     def _run_stop(self) -> str:
         ok = self.commander.stop()
         return self._log_boundary("stop", None, ok)
 
-    def _log_boundary(self, name: str, param: float | None, ok: bool) -> str:
+    def _log_boundary(self, name: str, param: float | str | None, ok: bool) -> str:
         elapsed = time.perf_counter() - self.start_time
         lr = self.commander.last_sent
         left = lr[0] if lr else 0.0
@@ -131,7 +132,7 @@ class MovementPlayground:
 
     def _parse_float_param(self, parts: list[str], name: str) -> float | str:
         if len(parts) != 2:
-            return f"Usage: {name} <speed-input>"
+            return f"Usage: {name} <value>"
         try:
             value = float(parts[1])
         except ValueError:
@@ -139,6 +140,17 @@ class MovementPlayground:
         if not math.isfinite(value):
             return "Parameter must be finite."
         return value
+
+    def _parse_two_float_params(self, parts: list[str], name: str) -> tuple[float, float] | str:
+        if len(parts) != 3:
+            return f"Usage: {name} <cm> <heading_error_deg>"
+        try:
+            a, b = float(parts[1]), float(parts[2])
+        except ValueError:
+            return "Both parameters must be numeric."
+        if not (math.isfinite(a) and math.isfinite(b)):
+            return "Both parameters must be finite."
+        return a, b
 
     def _status_text(self) -> str:
         c = self.commander
@@ -163,15 +175,15 @@ class MovementPlayground:
 
 def command_help() -> str:
     return """Commands:
-  turn <value>     Set rotation wheel speed (higher = faster). Does NOT stop automatically.
-  drive <value>    Set forward wheel speed (higher = faster). Does NOT stop automatically.
-  adjust <value>   Set arc-correction differential on current base speed.
-  stop             Zero wheel speeds. You must call this after turn/drive.
-  status           Show commander state
-  help             Show this help
-  quit / exit      Stop and exit
+  turn <degrees>                    In-place rotation. Does NOT stop automatically.
+  drive <cm>                        Straight drive. Does NOT stop automatically.
+  drive_adjusted <cm> <heading_deg> Drive with simultaneous arc correction. Does NOT stop automatically.
+  stop                              Zero wheel speeds. You must call this after any move.
+  status                            Show commander state
+  help                              Show this help
+  quit / exit                       Stop and exit
 
-Note: turn/drive/adjust set wheel speeds via a profiled speed curve. The robot
+Note: all move commands set wheel speeds via a profiled speed curve. The robot
 keeps moving until you send 'stop'. There is no camera feedback in this tool."""
 
 
@@ -317,8 +329,13 @@ class MovementPlaygroundGui:
             self.show_error("Command already running; wait for it to finish.")
             return
 
-        if command in ("turn", "drive", "adjust"):
+        if command in ("turn", "drive"):
             raw = f"{command} {self.param_value:g}"
+        elif command == "drive_adjusted":
+            # GUI has one param; treat it as heading correction, use 200 cm so
+            # speed profiling always runs at cruise speed (same role the old
+            # Adjust button's param played).
+            raw = f"drive_adjusted 200 {self.param_value:g}"
         else:
             raw = command
         self.last_command = raw
@@ -351,7 +368,7 @@ class MovementPlaygroundGui:
             GuiButton("+ Param", "param_plus", (880, 180, 88, 36), requires_connection=False),
             GuiButton("Turn", "turn", (710, 250, 135, 42)),
             GuiButton("Drive", "drive", (855, 250, 135, 42)),
-            GuiButton("Adjust", "adjust", (710, 310, 135, 42)),
+            GuiButton("DriveAdj", "drive_adjusted", (710, 310, 135, 42)),
             GuiButton("Stop", "stop", (855, 310, 135, 42)),
         ]
 
@@ -528,7 +545,7 @@ class MovementPlaygroundGui:
         # Parameter display
         self.draw_text(image, "Movement Commands", (710, 150), 0.65, (35, 35, 35), 2)
         self.draw_text(image, f"Speed input: {self.param_value:g}", (710, 215), 0.56)
-        self.draw_text(image, "(controls wheel speed, not distance. Stop manually.)", (710, 235), 0.42, (100, 100, 100))
+        self.draw_text(image, "(DriveAdj uses param as heading error, 200 cm distance.)", (710, 235), 0.42, (100, 100, 100))
 
         # State readout
         if self.commander is not None:

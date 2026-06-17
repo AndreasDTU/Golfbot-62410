@@ -199,44 +199,6 @@ class TestDriveAdjusted:
 
 
 # ---------------------------------------------------------------------------
-# Adjust
-# ---------------------------------------------------------------------------
-
-class TestAdjust:
-    def test_heading_error_produces_differential(self):
-        c = make_commander()
-        c._base_speed = 20.0
-        c.adjust(5.0)
-        left, right = last_lr(c)
-        correction = 5.0 * c._config.adjust_gain
-        assert left == pytest.approx(20.0 - correction, abs=0.5)
-        assert right == pytest.approx(20.0 + correction, abs=0.5)
-
-    def test_reuses_last_drive_speed(self):
-        c = make_commander()
-        c.drive(100.0)
-        saved_base = c._base_speed
-        assert saved_base > 0
-        c.adjust(2.0)
-        left, right = last_lr(c)
-        # Average of left and right should be close to saved_base
-        avg = (left + right) / 2
-        assert avg == pytest.approx(saved_base, abs=0.5)
-
-    def test_cold_start_zero_base(self):
-        c = make_commander()
-        assert c._base_speed == 0.0
-        c.adjust(10.0)
-        left, right = last_lr(c)
-        # base is 0, so left and right are mirror images
-        assert left == pytest.approx(-right, abs=0.1)
-
-    def test_non_finite_rejected(self):
-        c = make_commander()
-        assert c.adjust(float("inf")) is False
-
-
-# ---------------------------------------------------------------------------
 # Stop
 # ---------------------------------------------------------------------------
 

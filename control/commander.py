@@ -19,12 +19,12 @@ class RobotCommander:
     """Single control surface for all EV3 motor commands.
 
     Absorbs the former RobotController, TcpWheelDispatcher, and MotorCommander
-    into one class with a clean three-command movement API:
+    into one class with a clean movement API:
 
-        turn(degrees)   — in-place rotation, speed profiled by remaining angle
-        drive(cm)       — straight forward/backward, speed profiled by distance
-        adjust(degrees) — arc correction reusing the last drive speed
-        stop()          — zero wheel speeds, resets base speed
+        turn(degrees)                         — in-place rotation, speed profiled by remaining angle
+        drive(cm)                             — straight forward/backward, speed profiled by distance
+        drive_adjusted(cm, dt_s, heading_deg) — forward drive with simultaneous arc correction
+        stop()                                — zero wheel speeds, resets base speed
 
     All movement commands are non-blocking and produce a single LR wheel-speed
     message per call.  Actuator and calibration commands remain blocking.
@@ -289,22 +289,6 @@ class RobotCommander:
         self._base_speed = speed
         correction = heading_error_deg * self._config.adjust_gain
         return self._send_wheel_speeds(speed - correction, speed + correction)
-
-    def adjust(self, degrees: float) -> bool:
-        """Arc correction while maintaining forward motion.
-
-        *degrees* = heading error to correct (positive = needs CCW correction).
-        Reuses ``_base_speed`` from the most recent ``drive()`` call so that
-        forward speed is preserved.  If no ``drive()`` has occurred yet,
-        ``_base_speed`` defaults to 0 (pure turn from standstill).
-        """
-        if not math.isfinite(degrees):
-            self.last_error = "non-finite adjust angle rejected"
-            return False
-        correction = degrees * self._config.adjust_gain
-        left = self._base_speed - correction
-        right = self._base_speed + correction
-        return self._send_wheel_speeds(left, right)
 
     def stop(self, force: bool = True) -> bool:
         """Zero wheel speeds and reset base speed."""

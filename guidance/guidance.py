@@ -1,7 +1,7 @@
 """Stage 2 Guidance layer — per-frame waypoint follower.
 
 Computes the geometry: given a route and the live pose, produces
-turn / drive / adjust commands each tick. Uses RobotCommander exclusively;
+turn / drive_adjusted commands each tick. Uses RobotCommander exclusively;
 no direct wheel-speed or legacy steer() calls.
 
 Architecture: non-blocking ticking. Guidance runs every frame, reads the
@@ -42,13 +42,13 @@ class GuidanceController:
     """Per-frame waypoint follower.
 
     Each call to ``tick()`` reads the live pose, decides whether to
-    ``turn``, ``drive`` + ``adjust``, or ``stop``, and returns a
+    ``turn``, ``drive_adjusted``, or ``stop``, and returns a
     ``GuidanceStatus`` for the layer above.
 
     Sign / unit conventions (matching Control layer):
         * Heading: radians, 0 = +X, positive = CCW.  Normalized to [-pi, pi).
-        * ``commander.turn()`` and ``commander.adjust()`` take **degrees**.
-        * ``commander.drive()`` takes **cm**.
+        * ``commander.turn()`` takes **degrees**.
+        * ``commander.drive_adjusted()`` takes **cm** and **degrees**.
         * Guidance converts at the call site with ``math.degrees()``.
     """
 

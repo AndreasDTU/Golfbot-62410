@@ -1,6 +1,7 @@
 import argparse
 import cv2
 import sys
+import platform
 from pathlib import Path
 import numpy as np
 
@@ -65,7 +66,11 @@ def main(argv: list[str] | None = None) -> int:
         static_image = img
     elif not args.no_camera:
         cam_index = args.camera if args.camera is not None else config.camera.camera_index
-        camera = cv2.VideoCapture(cam_index)
+        if platform.system() == "Windows":
+            camera = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+        else:
+            camera = cv2.VideoCapture(cam_index)
+
         if not camera.isOpened():
             print(f"Could not open camera {cam_index}", file=sys.stderr)
             return 1

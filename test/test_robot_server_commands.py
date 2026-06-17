@@ -52,7 +52,7 @@ def load_robot_server_with_fake_ev3():
     try:
         spec = importlib.util.spec_from_file_location(
             "robot_server_under_test",
-            REPO_ROOT / "robot" / "robot_server.py",
+            REPO_ROOT / "control" / "robot" / "robot_server.py",
         )
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)

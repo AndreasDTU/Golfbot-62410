@@ -4,8 +4,8 @@ import unittest
 import math
 import numpy as np
 
-from pathfinding.models import HybridPlannerConfig, HybridPose, PlannedBallTarget, RouteSegmentType
-from pathfinding.planner import (
+from path.pathfinding.models import HybridPlannerConfig, HybridPose, PlannedBallTarget, RouteSegmentType
+from path.pathfinding.planner import (
     FORWARD_GEAR,
     LEFT_STEERING,
     NO_STEERING,
@@ -17,8 +17,8 @@ from pathfinding.planner import (
     HybridAStarPlanner,
     PickupStandoffGoal,
 )
-from robot.models import RobotGeometry
-from vision.config import FieldConfig
+from localization.models import RobotGeometry
+from config import FieldConfig
 
 
 class GridDijkstraHeuristicTests(unittest.TestCase):

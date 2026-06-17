@@ -1,220 +1,88 @@
-# CV Vision Pipeline Contract --- Ping Pong Ball Collection Robot
+# CV Vision Pipeline Contract
 
-Status: ACTIVE\
-Owner: Team `<your team>`{=html}\
-Scope: Real-time ball detection + mapping into a logical grid for
-navigation commands.\
-Non-scope: Training ML models (explicitly excluded).
+Status: ACTIVE KEPT LAYER
 
-## Goals
+Scope: Perception code for camera calibration, top-down preprocessing,
+ball/red-zone detection, tracking, coordinate mapping, occupancy-grid
+construction, and debug rendering.
 
-1.  Detect ping pong balls reliably in a contest arena with uneven
-    lighting (sunlight + shade possible).
-2.  Produce stable ball positions in a top-down coordinate system and
-    map them to a logical grid.
-3.  Run in real time (target: ≥ 20 FPS, stretch goal: 30 FPS) on the
-    chosen compute device (laptop recommended).
+Non-scope: training new ML models or replacing the detector family.
 
-## Hard Constraints
+## Current Locations
 
--   Environment lighting is not controllable (windows, shadows, mixed
-    illumination).
--   Camera setup is controllable (mounting position, height, framing).
--   No model training. Pretrained "foundation segmentation" not used as
-    core dependency.
+```text
+perception/vision/
+perception/camera/
+perception/tools/
+```
 
-------------------------------------------------------------------------
+Important modules:
 
-## System Outputs
+```text
+perception/vision/calibration.py
+perception/vision/preprocessing.py
+perception/vision/detection.py
+perception/vision/tracking.py
+perception/vision/grid_mapping.py
+perception/vision/pipeline.py
+perception/vision/debug.py
+perception/vision/config.py
+perception/vision/models.py
+perception/vision/geometry.py
+```
 
-Vision module outputs, every frame (or at fixed tick rate):
+The YOLO model file currently lives at:
 
--   FrameId, Timestamp
--   ArenaPose: homography / warp transform used for top-down mapping
--   Balls: list of {x_world, y_world, confidence, radius_px, area_px}
--   GridOccupancy: logical grid with cell states:
-    -   EMPTY, BALL, OBSTACLE, UNKNOWN (optional)
--   DebugOverlays (for development): masks + detections + grid + corner
-    markers
+```text
+perception/tools/best.pt
+```
 
-Routing/control note: path planning and drive control consume these mapped
-outputs after Grid Mapping. The current detector UI uses Hybrid A* over
-`(x, y, theta)` with an oriented robot footprint, then computes XTE/heading
-error and dispatches left/right wheel speeds directly from
-`tools/topdown_object_detector.py`; see `docs/PATHFINDING_ARCHITECTURE.md`.
-This does not change the required vision pipeline order below.
+## Current Boundary
 
-------------------------------------------------------------------------
+Perception may produce:
 
-## Pipeline Overview (Required Order)
+- warped/top-down frame data,
+- red-zone detections and masks,
+- raw ball detections,
+- smoothed ball field coordinates,
+- occupancy grid data,
+- debug visualization data.
 
-### 0) Camera Setup Requirements (physical)
+Path planning consumes mapped field coordinates and occupancy information after
+grid mapping. The previous all-in-one detector UI has been deleted, so there is
+currently no complete live app that wires this layer to Brain/Guidance/Control.
 
--   Camera mounted rigidly, cannot move during run.
--   Prefer near top-down (minimize perspective skew).
--   Ensure all arena corners are visible (or visible corner markers are
-    present).
+## Required Pipeline Order
 
-### 1) Calibration & Geometry Normalization
+1. Lens calibration for a camera/setup.
+2. Fast undistortion for frames that use that calibration.
+3. Top-down perspective transform or homography.
+4. Optional normalization/preprocessing.
+5. Ball and red-zone detection.
+6. Tracking/smoothing.
+7. Field-coordinate and occupancy-grid mapping.
+8. Debug rendering.
 
-Goal: Make spatial mapping consistent across the field.
+## Debug Requirements
 
-1.  Lens calibration (once per camera/setup).
-2.  Undistortion (every frame, fast remap).
-3.  Perspective transform (homography) to a fixed top-down rectangle.
+Preserve visibility for:
 
-Invariant: After warp, the arena must be a stable rectangle with fixed
-pixel dimensions.
+- warped/top-down view,
+- segmentation masks,
+- ball/red-zone detections,
+- robot pose and calibration status when supplied by Localization,
+- route/occupancy visualization when supplied by Path,
+- timing/FPS overlays in future app shells.
 
-### 2) Illumination Normalization
+## Performance Target
 
-Goal: Reduce sensitivity to sunlight/shadows.
+The final live system should sustain at least 20 FPS, with 30 FPS as the stretch
+target. Avoid expensive per-frame initialization in this kept layer.
 
-Required approach:
+## Validation
 
--   Convert warped frame → Lab
--   Apply CLAHE to L channel
--   Use a/b channels for color segmentation
+Current perception-adjacent tests are run through:
 
-Invariant: Detection must not collapse when half the field is in shade.
-
-### 3) Segmentation (Ball Candidate Mask)
-
--   Create binary mask of likely ball pixels.
--   Apply morphology cleanup.
-
-### 4) Candidate Extraction
-
--   Find connected components / contours.
--   Compute area, circularity, radius, bounding box.
-
-### 5) Filtering & Scoring
-
-Accept candidate if:
-
--   area within expected range
--   circularity above threshold
--   radius within expected range
-
-Assign confidence score.
-
-### 6) Tracking (optional)
-
--   Smooth detections across frames.
--   Reduce flicker.
-
-### 7) Grid Mapping
-
-Convert pixel coordinates to logical grid coordinates.
-
-------------------------------------------------------------------------
-
-## Performance Requirements
-
--   Minimum: ≥ 20 FPS
--   Stretch goal: 30 FPS
--   Max latency target: ≤ 50 ms per frame
-
-------------------------------------------------------------------------
-
-## Debug & Validation Requirements
-
-Provide overlays:
-
--   Warped view
--   Segmentation mask
--   Detection circles
--   FPS display
-
-Acceptance test:
-
-Detection must work in bright, dark, and mixed lighting.
-
-------------------------------------------------------------------------
-
-# Risk Management
-
-## Risk 1 --- Mixed illumination
-
-Likelihood: High\
-Impact: High
-
-Mitigation:
-
--   Lab color space normalization
--   CLAHE normalization
--   Geometry filtering
-
-Fallback:
-
--   Adaptive thresholding
-
-------------------------------------------------------------------------
-
-## Risk 2 --- Specular highlights
-
-Likelihood: High\
-Impact: Medium
-
-Mitigation:
-
--   Morphological closing
--   Circle fitting
-
-------------------------------------------------------------------------
-
-## Risk 3 --- Camera auto-adjustment
-
-Likelihood: Medium\
-Impact: High
-
-Mitigation:
-
--   Disable auto exposure if possible
--   Use Lab color channels
-
-------------------------------------------------------------------------
-
-## Risk 4 --- Homography failure
-
-Likelihood: Medium\
-Impact: High
-
-Mitigation:
-
--   Manual corner calibration fallback
-
-------------------------------------------------------------------------
-
-## Risk 5 --- False positives
-
-Likelihood: Medium\
-Impact: Medium
-
-Mitigation:
-
--   Geometry filters
--   Temporal filtering
-
-------------------------------------------------------------------------
-
-## Risk 6 --- Performance drop
-
-Likelihood: Medium\
-Impact: Medium
-
-Mitigation:
-
--   Reduce resolution
--   Profile pipeline
-
-------------------------------------------------------------------------
-
-# Definition of Done
-
-System is complete when:
-
--   Reliable detection in mixed lighting
--   ≥ 20 FPS achieved
--   Stable grid mapping
--   Debug tools functional
+```bash
+env PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache /Users/alex/miniforge3/bin/python3 -m unittest discover -s test -p 'test_*.py'
+```

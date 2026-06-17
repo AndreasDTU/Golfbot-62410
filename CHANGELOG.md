@@ -2,6 +2,37 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-06-15
+
+### Added
+
+- Added `docs/MOVEMENT_REWORK_STATUS.md` as the single source of truth for the
+  movement-layer rebuild.
+  - Audits all 6 layers (Perception, Path, Localization, Control, Guidance,
+    Brain/FSM) against the actual code in the repository.
+  - Records per-layer status (complete / partial / stub), key files,
+    working capabilities, gaps, boundary contracts, and test coverage.
+  - Documents the established units and frames contract (cm, radians,
+    bottom-left origin, CCW positive).
+  - Identifies cross-cutting gaps: boundary logging (missing everywhere),
+    sim/real backend (missing), and the blocking-vs-ticking resolution.
+  - Rewrites the 4-stage build plan to reflect current reality.
+  - Summarizes decisions made and work completed since the brainstorm
+    proposals in `docs/refactor/`.
+
+### Changed
+
+- Reorganized repository documentation around the current layer layout:
+  `perception/`, `path/`, `localization/`, `guidance/`, `control/`, and
+  `brain/`.
+  - Marked the previous autonomous top-down app as deleted and autonomous drive
+    as paused during the movement rework.
+  - Updated camera, pathfinding, collection, autonomous quickstart, and agent
+    guidance docs so they no longer describe old root folders or deleted
+    entrypoints as current.
+  - Preserved the movement rework plan as the source of truth for rebuilding
+    Control, Localization, Guidance, and Brain/FSM.
+
 ## 2026-06-11
 
 ### Added
@@ -34,6 +65,23 @@ All notable larger additions and behavioral changes to this repository should be
     sustained pose loss clears the route after the configured frame threshold.
 
 ### Changed
+
+- Restored the normal route-tracking heading-error sign so large heading
+  corrections in `TRACKING` steer toward the active route segment instead of
+  away from it.
+  - Added a regression test for the large-angle tank-steer case where an
+    eastbound route and a 130 degree heading error must command a clockwise
+    correction.
+
+- Near-zone pickup alignment now waits for the chassis and top-down pose stream
+  to settle after the initial blocking TCP turn before visual-servo corrections
+  begin.
+  - The visual-servo turn math now preserves the sign of forward target offset
+    instead of mirroring behind-robot geometry with `abs(forward_cm)`.
+  - Near-zone visual-servo stall and iteration limits now abort into replanning
+    instead of being treated as good-enough alignment for the final blind TCP
+    move.
+  - Updated focused drive-control tests for the new settle and abort semantics.
 
 - XTE route tracking is now monotonic and progress-aware.
   - The drive loop keeps a route-progress segment cursor per active route and

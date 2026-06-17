@@ -11,7 +11,7 @@ import numpy as np
 
 from control.telemetry import log_event
 from control.tools.drive_calibration import DriveCalibrationValues, parse_drive_calibration_response
-from perception.vision.config import DriveConfig
+from config import DriveConfig
 
 
 class RobotCommander:

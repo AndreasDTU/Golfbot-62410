@@ -19,7 +19,7 @@ from control.telemetry import log_event
 from localization.localization import normalize_angle
 from localization.models import RobotPose
 from path.pathfinding.models import HybridPose
-from perception.vision.config import DriveConfig
+from config import DriveConfig
 
 
 class GuidanceStatus(str, Enum):

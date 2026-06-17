@@ -11,7 +11,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from perception.vision.config import CameraConfig, FieldConfig, WindowConfig
+from config import CameraConfig, FieldConfig, WindowConfig
 from perception.vision.models import CameraGroundProjection, ParallaxConfig
 
 

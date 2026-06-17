@@ -1,10 +1,5 @@
-"""Typed configuration for the top-down detector.
-
-The legacy detector still owns the executable OpenCV loop during the refactor,
-but these immutable config objects provide a single place for field geometry,
-camera/UI defaults, detection tuning, robot geometry, planning, and control
-values.  They intentionally mirror the existing constants so migration can be
-done incrementally without changing behavior.
+"""
+Typed configuration for everything.
 """
 
 from __future__ import annotations

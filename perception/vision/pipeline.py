@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from perception.vision.calibration import HomographyCalibrator, UndistortionProvider
-from perception.vision.config import AppConfig, FieldConfig
+from config import AppConfig, FieldConfig
 from perception.vision.detection import BallDetector, RedZoneDetector, YoloBallDetector
 from perception.vision.geometry import CoordinateMapper
 from perception.vision.grid_mapping import OccupancyGridBuilder

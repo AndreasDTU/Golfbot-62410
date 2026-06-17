@@ -10,7 +10,7 @@ import numpy as np
 from path.pathfinding.models import HybridPose, RouteSegmentType, RouteTrackingError
 from path.pathfinding.planner import RoutePlanningFacade
 from localization.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose, WheelCommand
-from perception.vision.config import DriveConfig, FieldConfig
+from config import DriveConfig, FieldConfig
 
 
 class WheelCommandController:

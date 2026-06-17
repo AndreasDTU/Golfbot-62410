@@ -10,7 +10,7 @@ from control.commander import RobotCommander
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.models import RobotPose
 from path.pathfinding.models import HybridPose
-from perception.vision.config import DriveConfig
+from config import DriveConfig
 
 
 # ---------------------------------------------------------------------------

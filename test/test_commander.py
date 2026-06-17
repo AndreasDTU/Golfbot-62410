@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from perception.vision.config import DriveConfig
+from config import DriveConfig
 from control.commander import RobotCommander
 
 

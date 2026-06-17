@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from perception.vision.config import CameraConfig, FieldConfig
+from config import CameraConfig, FieldConfig
 from perception.vision.geometry import CoordinateMapper
 from perception.vision.models import CalibrationState, CameraGroundProjection
 

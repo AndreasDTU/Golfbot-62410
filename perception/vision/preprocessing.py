@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from perception.vision.calibration import HomographyCalibrationResult, HomographyCalibrator, UndistortionProvider
-from perception.vision.config import CameraConfig
+from config import CameraConfig
 from perception.vision.models import CalibrationState, CameraGroundProjection
 
 

@@ -18,7 +18,7 @@ from path.pathfinding.planner import (
     PickupStandoffGoal,
 )
 from localization.models import RobotGeometry
-from perception.vision.config import FieldConfig
+from config import FieldConfig
 
 
 class GridDijkstraHeuristicTests(unittest.TestCase):

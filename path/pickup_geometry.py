@@ -61,6 +61,8 @@ class PickupGeometryResult:
     dilated_obstacle_mask: np.ndarray  # bool, obstacles grown by R
     ring_radius_cm: float
     mouth_radius_cm: float
+    tube_forward_cm: float
+    tube_right_cm: float
     balls: tuple[BallPickupResult, ...]
     field_width_cm: float
     field_height_cm: float
@@ -244,6 +246,8 @@ def compute_pickup_geometry(
         dilated_obstacle_mask=dilated_obstacles.astype(bool),
         ring_radius_cm=R,
         mouth_radius_cm=mouth_r,
+        tube_forward_cm=tube_fwd,
+        tube_right_cm=tube_right,
         balls=tuple(ball_results),
         field_width_cm=field_width_cm,
         field_height_cm=field_height_cm,

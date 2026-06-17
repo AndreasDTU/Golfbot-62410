@@ -50,9 +50,10 @@ class RoutePlannerInput:
 class CoverPoint:
     """A chosen pickup pose and the balls it covers."""
 
-    pose: HybridPose               # exact instance reused in RoutePlan (id()-matching)
+    pose: HybridPose               # travel-stop pose, reused in RoutePlan (id()-matching)
     source_pickup: PickupPose      # original from geometry result
     covered_ball_indices: tuple[int, ...]  # indices into PickupGeometryResult.balls
+    pickup_poses: tuple[HybridPose, ...] = ()  # same-origin pickup actions; defaults to pose
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class RouteEdge:
     blocked: bool
     detour_waypoint: HybridPose | None
     total_distance_cm: float
+    detour_waypoints: tuple[HybridPose, ...] = ()
 
 
 @dataclass(frozen=True)

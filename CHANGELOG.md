@@ -2,6 +2,34 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-06-17
+
+### Added
+
+- Added selectable route strategies to `path/tools/pickup_visualizer.py`.
+  - The visualizer now has a `Strategy` OpenCV trackbar, a `t` hotkey, and a
+    `--strategy` CLI option for switching between the existing set-cover route
+    and an intersection-priority route.
+  - Added an intersection-priority strategy that treats overlapping pickup
+    rings as shared-origin stations and emits multiple same-origin pickup poses
+    so a route can pick up extra balls with an in-place turn.
+  - Multi-ball pickup stations are highlighted with a magenta ring in the
+    visualizer.
+
+- Extended route detours to support multi-waypoint paths around the inflated
+  center cross, including the final leg from the last pickup station to the
+  unload staging pose.
+  - Detour validation now permits only the first segment to escape an endpoint
+    already inside the inflated cross zone, or the final segment to enter one,
+    while keeping all middle segments obstacle-clear.
+
+- Made the `intersection-priority` visualizer strategy treat still-uncollected
+  balls as hard circular obstacles during route ordering.
+  - Candidate stations may ignore only the balls they collect at that station;
+    all other uncollected balls block direct travel and are routed around by a
+    small visibility-graph detour using cross corners and sampled ball danger
+    waypoints.
+
 ## 2026-06-15
 
 ### Added

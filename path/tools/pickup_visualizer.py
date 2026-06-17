@@ -39,7 +39,7 @@ from path.route_strategy import (
     RoutePlannerInput,
     RouteStrategyResult,
 )
-from path.route_v1 import SetCoverNearestNeighborStrategy
+from path.route_v1 import IntersectionPriorityStrategy, SetCoverNearestNeighborStrategy
 from path.tools.pathfinding_sandbox import (
     RANDOM_BALL_COUNT,
     RANDOM_WHITE_BALL_COUNT,
@@ -62,6 +62,24 @@ OUTPUT_FILE = OUTPUT_DIR / "pickup_geometry.png"
 # Cross geometry (same as pathfinding_sandbox)
 CENTER_CROSS_SIZE_CM = 20.0
 CENTER_CROSS_ARM_WIDTH_CM = 3.0
+
+
+class StrategyOption:
+    """One selectable visualizer routing strategy."""
+
+    def __init__(self, key: str, label: str, strategy_cls) -> None:
+        self.key = key
+        self.label = label
+        self.strategy_cls = strategy_cls
+
+    def create(self):
+        return self.strategy_cls()
+
+
+STRATEGY_OPTIONS = (
+    StrategyOption("set-cover", "Set-cover nearest-neighbor", SetCoverNearestNeighborStrategy),
+    StrategyOption("intersections", "Intersection-priority", IntersectionPriorityStrategy),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +303,13 @@ def draw_route_plan(
     # --- Layer 3: Detour waypoints used in the route (yellow diamonds) ---
     for key in route_edge_keys:
         edge = edge_lookup.get(key)
-        if edge is not None and edge.detour_waypoint is not None:
-            wp_px = to_px(edge.detour_waypoint)
-            _draw_diamond(image, wp_px, 6, (0, 220, 255))
+        if edge is not None:
+            detour_points = edge.detour_waypoints
+            if not detour_points and edge.detour_waypoint is not None:
+                detour_points = (edge.detour_waypoint,)
+            for waypoint in detour_points:
+                wp_px = to_px(waypoint)
+                _draw_diamond(image, wp_px, 6, (0, 220, 255))
 
     # --- Layer 4: Final route polyline (thick cyan with arrowheads) ---
     route_px = [to_px(p) for p in route_plan.points]
@@ -313,6 +335,8 @@ def draw_route_plan(
     for visit_order, cp_idx in enumerate(ordered):
         cp = cover_points[cp_idx]
         px = to_px(cp.pose)
+        if len(cp.covered_ball_indices) > 1:
+            cv2.circle(image, px, 13, (255, 0, 255), 2, cv2.LINE_AA)
         cv2.circle(image, px, 8, (255, 220, 0), -1, cv2.LINE_AA)
         cv2.circle(image, px, 8, (0, 0, 0), 1, cv2.LINE_AA)
         label = str(visit_order + 1)
@@ -367,6 +391,18 @@ def draw_route_plan(
     cv2.putText(image, legend, (12, y_legend), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 0), 1, cv2.LINE_AA)
 
     return image
+
+
+def draw_strategy_label(
+    image: np.ndarray,
+    strategy_option: StrategyOption,
+) -> None:
+    """Draw the currently selected routing strategy in the schematic."""
+    text = f"Strategy: {strategy_option.label}"
+    x_px = 12
+    y_px = 88
+    cv2.putText(image, text, (x_px, y_px), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(image, text, (x_px, y_px), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def _graph_index_to_pose(
@@ -459,6 +495,7 @@ def _compute_and_render(
     occupancy_builder: OccupancyGridBuilder,
     geometry,
     seed: int,
+    strategy_option: StrategyOption,
 ) -> np.ndarray:
     """Generate a scenario, compute geometry + route, render, and print summary.
 
@@ -511,20 +548,21 @@ def _compute_and_render(
         unload_pose=unload_pose,
         unload_goal_cm=unload_goal_cm,
     )
-    strategy = SetCoverNearestNeighborStrategy()
+    strategy = strategy_option.create()
     strategy_result = strategy.plan(route_input)
 
     # Render
     image = render_base_schematic(state)
     draw_pickup_geometry(image, result, state.renderer.mapper, config.field)
     draw_route_plan(image, strategy_result, result, state.renderer.mapper, config.field)
+    draw_strategy_label(image, strategy_option)
 
     # Save output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(OUTPUT_FILE), image)
 
     # Print summary
-    print(f"\n--- seed={seed} ---")
+    print(f"\n--- seed={seed} strategy={strategy_option.key} ---")
     print(f"R = {R:.1f} cm  Field: {config.field.width_cm} x {config.field.height_cm} cm")
     print(f"Balls: {len(result.balls)}")
     for b in result.balls:
@@ -558,7 +596,9 @@ def _compute_and_render(
     for i, cp_idx in enumerate(strategy_result.ordered_indices):
         cp = strategy_result.cover_points[cp_idx]
         balls_str = ", ".join(f"#{result.balls[bi].track_id}" for bi in cp.covered_ball_indices)
-        print(f"  Stop {i + 1}: ({cp.pose.x_cm:.1f}, {cp.pose.y_cm:.1f}) covers [{balls_str}]")
+        pickup_count = len(cp.pickup_poses or (cp.pose,))
+        action_text = f", {pickup_count} pickup actions" if pickup_count > 1 else ""
+        print(f"  Stop {i + 1}: ({cp.pose.x_cm:.1f}, {cp.pose.y_cm:.1f}) covers [{balls_str}]{action_text}")
     rp = strategy_result.route_plan
     if rp.unload_pose is not None:
         print(f"  Unload: ({rp.unload_pose.x_cm:.1f}, {rp.unload_pose.y_cm:.1f}) -> goal {rp.unload_goal_cm}")
@@ -576,6 +616,12 @@ def main() -> int:
         help="Input mode: 'test' for synthetic scenario, 'camera' for live capture",
     )
     parser.add_argument("--seed", type=int, default=42, help="RNG seed for test scenario")
+    parser.add_argument(
+        "--strategy",
+        choices=[option.key for option in STRATEGY_OPTIONS],
+        default=STRATEGY_OPTIONS[0].key,
+        help="Initial route strategy shown in the visualizer",
+    )
     args = parser.parse_args()
 
     if args.mode == "camera":
@@ -588,22 +634,47 @@ def main() -> int:
     state = SandboxState(config=config, renderer=renderer)
 
     seed = args.seed
-    image = _compute_and_render(state, occupancy_builder, geometry, seed)
+    strategy_index = next(
+        index for index, option in enumerate(STRATEGY_OPTIONS)
+        if option.key == args.strategy
+    )
+    image: np.ndarray | None = None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, config.windows.schematic_width_px, config.windows.schematic_height_px)
-    cv2.imshow(WINDOW_NAME, image)
-    print("\nPress 'r' to randomize, Esc/q to quit.")
+    cv2.createTrackbar("Strategy", WINDOW_NAME, strategy_index, len(STRATEGY_OPTIONS) - 1, lambda _value: None)
+
+    def render_current() -> None:
+        nonlocal image
+        image = _compute_and_render(
+            state,
+            occupancy_builder,
+            geometry,
+            seed,
+            STRATEGY_OPTIONS[strategy_index],
+        )
+        cv2.imshow(WINDOW_NAME, image)
+
+    render_current()
+    print("\nUse the Strategy trackbar or press 't' to switch. Press 'r' to randomize, Esc/q to quit.")
 
     while True:
-        key = cv2.waitKey(0) & 0xFF
+        trackbar_index = cv2.getTrackbarPos("Strategy", WINDOW_NAME)
+        if 0 <= trackbar_index < len(STRATEGY_OPTIONS) and trackbar_index != strategy_index:
+            strategy_index = trackbar_index
+            render_current()
+
+        key = cv2.waitKey(50) & 0xFF
         if key in (27, ord("q")):
             break
+        if key == ord("t"):
+            strategy_index = (strategy_index + 1) % len(STRATEGY_OPTIONS)
+            cv2.setTrackbarPos("Strategy", WINDOW_NAME, strategy_index)
+            render_current()
         if key == ord("r"):
             seed += 1
-            image = _compute_and_render(state, occupancy_builder, geometry, seed)
-            cv2.imshow(WINDOW_NAME, image)
-            print("\nPress 'r' to randomize, Esc/q to quit.")
+            render_current()
+            print("\nUse the Strategy trackbar or press 't' to switch. Press 'r' to randomize, Esc/q to quit.")
 
     cv2.destroyAllWindows()
     return 0

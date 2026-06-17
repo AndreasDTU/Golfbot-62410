@@ -35,7 +35,7 @@ class GuidanceStatus(str, Enum):
 # Default waypoint arrival tolerance in cm (matches PlannerConfig.goal_tolerance_cm).
 DEFAULT_WAYPOINT_ARRIVAL_CM = 4.0
 DEFAULT_BALL_ARRIVAL_CM = 1.0
-DEFAULT_FINAL_HEADING_TOLERANCE_RAD = math.radians(5.0)
+DEFAULT_FINAL_HEADING_TOLERANCE_RAD = math.radians(2.0)
 
 
 class GuidanceController:

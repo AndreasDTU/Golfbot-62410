@@ -15,6 +15,8 @@ class FieldConfig:
 
     width_cm: float = 167.0
     height_cm: float = 121.5
+    ball_height_cm: float = 2.0
+    floor_height_cm: float = 0.0
 
     @property
     def grid_width_cm(self) -> int:
@@ -267,11 +269,11 @@ class ConnectionConfig:
 class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
-    drive_speed_pct: float = 50.0
+    drive_speed_pct: float = 100.0
     max_speed_pct: float = 100.0
     max_heading_for_forward_rad: float = math.radians(15.0)
     turn_speed_pct: float = 25.0
-    creep_speed_pct: float = 7.0
+    creep_speed_pct: float = 25.0
     # PID gains
     heading_kp: float = 38.0
     heading_kd: float = 6.0
@@ -295,7 +297,7 @@ class DriveConfig:
     near_zone_cm: float = 15.0
     near_zone_move_speed_pct: float = 7.0
     # Heading correction
-    adjust_gain: float = 2.0
+    adjust_gain: float = 0.5
     # Route tracking
     route_tracking_lookahead_segments: int = 12
 

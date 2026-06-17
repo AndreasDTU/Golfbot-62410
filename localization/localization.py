@@ -133,6 +133,7 @@ class RobotPoseEstimator:
             rear_cm=float(params.get("robot_rear_cm", self.robot_config.tuned_footprint_rear_from_origin_cm)),
             tube_forward_cm=float(params.get("tube_forward_cm", self.robot_config.tuned_tube_offset_cm)),
             tube_right_cm=float(params.get("tube_right_cm", self.robot_config.tuned_tube_right_offset_cm)),
+            mouth_radius_cm=float(params.get("mouth_radius_cm", self.robot_config.mouth_radius_cm)),
             unload_extension_cm=float(params.get("unload_extension_cm", self.robot_config.tuned_unload_extension_cm)),
         )
 

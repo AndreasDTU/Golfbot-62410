@@ -101,6 +101,7 @@ class RobotGeometryConfig:
     tuned_tube_offset_cm: float = 17.1
     tuned_tube_right_offset_cm: float = 0.0
     tube_width_cm: float = 6.0
+    mouth_radius_cm: float = 2.0
     tuned_unload_extension_cm: float = 30.0
 
 

@@ -159,6 +159,46 @@ class TestDrive:
 
 
 # ---------------------------------------------------------------------------
+# DriveAdjusted
+# ---------------------------------------------------------------------------
+
+class TestDriveAdjusted:
+    def test_single_command_per_tick(self):
+        c = make_commander()
+        before = len(c.sent_commands)
+        c.drive_adjusted(100.0, None, 5.0)
+        assert len(c.sent_commands) - before == 1
+
+    def test_forward_speed_with_correction(self):
+        c = make_commander()
+        c.drive_adjusted(100.0, None, 5.0)
+        left, right = last_lr(c)
+        correction = 5.0 * c._config.adjust_gain
+        base = (left + right) / 2
+        assert base == pytest.approx(c._config.drive_speed_pct, abs=0.5)
+        assert right - left == pytest.approx(2 * correction, abs=0.1)
+
+    def test_zero_heading_error_drives_straight(self):
+        c = make_commander()
+        c.drive_adjusted(100.0, None, 0.0)
+        left, right = last_lr(c)
+        assert left == pytest.approx(right, abs=0.01)
+
+    def test_stores_base_speed(self):
+        c = make_commander()
+        c.drive_adjusted(100.0, None, 10.0)
+        assert c._base_speed == pytest.approx(c._config.drive_speed_pct, abs=0.5)
+
+    def test_non_finite_cm_rejected(self):
+        c = make_commander()
+        assert c.drive_adjusted(float("nan"), None, 5.0) is False
+
+    def test_non_finite_heading_rejected(self):
+        c = make_commander()
+        assert c.drive_adjusted(100.0, None, float("inf")) is False
+
+
+# ---------------------------------------------------------------------------
 # Adjust
 # ---------------------------------------------------------------------------
 

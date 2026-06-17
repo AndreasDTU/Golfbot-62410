@@ -271,6 +271,25 @@ class RobotCommander:
         self._base_speed = speed
         return self._send_wheel_speeds(speed, speed)
 
+    def drive_adjusted(self, cm: float, dt_s: float | None, heading_error_deg: float) -> bool:
+        """Forward drive with simultaneous arc correction.
+
+        Computes a single wheel-speed command combining profiled forward speed
+        (from *cm*) with heading correction (from *heading_error_deg*).  This
+        replaces the two-call ``drive() + adjust()`` pattern, which sent an
+        intermediate straight-drive command before the arc correction.
+        """
+        if not (math.isfinite(cm) and math.isfinite(heading_error_deg)):
+            self.last_error = "non-finite drive_adjusted argument rejected"
+            return False
+        desired = self._target_speed_for_distance(cm)
+        if cm < 0:
+            desired = -desired
+        speed = self._slew_limited_speed(desired, dt_s)
+        self._base_speed = speed
+        correction = heading_error_deg * self._config.adjust_gain
+        return self._send_wheel_speeds(speed - correction, speed + correction)
+
     def adjust(self, degrees: float) -> bool:
         """Arc correction while maintaining forward motion.
 

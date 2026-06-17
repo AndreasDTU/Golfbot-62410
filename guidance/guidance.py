@@ -163,10 +163,8 @@ class GuidanceController:
             )
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
-        # 7. Drive forward with arc correction.
-        ok_drive = self._commander.drive(distance, dt_s)
-        ok_adjust = self._commander.adjust(math.degrees(heading_error))
-        ok = ok_drive and ok_adjust
+        # 7. Drive forward with arc correction (single combined LR command).
+        ok = self._commander.drive_adjusted(distance, dt_s, math.degrees(heading_error))
         self._log(
             "DRIVING", dist=distance,
             heading_err=math.degrees(heading_error), ok=ok,

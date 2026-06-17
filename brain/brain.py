@@ -60,6 +60,7 @@ class BrainController:
         self._unload_heading_samples: list[float] = []
         self._unload_target_heading: float | None = None
         self._unload_corrected: bool = False
+        self._unload_correcting: bool = False
 
     # ------------------------------------------------------------------
     # Public properties
@@ -124,6 +125,7 @@ class BrainController:
         self._unload_heading_samples = []
         self._unload_target_heading = None
         self._unload_corrected = False
+        self._unload_correcting = False
 
     # ------------------------------------------------------------------
     # Per-frame tick
@@ -263,9 +265,10 @@ class BrainController:
         Phase 1 (SETTLE): Accumulate heading samples for 2 seconds while
         the robot is stopped, averaging out localization noise.
 
-        Phase 2 (CORRECT): Compare the averaged heading to the expected
-        heading from the preceding DRIVE step.  If the error exceeds a
-        tight tolerance, issue a single tank-turn correction.
+        Phase 2 (CORRECT): Compare the live heading to the target heading
+        each tick, issuing tank-turn commands until the error is within
+        tolerance.  The first tick after settle uses the averaged heading
+        to decide whether correction is needed at all.
 
         Phase 3 (DUMP): Call the blocking ``commander.dropoff()``.
         """
@@ -283,7 +286,7 @@ class BrainController:
             if elapsed < UNLOAD_SETTLE_DURATION_S:
                 return self._state
 
-            # Phase 2: Correct heading if needed.
+            # Settle done — decide whether correction is needed.
             self._unload_corrected = True
             if (
                 self._unload_target_heading is not None
@@ -301,11 +304,34 @@ class BrainController:
                     error_deg=math.degrees(heading_error),
                 )
                 if abs(heading_error) > UNLOAD_HEADING_TOLERANCE_RAD:
+                    # Needs correction — stay in correcting phase.
+                    self._unload_correcting = True
                     self._commander.turn(math.degrees(heading_error))
                     log_event(
-                        "BRAIN", "UNLOAD heading corrected",
-                        turn_deg=math.degrees(heading_error),
+                        "BRAIN", "UNLOAD heading correction started",
+                        error_deg=math.degrees(heading_error),
                     )
+                    return self._state
+            # No correction needed — fall through to dump on next tick.
+            return self._state
+
+        # Phase 2: Correcting — keep turning until heading converges.
+        if self._unload_correcting:
+            if pose is None:
+                self._commander.stop()
+                return self._state
+            heading_error = normalize_angle(
+                self._unload_target_heading - pose.heading_rad
+            )
+            if abs(heading_error) <= UNLOAD_HEADING_TOLERANCE_RAD:
+                self._commander.stop()
+                self._unload_correcting = False
+                log_event(
+                    "BRAIN", "UNLOAD heading correction done",
+                    error_deg=math.degrees(heading_error),
+                )
+                return self._state
+            self._commander.turn(math.degrees(heading_error))
             return self._state
 
         # Phase 3: Dump.

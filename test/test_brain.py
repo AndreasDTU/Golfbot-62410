@@ -100,13 +100,22 @@ def make_plan(
 DT = 0.033  # ~30 FPS
 
 
-def _settle_unload(brain, p):
-    """Tick through the 2-second settle and heading-correction phases."""
+def _settle_unload(brain, settle_pose, corrected_pose=None):
+    """Tick through the settle, and if correction is needed, the correcting phase.
+
+    *settle_pose* is the pose reported during the 2-second settle window.
+    *corrected_pose* is the pose reported after the turn finishes (heading
+    within tolerance).  When None, it defaults to *settle_pose* (meaning
+    heading already matches the target, so no correcting phase runs).
+    """
     with patch('brain.brain.time.perf_counter') as mock_time:
         mock_time.return_value = 0.0
-        brain.tick(p, DT)
+        brain.tick(settle_pose, DT)
         mock_time.return_value = 2.1
-        brain.tick(p, DT)
+        brain.tick(settle_pose, DT)
+    # If correction was triggered, tick with the corrected heading so it converges.
+    if corrected_pose is not None:
+        brain.tick(corrected_pose, DT)
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +339,7 @@ class TestUnload:
             assert state == BrainState.UNLOAD
 
     def test_heading_correction_sends_turn(self):
-        """Heading error > 3 deg during settle triggers a correction turn."""
+        """Heading error > 3 deg during settle triggers correction turns."""
         brain, _, cmd = make_brain()
         p1 = wp(20, 0, theta_deg=0.0)
         plan = make_plan([p1], unload_pose=wp(20, 0))
@@ -347,14 +356,52 @@ class TestUnload:
             mock_time.return_value = 0.0
             brain.tick(pose(20, 0, 10), DT)
             mock_time.return_value = 2.1
-            brain.tick(pose(20, 0, 10), DT)
+            brain.tick(pose(20, 0, 10), DT)  # settle done, correction started
 
+        # Should have sent a turn command (opposite signs = rotation)
         new_cmds = cmd.sent_commands[cmds_before:]
         lr_cmds = [c for c in new_cmds if c.startswith('LR')]
         assert len(lr_cmds) == 1
         parts = lr_cmds[0].split()
         left, right = float(parts[1]), float(parts[2])
-        assert left * right < 0  # opposite signs = rotation
+        assert left * right < 0
+
+        # Still in UNLOAD — correcting phase continues
+        assert brain.state == BrainState.UNLOAD
+        brain.tick(pose(20, 0, 5), DT)   # still off by 5 deg > 3 deg
+        assert brain.state == BrainState.UNLOAD
+
+        # Heading converges within tolerance
+        brain.tick(pose(20, 0, 1), DT)   # 1 deg < 3 deg → correction done
+        assert brain.state == BrainState.UNLOAD  # ready for dump on next tick
+
+    def test_correcting_phase_stops_on_pose_loss(self):
+        """Pose loss during correction issues stop and stays in UNLOAD."""
+        brain, _, cmd = make_brain()
+        p1 = wp(20, 0, theta_deg=0.0)
+        plan = make_plan([p1], unload_pose=wp(20, 0))
+        brain.load_route(plan)
+
+        brain.tick(pose(0, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD
+
+        # Settle with heading 10 deg off
+        with patch('brain.brain.time.perf_counter') as mock_time:
+            mock_time.return_value = 0.0
+            brain.tick(pose(20, 0, 10), DT)
+            mock_time.return_value = 2.1
+            brain.tick(pose(20, 0, 10), DT)  # correction started
+
+        # Lose pose during correction
+        brain.tick(None, DT)
+        assert brain.state == BrainState.UNLOAD
+
+        # Pose returns with corrected heading → correction done → dump
+        brain.tick(pose(20, 0, 0), DT)
+        state = brain.tick(pose(20, 0, 0), DT)  # dump
+        assert cmd.dropoff_calls == 1
+        assert state == BrainState.IDLE
 
     def test_no_heading_correction_within_tolerance(self):
         """Heading error <= 3 deg skips the correction turn."""

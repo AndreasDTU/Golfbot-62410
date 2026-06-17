@@ -1081,7 +1081,18 @@ class MainGui:
     # ------------------------------------------------------------------
 
     def _process_frame(self, raw_frame: np.ndarray) -> VisionFrameResult:
-        return self.pipeline.process(raw_frame, params=self.params, use_aruco=True)
+        # HSV cross detection is disabled; the central cross is the manually
+        # placed one, fed in as a red zone so it flows into the occupancy grid
+        # and both panel overlays.
+        cross = self.cross_red_zone()
+        extra_red_zones = [cross] if cross is not None else []
+        return self.pipeline.process(
+            raw_frame,
+            params=self.params,
+            use_aruco=True,
+            detect_red_zones=False,
+            extra_red_zones=extra_red_zones,
+        )
 
     def _estimate_pose(self, result: VisionFrameResult) -> None:
         topdown = result.preprocessed.topdown
@@ -1112,30 +1123,9 @@ class MainGui:
 
         if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
             left = cv2.resize(left, (self._left_w, self._left_h), interpolation=cv2.INTER_LINEAR)
-        self._draw_cross_overlay(left)
         if self.mode == AppMode.CALIBRATE:
             self._draw_calibration_overlay(left)
         return left
-
-    def _draw_cross_overlay(self, image: np.ndarray) -> None:
-        """Draw the placed cross on the top-down camera feed."""
-        if self._cross_spec is None:
-            return
-        mapper = self.pipeline.mapper
-        topdown_w, topdown_h = self.config.camera.topdown_warp_size
-        scale_x = self._left_w / max(1, topdown_w)
-        scale_y = self._left_h / max(1, topdown_h)
-
-        def to_px(point_cm: tuple[float, float]) -> tuple[int, int]:
-            px, py = mapper.field_cm_to_topdown_pixel(point_cm)
-            return int(round(px * scale_x)), int(round(py * scale_y))
-
-        poly = np.array([to_px(p) for p in self._cross_spec.polygon_cm()], dtype=np.int32).reshape(-1, 1, 2)
-        overlay = image.copy()
-        cv2.fillPoly(overlay, [poly], (0, 0, 255))
-        cv2.addWeighted(overlay, 0.35, image, 0.65, 0.0, image)
-        cv2.polylines(image, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.drawMarker(image, to_px(self._cross_spec.center_cm), (0, 255, 255), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
 
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.

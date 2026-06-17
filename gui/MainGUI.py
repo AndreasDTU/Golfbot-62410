@@ -16,11 +16,14 @@ from enum import Enum
 import cv2
 import numpy as np
 
+from brain.brain import BrainController
+from brain.models import BrainState
 from control.commander import RobotCommander
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
 from localization.models import RobotPose
-from path.pathfinding.models import HybridPose
+from path.pathfinding.models import HybridPose, PlannedBallTarget
+from path.pathfinding.planner import RoutePlanningFacade
 from config import AppConfig
 from perception.vision.debug import DebugRenderer
 from perception.vision.models import CalibrationState
@@ -223,6 +226,13 @@ class MainGui:
     _active_route: list[HybridPose] | None = None
     _last_guidance_time: float | None = None
 
+    # Brain / Auto state
+    _brain: BrainController | None = None
+    _brain_state: BrainState | None = None
+    _last_brain_time: float | None = None
+    _brain_route_points: list[HybridPose] | None = None
+    _last_result: VisionFrameResult | None = None
+
     # Dimensions derived from config
     _left_w: int = 0
     _left_h: int = 0
@@ -235,6 +245,11 @@ class MainGui:
         self._right_h = self.config.windows.schematic_height_px
         self.params = self.pipeline.default_params()
         self._load_robot_calibration()
+        self._route_planner = RoutePlanningFacade(
+            field_config=self.config.field,
+            robot_config=self.config.robot,
+            planner_config=self.config.planner,
+        )
 
     def _load_robot_calibration(self) -> None:
         cal_path = self.config.paths.robot_calibration_file
@@ -297,9 +312,7 @@ class MainGui:
             self.mode = AppMode.MANUAL
             self.message = "Manual mode (view only)"
         elif action == "auto":
-            self._disconnect_guidance()
-            self.mode = AppMode.AUTO
-            self.message = "Auto mode (view only)"
+            self._start_brain()
         elif action == "stop":
             self._disconnect_guidance()
             self.mode = AppMode.IDLE
@@ -415,7 +428,13 @@ class MainGui:
         self._load_test_route(next_name)
 
     def _disconnect_guidance(self) -> None:
-        """Clear route, stop robot, close socket, reset guidance state."""
+        """Clear route, stop robot, close socket, reset guidance and brain state."""
+        if self._brain is not None:
+            self._brain.reset()
+        self._brain = None
+        self._brain_state = None
+        self._brain_route_points = None
+        self._last_brain_time = None
         if self._guidance is not None:
             self._guidance.clear_route()
         if self._commander is not None:
@@ -444,6 +463,112 @@ class MainGui:
         self._last_guidance_time = now
 
         self._guidance_status = self._guidance.tick(self.robot_pose, dt_s)
+
+    # ------------------------------------------------------------------
+    # Brain / Auto mode
+    # ------------------------------------------------------------------
+
+    def _start_brain(self) -> None:
+        """Validate inputs, plan a route, and start the Brain FSM."""
+        if self._connecting:
+            self.message = "Already connecting..."
+            return
+        if self._brain is not None:
+            self.message = "Brain already running"
+            return
+
+        # Validate prerequisites
+        if self.robot_pose is None:
+            self.message = "Cannot start: no robot pose"
+            return
+        result = self._last_result
+        if result is None or result.occupancy_grid is None:
+            self.message = "Cannot start: no occupancy grid"
+            return
+        if not result.smoothed_ball_coordinates:
+            self.message = "Cannot start: no balls detected"
+            return
+
+        # Capture current frame data before spawning thread
+        captured_grid = result.occupancy_grid.copy()
+        captured_balls = list(result.smoothed_ball_coordinates)
+        captured_pose = self.robot_pose
+
+        self._connecting = True
+        self.message = "Connecting and planning route..."
+
+        def connect_and_plan() -> None:
+            try:
+                commander = RobotCommander(
+                    drive_config=self.config.drive,
+                    auto_connect=True,
+                )
+                guidance = GuidanceController(commander, config=self.config.drive)
+                brain = BrainController(guidance, commander)
+
+                start_pose = HybridPose(
+                    x_cm=captured_pose.x_cm,
+                    y_cm=captured_pose.y_cm,
+                    theta_rad=captured_pose.heading_rad,
+                )
+                targets = [
+                    PlannedBallTarget(
+                        track_id=b.track_id,
+                        label=b.label,
+                        x_cm=b.cm_x,
+                        y_cm=b.cm_y,
+                        node_cm=self.pipeline.mapper.field_metric_cm_to_grid_node(
+                            (b.cm_x, b.cm_y),
+                        ),
+                    )
+                    for b in captured_balls
+                ]
+                geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+
+                plan = self._route_planner.plan_route(
+                    captured_grid, targets, start_pose, geometry,
+                )
+
+                if not plan.points:
+                    self.message = "Planner returned empty route"
+                    commander.close()
+                    return
+
+                brain.load_route(plan)
+
+                self._commander = commander
+                self._guidance = guidance
+                self._brain = brain
+                self._brain_route_points = plan.points
+                self._last_brain_time = None
+                self._brain_state = None
+                self.mode = AppMode.AUTO
+                self.message = f"Brain running — {brain.step_count} steps"
+            except Exception as exc:
+                self.message = f"Brain start failed: {exc}"
+                self._commander = None
+                self._guidance = None
+                self._brain = None
+            finally:
+                self._connecting = False
+
+        threading.Thread(target=connect_and_plan, daemon=True).start()
+
+    def _tick_brain(self) -> None:
+        """Run one Brain FSM frame if in AUTO mode."""
+        if self.mode != AppMode.AUTO:
+            return
+        if self._brain is None or self._connecting:
+            return
+
+        now = time.perf_counter()
+        if self._last_brain_time is None:
+            dt_s = 0.033
+        else:
+            dt_s = max(0.001, min(0.5, now - self._last_brain_time))
+        self._last_brain_time = now
+
+        self._brain_state = self._brain.tick(self.robot_pose, dt_s)
 
     # ------------------------------------------------------------------
     # Per-frame processing
@@ -490,12 +615,15 @@ class MainGui:
             float(self.params.get("camera_center_y", self._left_h / 2)),
         )
 
-        # Pass test route waypoints to the schematic when guidance is active
+        # Pass route waypoints to the schematic when guidance or brain is active
         manual_wp: list[tuple[float, float]] | None = None
         route_pts: list[HybridPose] | None = None
         if self._active_route is not None and self.mode == AppMode.GUIDANCE_TEST:
             manual_wp = [(wp.x_cm, wp.y_cm) for wp in self._active_route]
             route_pts = self._active_route
+        elif self._brain_route_points is not None and self.mode == AppMode.AUTO:
+            manual_wp = [(wp.x_cm, wp.y_cm) for wp in self._brain_route_points]
+            route_pts = self._brain_route_points
 
         return self.renderer.draw_schematic(
             frame_shape=frame_shape,
@@ -535,12 +663,24 @@ class MainGui:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 255), 1, cv2.LINE_AA)
             cv2.putText(canvas, self.message, (20, y0 + 62),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
+        elif self.mode == AppMode.AUTO:
+            bs = self._brain_state.value if self._brain_state else "—"
+            step_cur = self._brain.step_cursor if self._brain else 0
+            step_tot = self._brain.step_count if self._brain else 0
+            connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
+            if self._connecting:
+                connected = "Connecting..."
+            brain_line = f"Brain: {bs} | Step: {step_cur}/{step_tot} | {connected}"
+            cv2.putText(canvas, brain_line, (20, y0 + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 220), 1, cv2.LINE_AA)
+            cv2.putText(canvas, self.message, (20, y0 + 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
         else:
             cv2.putText(canvas, self.message, (20, y0 + 42),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
 
         cv2.putText(canvas,
-                    "Keys: q/Esc quit | f set corners | g guidance test | s stop",
+                    "Keys: q/Esc quit | f set corners | g guidance test | a auto | s stop",
                     (20, y0 + 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
 
@@ -583,8 +723,10 @@ class MainGui:
 
         if raw_frame is not None:
             result = self._process_frame(raw_frame)
+            self._last_result = result
             self._estimate_pose(result)
             self._tick_guidance()
+            self._tick_brain()
             left = self._build_left_panel(result)
             right = self._build_right_panel(result)
         else:

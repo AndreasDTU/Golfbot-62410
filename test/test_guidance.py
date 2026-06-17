@@ -175,7 +175,7 @@ class TestArrival:
     def test_arrives_at_single_waypoint(self):
         g, cmd = make_guidance()
         g.set_route([wp(50, 50)])
-        # Robot is at the waypoint
+        # Robot is at the waypoint with matching heading → ARRIVED
         status = g.tick(pose(50, 50, 0), DT)
         assert status == GuidanceStatus.ARRIVED
 
@@ -183,17 +183,17 @@ class TestArrival:
         g, cmd = make_guidance()
         g.set_route([wp(50, 50), wp(80, 50)])
         assert g.cursor == 0
-        # Robot is at first waypoint
+        # Robot is at first waypoint — intermediate, no heading check
         status = g.tick(pose(50, 50, 0), DT)
         assert status == GuidanceStatus.RUNNING
         assert g.cursor == 1
 
-    def test_within_tolerance_counts_as_arrived(self):
+    def test_within_ball_tolerance_enters_alignment(self):
         g, cmd = make_guidance()
-        # Default waypoint_arrival_cm is 4.0
+        # ball_arrival_cm defaults to 1.0 for last waypoint
         g.set_route([wp(50, 50)])
-        # Robot is 3 cm away — within tolerance
-        status = g.tick(pose(47, 50, 0), DT)
+        # Robot is 0.5 cm away with matching heading → distance OK, heading OK → ARRIVED
+        status = g.tick(pose(49.5, 50, 0), DT)
         assert status == GuidanceStatus.ARRIVED
 
     def test_outside_tolerance_keeps_running(self):
@@ -202,6 +202,87 @@ class TestArrival:
         # Robot is 10 cm away
         status = g.tick(pose(40, 50, 0), DT)
         assert status == GuidanceStatus.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# Final waypoint heading alignment
+# ---------------------------------------------------------------------------
+
+class TestFinalHeadingAlignment:
+    def test_position_reached_wrong_heading_keeps_running(self):
+        g, cmd = make_guidance()
+        # Waypoint heading is 90°, robot heading is 0°
+        g.set_route([wp(50, 50, 90)])
+        status = g.tick(pose(50, 50, 0), DT)
+        # Position reached but heading is off → RUNNING (aligning)
+        assert status == GuidanceStatus.RUNNING
+
+    def test_alignment_sends_turn_command(self):
+        g, cmd = make_guidance()
+        g.set_route([wp(50, 50, 90)])
+        g.tick(pose(50, 50, 0), DT)
+        # Should have sent a turn (differential wheels)
+        left, right = last_lr(cmd)
+        assert left * right < 0  # opposite signs = rotation
+
+    def test_alignment_completes_when_heading_matches(self):
+        g, cmd = make_guidance()
+        g.set_route([wp(50, 50, 90)])
+        # First tick: position reached, heading wrong → starts aligning
+        status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.RUNNING
+        # Second tick: heading now matches → ARRIVED
+        status = g.tick(pose(50, 50, 90), DT)
+        assert status == GuidanceStatus.ARRIVED
+
+    def test_alignment_within_tolerance_is_arrived(self):
+        g, cmd = make_guidance()
+        # Default tolerance is 5°
+        g.set_route([wp(50, 50, 90)])
+        # Robot heading is 87° — within 5° of 90° → ARRIVED
+        status = g.tick(pose(50, 50, 87), DT)
+        assert status == GuidanceStatus.ARRIVED
+
+    def test_alignment_outside_tolerance_keeps_turning(self):
+        g, cmd = make_guidance()
+        g.set_route([wp(50, 50, 90)])
+        # Robot heading is 80° — 10° off, outside 5° tolerance
+        status = g.tick(pose(50, 50, 80), DT)
+        assert status == GuidanceStatus.RUNNING
+
+    def test_intermediate_waypoints_skip_alignment(self):
+        g, cmd = make_guidance()
+        # Intermediate waypoint at (50,50) heading 90°, robot heading 0°
+        # Should advance cursor without caring about heading
+        g.set_route([wp(50, 50, 90), wp(80, 50)])
+        status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.RUNNING
+        assert g.cursor == 1  # advanced past intermediate
+
+    def test_set_route_resets_alignment(self):
+        g, cmd = make_guidance()
+        g.set_route([wp(50, 50, 90)])
+        # Enter alignment phase
+        g.tick(pose(50, 50, 0), DT)
+        # Load new route — should reset alignment state
+        g.set_route([wp(80, 50)])
+        status = g.tick(pose(80, 50, 0), DT)
+        assert status == GuidanceStatus.ARRIVED
+
+    def test_clear_route_resets_alignment(self):
+        g, cmd = make_guidance()
+        g.set_route([wp(50, 50, 90)])
+        g.tick(pose(50, 50, 0), DT)  # enter alignment
+        g.clear_route()
+        status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.NO_ROUTE
+
+    def test_no_pose_during_alignment_stops(self):
+        g, cmd = make_guidance()
+        g.set_route([wp(50, 50, 90)])
+        g.tick(pose(50, 50, 0), DT)  # enter alignment
+        status = g.tick(None, DT)
+        assert status == GuidanceStatus.NO_POSE
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +304,7 @@ class TestFullRoute:
         assert status == GuidanceStatus.RUNNING
         assert g.cursor == 2
 
-        # At third waypoint → ARRIVED
+        # At third (last) waypoint with matching heading → ARRIVED
         status = g.tick(pose(70, 50, 0), DT)
         assert status == GuidanceStatus.ARRIVED
 
@@ -233,6 +314,24 @@ class TestFullRoute:
         g.tick(pose(50, 50, 0), DT)
         # Subsequent ticks still return ARRIVED
         status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.ARRIVED
+
+    def test_full_route_with_heading_alignment(self):
+        g, cmd = make_guidance()
+        # Last waypoint requires heading 90°
+        g.set_route([wp(50, 50), wp(70, 50, 90)])
+
+        # At first waypoint → advances
+        status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.RUNNING
+        assert g.cursor == 1
+
+        # At last waypoint position, heading wrong → aligning
+        status = g.tick(pose(70, 50, 0), DT)
+        assert status == GuidanceStatus.RUNNING
+
+        # Heading now correct → ARRIVED
+        status = g.tick(pose(70, 50, 90), DT)
         assert status == GuidanceStatus.ARRIVED
 
 

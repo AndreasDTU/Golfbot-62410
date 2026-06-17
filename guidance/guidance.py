@@ -35,6 +35,7 @@ class GuidanceStatus(str, Enum):
 # Default waypoint arrival tolerance in cm (matches PlannerConfig.goal_tolerance_cm).
 DEFAULT_WAYPOINT_ARRIVAL_CM = 4.0
 DEFAULT_BALL_ARRIVAL_CM = 1.0
+DEFAULT_FINAL_HEADING_TOLERANCE_RAD = math.radians(5.0)
 
 
 class GuidanceController:
@@ -57,15 +58,18 @@ class GuidanceController:
         config: DriveConfig | None = None,
         waypoint_arrival_cm: float = DEFAULT_WAYPOINT_ARRIVAL_CM,
         ball_arrival_cm: float = DEFAULT_BALL_ARRIVAL_CM,
+        final_heading_tolerance_rad: float = DEFAULT_FINAL_HEADING_TOLERANCE_RAD,
     ) -> None:
         self._commander = commander
         self._config = config or DriveConfig()
         self._waypoint_arrival_cm = waypoint_arrival_cm
         self._ball_arrival_cm = ball_arrival_cm
+        self._final_heading_tolerance_rad = final_heading_tolerance_rad
 
         self._waypoints: list[HybridPose] = []
         self._cursor: int = 0
         self._route_complete: bool = False
+        self._aligning: bool = False
 
     # ------------------------------------------------------------------
     # Route management
@@ -76,6 +80,7 @@ class GuidanceController:
         self._waypoints = list(waypoints)
         self._cursor = 0
         self._route_complete = False
+        self._aligning = False
         log_event("GUIDANCE", "route set", waypoints=len(self._waypoints))
 
     def clear_route(self) -> None:
@@ -83,6 +88,7 @@ class GuidanceController:
         self._waypoints = []
         self._cursor = 0
         self._route_complete = False
+        self._aligning = False
         self._commander.stop()
         log_event("GUIDANCE", "route cleared")
 
@@ -127,24 +133,28 @@ class GuidanceController:
         if self._route_complete:
             return GuidanceStatus.ARRIVED
 
-        # 3. Compute geometry to current target waypoint.
+        # 3. Final-waypoint heading alignment phase.
+        if self._aligning:
+            return self._tick_align(pose)
+
+        # 4. Compute geometry to current target waypoint.
         target = self._waypoints[self._cursor]
         distance, heading_error = self._compute_geometry(pose, target)
 
-        # 4. Check arrival at current waypoint.
-        lastPoint = self._cursor >= len(self._waypoints) - 1
-        if distance < (self._ball_arrival_cm if lastPoint else self._waypoint_arrival_cm):
+        # 5. Check arrival at current waypoint.
+        is_last = self._cursor >= len(self._waypoints) - 1
+        if distance < (self._ball_arrival_cm if is_last else self._waypoint_arrival_cm):
+            if is_last:
+                # Position reached — enter heading alignment phase.
+                self._aligning = True
+                self._log("ALIGNING", dist=distance)
+                return self._tick_align(pose)
+            # Intermediate waypoint — advance cursor.
             self._cursor += 1
-            if lastPoint:
-                self._commander.stop()
-                self._route_complete = True
-                self._log("ARRIVED", dist=distance)
-                return GuidanceStatus.ARRIVED
-            # Recalculate for the next waypoint.
             target = self._waypoints[self._cursor]
             distance, heading_error = self._compute_geometry(pose, target)
 
-        # 5. Large heading error — rotate in place.
+        # 6. Large heading error — rotate in place.
         if abs(heading_error) > self._config.max_heading_for_forward_rad:
             ok = self._commander.turn(math.degrees(heading_error))
             self._log(
@@ -153,7 +163,7 @@ class GuidanceController:
             )
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
-        # 6. Drive forward with arc correction.
+        # 7. Drive forward with arc correction.
         ok_drive = self._commander.drive(distance, dt_s)
         ok_adjust = self._commander.adjust(math.degrees(heading_error))
         ok = ok_drive and ok_adjust
@@ -166,6 +176,24 @@ class GuidanceController:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _tick_align(self, pose: RobotPose) -> GuidanceStatus:
+        """Rotate in place to match the final waypoint's heading."""
+        target = self._waypoints[self._cursor]
+        heading_error = normalize_angle(target.theta_rad - pose.heading_rad)
+
+        if abs(heading_error) <= self._final_heading_tolerance_rad:
+            self._commander.stop()
+            self._route_complete = True
+            self._log("ARRIVED", heading_err=math.degrees(heading_error))
+            return GuidanceStatus.ARRIVED
+
+        ok = self._commander.turn(math.degrees(heading_error))
+        self._log(
+            "ALIGN_TURN",
+            heading_err=math.degrees(heading_error), ok=ok,
+        )
+        return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
     @staticmethod
     def _compute_geometry(

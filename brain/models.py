@@ -15,6 +15,7 @@ class BrainState(str, Enum):
     DRIVE = "DRIVE"
     PICKUP = "PICKUP"
     UNLOAD = "UNLOAD"
+    VICTORY = "VICTORY"
     ERROR = "ERROR"
     DONE = "DONE"
 
@@ -25,6 +26,7 @@ class IntentAction(str, Enum):
     DRIVE = "DRIVE"
     PICKUP = "PICKUP"
     UNLOAD = "UNLOAD"
+    VICTORY = "VICTORY"
     STOP = "STOP"
 
 

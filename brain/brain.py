@@ -141,6 +141,9 @@ class BrainController:
         if self._state == BrainState.UNLOAD:
             return self._tick_unload()
 
+        if self._state == BrainState.VICTORY:
+            return self._tick_victory()
+
         return self._state
 
     # ------------------------------------------------------------------
@@ -150,9 +153,9 @@ class BrainController:
     def _tick_idle(self) -> BrainState:
         """Dispatch the next step or transition to DONE."""
         if self._step_cursor >= len(self._steps):
-            self._state = BrainState.DONE
-            self._intent = BrainIntent(action=IntentAction.STOP)
-            log_event("BRAIN", "DONE", reason="all steps completed")
+            self._intent = BrainIntent(action=IntentAction.VICTORY)
+            self._state = BrainState.VICTORY
+            log_event("BRAIN", "VICTORY", reason="all steps completed")
             return self._state
 
         step = self._steps[self._step_cursor]
@@ -249,6 +252,23 @@ class BrainController:
 
         self._step_cursor += 1
         self._state = BrainState.IDLE
+        return self._state
+
+    def _tick_victory(self) -> BrainState:
+        """Execute blocking victory dance and transition to DONE."""
+        try:
+            result = self._commander.victory_dance()
+            log_event("BRAIN", "VICTORY complete", result=result)
+        except Exception as exc:
+            self._error_message = f"Victory dance failed: {exc}"
+            self._state = BrainState.ERROR
+            self._intent = BrainIntent(action=IntentAction.STOP)
+            log_event("BRAIN", "ERROR", source="victory", error=str(exc))
+            return self._state
+
+        self._state = BrainState.DONE
+        self._intent = BrainIntent(action=IntentAction.STOP)
+        log_event("BRAIN", "DONE", reason="victory dance complete")
         return self._state
 
     # ------------------------------------------------------------------

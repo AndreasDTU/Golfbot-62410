@@ -333,6 +333,22 @@ class RobotCommander:
     def dropoff(self) -> str:
         return self.unload_full_cycle()
 
+    def victory_dance(self) -> str:
+        """Blocking sequence of moves executed when all balls have been collected."""
+        moves = [
+            "turn 360 50",    # full spin right
+            "turn -360 50",   # full spin left
+            "turn 45 40",     # shimmy right
+            "turn -90 40",    # shimmy left
+            "turn 45 40",     # re-centre
+            "move 10 50",     # forward lunge
+            "back 10 50",     # retreat
+            "turn 720 70",    # blazing double-spin finale
+        ]
+        for cmd in moves:
+            self._send(cmd)
+        return "ok: victory dance complete"
+
     # ------------------------------------------------------------------
     # Calibration API (blocking, unchanged)
     # ------------------------------------------------------------------

@@ -27,8 +27,10 @@ class FakeCommander(RobotCommander):
         self.sent_commands: list[str] = []
         self.pickup_calls: int = 0
         self.dropoff_calls: int = 0
+        self.victory_dance_calls: int = 0
         self.pickup_should_fail: bool = False
         self.dropoff_should_fail: bool = False
+        self.victory_dance_should_fail: bool = False
 
     def _send(self, cmd: str) -> str:
         self.sent_commands.append(cmd)
@@ -48,6 +50,12 @@ class FakeCommander(RobotCommander):
         self.dropoff_calls += 1
         if self.dropoff_should_fail:
             raise RuntimeError("unload actuator failed")
+        return "ok"
+
+    def victory_dance(self) -> str:
+        self.victory_dance_calls += 1
+        if self.victory_dance_should_fail:
+            raise RuntimeError("victory dance failed")
         return "ok"
 
 
@@ -109,8 +117,10 @@ class TestInitialState:
         assert brain.state == BrainState.IDLE
 
     def test_no_plan_transitions_to_done(self):
-        """With no route loaded, step list is empty so IDLE dispatches DONE."""
+        """With no route loaded, IDLE dispatches VICTORY then dance completes to DONE."""
         brain, _, _ = make_brain()
+        state = brain.tick(pose(50, 50, 0), DT)
+        assert state == BrainState.VICTORY
         state = brain.tick(pose(50, 50, 0), DT)
         assert state == BrainState.DONE
 
@@ -157,7 +167,9 @@ class TestDriveOnly:
         state = brain.tick(pose(50, 50, 0), DT)  # at waypoint -> ARRIVED -> IDLE
         assert state == BrainState.IDLE
 
-        state = brain.tick(pose(50, 50, 0), DT)  # no more steps -> DONE
+        state = brain.tick(pose(50, 50, 0), DT)  # no more steps -> VICTORY
+        assert state == BrainState.VICTORY
+        state = brain.tick(pose(50, 50, 0), DT)  # dance completes -> DONE
         assert state == BrainState.DONE
 
     def test_intent_target_is_last_waypoint(self):
@@ -201,8 +213,48 @@ class TestDone:
 
     def test_done_intent_is_stop(self):
         brain, _, _ = make_brain()
-        brain.tick(pose(0, 0, 0), DT)  # empty plan -> DONE
+        brain.tick(pose(0, 0, 0), DT)  # empty plan -> VICTORY
+        brain.tick(pose(0, 0, 0), DT)  # dance -> DONE
         assert brain.intent.action == IntentAction.STOP
+
+
+# ---------------------------------------------------------------------------
+# Victory
+# ---------------------------------------------------------------------------
+
+class TestVictory:
+    def test_victory_dispatches_when_steps_exhausted(self):
+        brain, _, _ = make_brain()
+        state = brain.tick(pose(0, 0, 0), DT)
+        assert state == BrainState.VICTORY
+        assert brain.intent.action == IntentAction.VICTORY
+
+    def test_victory_calls_commander_dance(self):
+        brain, _, cmd = make_brain()
+        brain.tick(pose(0, 0, 0), DT)   # IDLE -> VICTORY
+        brain.tick(pose(0, 0, 0), DT)   # VICTORY -> dance -> DONE
+        assert cmd.victory_dance_calls == 1
+
+    def test_victory_transitions_to_done(self):
+        brain, _, _ = make_brain()
+        brain.tick(pose(0, 0, 0), DT)   # IDLE -> VICTORY
+        state = brain.tick(pose(0, 0, 0), DT)
+        assert state == BrainState.DONE
+
+    def test_victory_failure_enters_error(self):
+        brain, _, cmd = make_brain()
+        brain.tick(pose(0, 0, 0), DT)   # IDLE -> VICTORY
+        cmd.victory_dance_should_fail = True
+        state = brain.tick(pose(0, 0, 0), DT)
+        assert state == BrainState.ERROR
+        assert "victory" in brain.error_message.lower()
+
+    def test_done_persists_after_victory(self):
+        brain, _, _ = make_brain()
+        brain.tick(pose(0, 0, 0), DT)   # IDLE -> VICTORY
+        brain.tick(pose(0, 0, 0), DT)   # VICTORY -> DONE
+        state = brain.tick(pose(0, 0, 0), DT)
+        assert state == BrainState.DONE
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +392,9 @@ class TestFullRoute:
         brain.tick(pose(60, 0, 0), DT)   # UNLOAD -> blocks -> IDLE
         assert cmd.dropoff_calls == 1
 
-        # Done
+        # Victory dance then done
+        state = brain.tick(pose(60, 0, 0), DT)
+        assert state == BrainState.VICTORY
         state = brain.tick(pose(60, 0, 0), DT)
         assert state == BrainState.DONE
 

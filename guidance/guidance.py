@@ -34,6 +34,7 @@ class GuidanceStatus(str, Enum):
 
 # Default waypoint arrival tolerance in cm (matches PlannerConfig.goal_tolerance_cm).
 DEFAULT_WAYPOINT_ARRIVAL_CM = 4.0
+DEFAULT_BALL_ARRIVAL_CM = 1.0
 
 
 class GuidanceController:
@@ -55,10 +56,12 @@ class GuidanceController:
         commander: RobotCommander,
         config: DriveConfig | None = None,
         waypoint_arrival_cm: float = DEFAULT_WAYPOINT_ARRIVAL_CM,
+        ball_arrival_cm: float = DEFAULT_BALL_ARRIVAL_CM,
     ) -> None:
         self._commander = commander
         self._config = config or DriveConfig()
         self._waypoint_arrival_cm = waypoint_arrival_cm
+        self._ball_arrival_cm = ball_arrival_cm
 
         self._waypoints: list[HybridPose] = []
         self._cursor: int = 0
@@ -129,9 +132,10 @@ class GuidanceController:
         distance, heading_error = self._compute_geometry(pose, target)
 
         # 4. Check arrival at current waypoint.
-        if distance < self._waypoint_arrival_cm:
+        lastPoint = self._cursor >= len(self._waypoints) - 1
+        if distance < (self._ball_arrival_cm if lastPoint else self._waypoint_arrival_cm):
             self._cursor += 1
-            if self._cursor >= len(self._waypoints):
+            if lastPoint:
                 self._commander.stop()
                 self._route_complete = True
                 self._log("ARRIVED", dist=distance)

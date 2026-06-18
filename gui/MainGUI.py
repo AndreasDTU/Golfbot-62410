@@ -35,7 +35,7 @@ from path.tools.pickup_visualizer import (
     draw_route_plan,
     draw_strategy_label,
 )
-from config import AppConfig
+from config import AppConfig, RouteStrategyName
 from perception.vision.debug import DebugRenderer
 from perception.vision.models import CalibrationState, RedCrossSpec, RedZoneDetection
 from perception.vision.pipeline import VisionPipeline, VisionFrameResult
@@ -96,6 +96,17 @@ TEST_ROUTES: dict[str, list[HybridPose]] = {
 }
 
 TEST_ROUTE_NAMES: list[str] = list(TEST_ROUTES.keys())
+
+ROUTE_VIEW_KEY_BY_CONFIG_STRATEGY: dict[RouteStrategyName, str] = {
+    RouteStrategyName.SET_COVER_NEAREST: "set-cover",
+    RouteStrategyName.INTERSECTION_PRIORITY: "intersections",
+    RouteStrategyName.INTERSECTION_NEAREST: "intersection-nearest",
+    RouteStrategyName.INTERSECTION_OPTIMAL: "intersection-optimal",
+}
+
+CONFIG_STRATEGY_BY_ROUTE_VIEW_KEY: dict[str, RouteStrategyName] = {
+    value: key for key, value in ROUTE_VIEW_KEY_BY_CONFIG_STRATEGY.items()
+}
 
 
 @dataclass(frozen=True)
@@ -319,6 +330,7 @@ class MainGui:
         self._load_robot_calibration()
         self._load_field_corners()
         self._load_cross()
+        self._route_view_strategy_index = self._route_view_strategy_index_from_config()
         self._route_planner = RoutePlanningFacade(
             field_config=self.config.field,
             robot_config=self.config.robot,
@@ -1249,6 +1261,23 @@ class MainGui:
         )
         self.message = "Route View opened — use Strategy trackbar to switch"
 
+    def _route_view_strategy_index_from_config(self) -> int:
+        """Return the route-view option matching the configured route strategy."""
+        configured_key = ROUTE_VIEW_KEY_BY_CONFIG_STRATEGY.get(self.config.planner.route_strategy)
+        for index, option in enumerate(STRATEGY_OPTIONS):
+            if option.key == configured_key:
+                return index
+        return 0
+
+    def _sync_route_view_strategy_to_planner(self) -> None:
+        """Apply the selected route-view strategy to the shared planner facade."""
+        if not (0 <= self._route_view_strategy_index < len(STRATEGY_OPTIONS)):
+            return
+        option = STRATEGY_OPTIONS[self._route_view_strategy_index]
+        strategy_name = CONFIG_STRATEGY_BY_ROUTE_VIEW_KEY.get(option.key)
+        if strategy_name is not None:
+            self._route_planner.set_strategy(strategy_name)
+
     def _close_route_view(self) -> None:
         self._route_view_open = False
         self._route_view_cached_image = None
@@ -1276,6 +1305,8 @@ class MainGui:
         if 0 <= tb < len(STRATEGY_OPTIONS):
             strategy_changed = tb != self._route_view_strategy_index
             self._route_view_strategy_index = tb
+            if strategy_changed:
+                self._sync_route_view_strategy_to_planner()
         else:
             strategy_changed = False
 

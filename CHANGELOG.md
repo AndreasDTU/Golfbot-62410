@@ -12,6 +12,12 @@ All notable larger additions and behavioral changes to this repository should be
     config construction, debug footprint rendering, and saved geometry tuning
     now read those values from the live `RobotGeometry`/planner config path.
 
+- Made the Main GUI route-view strategy selector initialize from
+  `PlannerConfig.route_strategy` instead of always starting on the first
+  visualizer strategy.
+  - Changing the route-view strategy now also updates the shared route-planning
+    facade used for AUTO planning.
+
 ## 2026-06-17
 
 ### Added

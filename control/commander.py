@@ -287,7 +287,7 @@ class RobotCommander:
             desired = -desired
         speed = self._slew_limited_speed(desired, dt_s)
         self._base_speed = speed
-        correction = heading_error_deg * self._config.adjust_gain
+        correction = heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
         return self._send_wheel_speeds(speed - correction, speed + correction)
 
     def stop(self, force: bool = True) -> bool:

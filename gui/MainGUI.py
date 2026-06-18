@@ -1621,6 +1621,35 @@ class MainGui:
             color = (60, 60, 200) if ball.track_id in self._last_crop_missing else (60, 200, 60)
             cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), color, 2, cv2.LINE_AA)
 
+        # Draw pending verification cluster overlay
+        if self._pending_verification:
+            pv_px = [
+                self.pipeline.mapper.field_cm_to_topdown_pixel((b.cm_x, b.cm_y))
+                for b in self._pending_verification
+            ]
+            # Dashed yellow box per pending ball
+            for px, py in pv_px:
+                px, py = int(round(px)), int(round(py))
+                cv2.rectangle(image, (px - half, py - half), (px + half, py + half), (0, 220, 220), 1, cv2.LINE_AA)
+                cv2.drawMarker(image, (px, py), (0, 220, 220), cv2.MARKER_CROSS, 10, 1, cv2.LINE_AA)
+
+            # Cluster center crosshair
+            cx_mean = sum(p[0] for p in pv_px) / len(pv_px)
+            cy_mean = sum(p[1] for p in pv_px) / len(pv_px)
+            center_px = (int(round(cx_mean)), int(round(cy_mean)))
+
+            # Cluster radius = max distance from center to any pending ball
+            cluster_r = max(
+                int(round(((p[0] - cx_mean) ** 2 + (p[1] - cy_mean) ** 2) ** 0.5))
+                for p in pv_px
+            ) + half
+            cv2.circle(image, center_px, cluster_r, (0, 220, 220), 1, cv2.LINE_AA)
+            cv2.drawMarker(image, center_px, (0, 220, 220), cv2.MARKER_TILTED_CROSS, 14, 2, cv2.LINE_AA)
+
+            label = f"Pending {self._attempted_pickups}x"
+            cv2.putText(image, label, (center_px[0] + cluster_r + 4, center_px[1] + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 220), 1, cv2.LINE_AA)
+
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.
 

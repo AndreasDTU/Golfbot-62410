@@ -316,10 +316,10 @@ class DriveConfig:
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
     edge_max_gain_scale: float = 1.6
-    near_zone_cm: float = 15.0
+    near_zone_cm: float = 10.0
     near_zone_move_speed_pct: float = 7.0
     # Heading correction
-    adjust_gain: float = 0.5
+    adjust_gain: float = 15
     # Route tracking
     route_tracking_lookahead_segments: int = 12
 

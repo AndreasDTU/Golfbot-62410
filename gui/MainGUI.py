@@ -1450,7 +1450,10 @@ class MainGui:
         # HSV cross detection is disabled; the central cross is the manually
         # placed one, fed in as a red zone so it flows into the occupancy grid
         # and both panel overlays.
-        skip = self.mode == AppMode.AUTO and self._tracked_balls is not None
+        skip = (
+            self.mode == AppMode.GUIDANCE_TEST
+            or (self.mode == AppMode.AUTO and self._tracked_balls is not None)
+        )
         cross = self.cross_red_zone()
         extra_red_zones = [cross] if cross is not None else []
         return self.pipeline.process(

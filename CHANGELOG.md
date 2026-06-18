@@ -28,6 +28,9 @@ All notable larger additions and behavioral changes to this repository should be
 - Made AUTO route planning and displacement replanning use the same manually
   placed cross obstacle as the Route View preview.
 
+- Disabled YOLO ball detection while the Main GUI is in guidance-test mode, so
+  movement isolation testing keeps ArUco pose updates but skips ball perception.
+
 ## 2026-06-17
 
 ### Added

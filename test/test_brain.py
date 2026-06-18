@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from unittest.mock import patch
 
 from control.commander import RobotCommander
 from guidance.guidance import GuidanceController
@@ -97,6 +98,24 @@ def make_plan(
 
 
 DT = 0.033  # ~30 FPS
+
+
+def _settle_unload(brain, settle_pose, corrected_pose=None):
+    """Tick through the settle, and if correction is needed, the correcting phase.
+
+    *settle_pose* is the pose reported during the 2-second settle window.
+    *corrected_pose* is the pose reported after the turn finishes (heading
+    within tolerance).  When None, it defaults to *settle_pose* (meaning
+    heading already matches the target, so no correcting phase runs).
+    """
+    with patch('brain.brain.time.perf_counter') as mock_time:
+        mock_time.return_value = 0.0
+        brain.tick(settle_pose, DT)
+        mock_time.return_value = 2.1
+        brain.tick(settle_pose, DT)
+    # If correction was triggered, tick with the corrected heading so it converges.
+    if corrected_pose is not None:
+        brain.tick(corrected_pose, DT)
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +297,8 @@ class TestUnload:
         brain.tick(pose(0, 0, 0), DT)    # DRIVE
         brain.tick(pose(20, 0, 0), DT)   # arrive -> IDLE
         brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD (dispatch)
-        state = brain.tick(pose(20, 0, 0), DT)  # UNLOAD -> blocks -> IDLE
+        _settle_unload(brain, pose(20, 0, 0))  # settle + correct
+        state = brain.tick(pose(20, 0, 0), DT)  # dump -> IDLE
         assert cmd.dropoff_calls == 1
         assert state == BrainState.IDLE
 
@@ -291,11 +311,141 @@ class TestUnload:
         brain.tick(pose(0, 0, 0), DT)    # DRIVE
         brain.tick(pose(20, 0, 0), DT)   # arrive -> IDLE
         brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD (dispatch)
+        _settle_unload(brain, pose(20, 0, 0))  # settle + correct
 
         cmd.dropoff_should_fail = True
-        state = brain.tick(pose(20, 0, 0), DT)  # UNLOAD -> fails -> ERROR
+        state = brain.tick(pose(20, 0, 0), DT)  # dump -> ERROR
         assert state == BrainState.ERROR
         assert "unload" in brain.error_message.lower()
+
+    def test_settle_phase_stays_in_unload(self):
+        """Robot stays in UNLOAD during the 2-second settle window."""
+        brain, _, _ = make_brain()
+        p1 = wp(20, 0)
+        plan = make_plan([p1], unload_pose=wp(20, 0))
+        brain.load_route(plan)
+
+        brain.tick(pose(0, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD
+
+        with patch('brain.brain.time.perf_counter') as mock_time:
+            mock_time.return_value = 0.0
+            state = brain.tick(pose(20, 0, 0), DT)
+            assert state == BrainState.UNLOAD
+
+            mock_time.return_value = 1.0  # still within 2s settle
+            state = brain.tick(pose(20, 0, 0), DT)
+            assert state == BrainState.UNLOAD
+
+    def test_heading_correction_sends_turn(self):
+        """Heading error > 3 deg during settle triggers correction turns."""
+        brain, _, cmd = make_brain()
+        p1 = wp(20, 0, theta_deg=0.0)
+        plan = make_plan([p1], unload_pose=wp(20, 0))
+        brain.load_route(plan)
+
+        brain.tick(pose(0, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD
+
+        cmds_before = len(cmd.sent_commands)
+
+        # Settle with heading 10 deg off from target (0 deg)
+        with patch('brain.brain.time.perf_counter') as mock_time:
+            mock_time.return_value = 0.0
+            brain.tick(pose(20, 0, 10), DT)
+            mock_time.return_value = 2.1
+            brain.tick(pose(20, 0, 10), DT)  # settle done, correction started
+
+        # Should have sent a turn command (opposite signs = rotation)
+        new_cmds = cmd.sent_commands[cmds_before:]
+        lr_cmds = [c for c in new_cmds if c.startswith('LR')]
+        assert len(lr_cmds) == 1
+        parts = lr_cmds[0].split()
+        left, right = float(parts[1]), float(parts[2])
+        assert left * right < 0
+
+        # Still in UNLOAD — correcting phase continues
+        assert brain.state == BrainState.UNLOAD
+        brain.tick(pose(20, 0, 5), DT)   # still off by 5 deg > 3 deg
+        assert brain.state == BrainState.UNLOAD
+
+        # Heading converges within tolerance
+        brain.tick(pose(20, 0, 1), DT)   # 1 deg < 3 deg → correction done
+        assert brain.state == BrainState.UNLOAD  # ready for dump on next tick
+
+    def test_correcting_phase_stops_on_pose_loss(self):
+        """Pose loss during correction issues stop and stays in UNLOAD."""
+        brain, _, cmd = make_brain()
+        p1 = wp(20, 0, theta_deg=0.0)
+        plan = make_plan([p1], unload_pose=wp(20, 0))
+        brain.load_route(plan)
+
+        brain.tick(pose(0, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD
+
+        # Settle with heading 10 deg off
+        with patch('brain.brain.time.perf_counter') as mock_time:
+            mock_time.return_value = 0.0
+            brain.tick(pose(20, 0, 10), DT)
+            mock_time.return_value = 2.1
+            brain.tick(pose(20, 0, 10), DT)  # correction started
+
+        # Lose pose during correction
+        brain.tick(None, DT)
+        assert brain.state == BrainState.UNLOAD
+
+        # Pose returns with corrected heading → correction done → dump
+        brain.tick(pose(20, 0, 0), DT)
+        state = brain.tick(pose(20, 0, 0), DT)  # dump
+        assert cmd.dropoff_calls == 1
+        assert state == BrainState.IDLE
+
+    def test_no_heading_correction_within_tolerance(self):
+        """Heading error <= 3 deg skips the correction turn."""
+        brain, _, cmd = make_brain()
+        p1 = wp(20, 0, theta_deg=0.0)
+        plan = make_plan([p1], unload_pose=wp(20, 0))
+        brain.load_route(plan)
+
+        brain.tick(pose(0, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD
+
+        cmds_before = len(cmd.sent_commands)
+
+        # Settle with heading matching target (both 0 deg)
+        with patch('brain.brain.time.perf_counter') as mock_time:
+            mock_time.return_value = 0.0
+            brain.tick(pose(20, 0, 0), DT)
+            mock_time.return_value = 2.1
+            brain.tick(pose(20, 0, 0), DT)
+
+        new_cmds = cmd.sent_commands[cmds_before:]
+        turn_cmds = [
+            c for c in new_cmds
+            if c.startswith('LR') and float(c.split()[1]) * float(c.split()[2]) < 0
+        ]
+        assert len(turn_cmds) == 0
+
+    def test_unload_with_no_pose_during_settle(self):
+        """No pose during settle is tolerated; dump still proceeds."""
+        brain, _, cmd = make_brain()
+        p1 = wp(20, 0)
+        plan = make_plan([p1], unload_pose=wp(20, 0))
+        brain.load_route(plan)
+
+        brain.tick(pose(0, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)
+        brain.tick(pose(20, 0, 0), DT)   # IDLE -> UNLOAD
+
+        _settle_unload(brain, None)  # no pose throughout settle
+
+        state = brain.tick(pose(20, 0, 0), DT)  # dump -> IDLE
+        assert cmd.dropoff_calls == 1
+        assert state == BrainState.IDLE
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +487,8 @@ class TestFullRoute:
 
         # Unload
         brain.tick(pose(60, 0, 0), DT)   # IDLE -> UNLOAD (dispatch)
-        brain.tick(pose(60, 0, 0), DT)   # UNLOAD -> blocks -> IDLE
+        _settle_unload(brain, pose(60, 0, 0))  # settle + correct
+        brain.tick(pose(60, 0, 0), DT)   # dump -> IDLE
         assert cmd.dropoff_calls == 1
 
         # Done

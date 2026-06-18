@@ -7,14 +7,21 @@ FSM and returns the current BrainState.
 
 from __future__ import annotations
 
+import math
+import time
+
 from control.commander import RobotCommander
 from control.telemetry import log_event
 from guidance.guidance import GuidanceController, GuidanceStatus
+from localization.localization import normalize_angle
 from localization.models import RobotPose
 from path.pathfinding.models import RoutePlan
 
 from brain.models import BrainIntent, BrainState, IntentAction, StepKind
 from brain.route_interpreter import interpret_route
+
+UNLOAD_SETTLE_DURATION_S = 2.0
+UNLOAD_HEADING_TOLERANCE_RAD = math.radians(3.0)
 
 
 class BrainController:
@@ -48,6 +55,13 @@ class BrainController:
         self._intent: BrainIntent = BrainIntent(action=IntentAction.STOP)
         self._error_message: str = ""
         self._ball_displaced: bool = False
+
+        # Unload settle state
+        self._unload_settle_start: float | None = None
+        self._unload_heading_samples: list[float] = []
+        self._unload_target_heading: float | None = None
+        self._unload_corrected: bool = False
+        self._unload_correcting: bool = False
 
     # ------------------------------------------------------------------
     # Public properties
@@ -93,6 +107,7 @@ class BrainController:
         self._error_message = ""
         self._ball_displaced = False
         self._intent = BrainIntent(action=IntentAction.STOP)
+        self._reset_unload_state()
         self._guidance.clear_route()
         log_event("BRAIN", "route loaded", steps=len(self._steps))
 
@@ -104,8 +119,16 @@ class BrainController:
         self._error_message = ""
         self._ball_displaced = False
         self._intent = BrainIntent(action=IntentAction.STOP)
+        self._reset_unload_state()
         self._guidance.clear_route()
         log_event("BRAIN", "reset")
+
+    def _reset_unload_state(self) -> None:
+        self._unload_settle_start = None
+        self._unload_heading_samples = []
+        self._unload_target_heading = None
+        self._unload_corrected = False
+        self._unload_correcting = False
 
     # ------------------------------------------------------------------
     # Per-frame tick
@@ -157,7 +180,7 @@ class BrainController:
             return self._tick_pickup()
 
         if self._state == BrainState.UNLOAD:
-            return self._tick_unload()
+            return self._tick_unload(pose)
 
         return self._state
 
@@ -195,6 +218,13 @@ class BrainController:
             log_event("BRAIN", "PICKUP started", step=self._step_cursor)
 
         elif step.kind == StepKind.UNLOAD:
+            self._reset_unload_state()
+            # Find target heading from the preceding DRIVE step's last waypoint.
+            for i in range(self._step_cursor - 1, -1, -1):
+                prev = self._steps[i]
+                if prev.kind == StepKind.DRIVE and prev.waypoints:
+                    self._unload_target_heading = prev.waypoints[-1].theta_rad
+                    break
             self._intent = BrainIntent(action=IntentAction.UNLOAD)
             self._state = BrainState.UNLOAD
             log_event("BRAIN", "UNLOAD started", step=self._step_cursor)
@@ -247,8 +277,82 @@ class BrainController:
         self._state = BrainState.IDLE
         return self._state
 
-    def _tick_unload(self) -> BrainState:
-        """Execute blocking unload and advance."""
+    def _tick_unload(self, pose: RobotPose | None) -> BrainState:
+        """Three-phase unload: settle → heading correct → dump.
+
+        Phase 1 (SETTLE): Accumulate heading samples for 2 seconds while
+        the robot is stopped, averaging out localization noise.
+
+        Phase 2 (CORRECT): Compare the live heading to the target heading
+        each tick, issuing tank-turn commands until the error is within
+        tolerance.  The first tick after settle uses the averaged heading
+        to decide whether correction is needed at all.
+
+        Phase 3 (DUMP): Call the blocking ``commander.dropoff()``.
+        """
+        # Phase 1: Settle — collect heading samples.
+        if not self._unload_corrected:
+            if self._unload_settle_start is None:
+                self._unload_settle_start = time.perf_counter()
+                self._unload_heading_samples = []
+                log_event("BRAIN", "UNLOAD settle started", step=self._step_cursor)
+
+            if pose is not None:
+                self._unload_heading_samples.append(pose.heading_rad)
+
+            elapsed = time.perf_counter() - self._unload_settle_start
+            if elapsed < UNLOAD_SETTLE_DURATION_S:
+                return self._state
+
+            # Settle done — decide whether correction is needed.
+            self._unload_corrected = True
+            if (
+                self._unload_target_heading is not None
+                and self._unload_heading_samples
+            ):
+                avg_heading = self._circular_mean(self._unload_heading_samples)
+                heading_error = normalize_angle(
+                    self._unload_target_heading - avg_heading
+                )
+                log_event(
+                    "BRAIN", "UNLOAD settle done",
+                    samples=len(self._unload_heading_samples),
+                    avg_heading_deg=math.degrees(avg_heading),
+                    target_deg=math.degrees(self._unload_target_heading),
+                    error_deg=math.degrees(heading_error),
+                )
+                if abs(heading_error) > UNLOAD_HEADING_TOLERANCE_RAD:
+                    # Needs correction — stay in correcting phase.
+                    self._unload_correcting = True
+                    self._commander.turn(math.degrees(heading_error))
+                    log_event(
+                        "BRAIN", "UNLOAD heading correction started",
+                        error_deg=math.degrees(heading_error),
+                    )
+                    return self._state
+            # No correction needed — fall through to dump on next tick.
+            return self._state
+
+        # Phase 2: Correcting — keep turning until heading converges.
+        if self._unload_correcting:
+            if pose is None:
+                self._commander.stop()
+                return self._state
+            heading_error = normalize_angle(
+                self._unload_target_heading - pose.heading_rad
+            )
+            if abs(heading_error) <= UNLOAD_HEADING_TOLERANCE_RAD:
+                self._commander.stop()
+                self._unload_correcting = False
+                log_event(
+                    "BRAIN", "UNLOAD heading correction done",
+                    error_deg=math.degrees(heading_error),
+                )
+                return self._state
+            self._commander.turn(math.degrees(heading_error))
+            return self._state
+
+        # Phase 3: Dump.
         try:
             result = self._commander.dropoff()
             log_event(
@@ -268,6 +372,13 @@ class BrainController:
         self._step_cursor += 1
         self._state = BrainState.IDLE
         return self._state
+
+    @staticmethod
+    def _circular_mean(angles_rad: list[float]) -> float:
+        """Compute the circular (angular) mean of a list of angles."""
+        sin_sum = sum(math.sin(a) for a in angles_rad)
+        cos_sum = sum(math.cos(a) for a in angles_rad)
+        return math.atan2(sin_sum, cos_sum)
 
     # ------------------------------------------------------------------
     # Error recovery

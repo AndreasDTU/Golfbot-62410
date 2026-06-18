@@ -218,8 +218,16 @@ class VisionPipeline:
         normalize_illumination: bool | None = None,
         dilate_for_legacy: bool | None = None,
         skip_ball_detection: bool = False,
+        detect_red_zones: bool = True,
+        extra_red_zones: list[RedZoneDetection] | None = None,
     ) -> VisionFrameResult:
-        """Process one frame through the extracted vision components."""
+        """Process one frame through the extracted vision components.
+
+        ``detect_red_zones=False`` skips HSV red-zone segmentation (e.g. when the
+        central cross is specified manually instead).  ``extra_red_zones`` are
+        appended to the detected ones and flow into both the occupancy grid and
+        the overlays, so a manually placed obstacle becomes a real avoidance zone.
+        """
         effective_params = self.default_params() if params is None else dict(params)
         preprocessed = self.preprocessor.process(
             frame,
@@ -252,11 +260,17 @@ class VisionPipeline:
             float(effective_params["camera_center_x"]),
             float(effective_params["camera_center_y"]),
         )
-        red_zones, red_mask = self.red_zone_detector.detect(
-            frame_for_detection,
-            effective_params,
-            camera_center_pixels,
-        )
+        if detect_red_zones:
+            red_zones, red_mask = self.red_zone_detector.detect(
+                frame_for_detection,
+                effective_params,
+                camera_center_pixels,
+            )
+        else:
+            red_zones = []
+            red_mask = np.zeros(frame_for_detection.shape[:2], dtype=np.uint8)
+        if extra_red_zones:
+            red_zones = list(red_zones) + list(extra_red_zones)
         if skip_ball_detection:
             white_balls: list[BallDetection] = []
             orange_balls: list[BallDetection] = []

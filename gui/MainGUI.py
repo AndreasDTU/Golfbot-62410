@@ -7,6 +7,7 @@ Guidance isolation testing (Stage 2) is available via the Guide Test button.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -28,7 +29,7 @@ from path.pathfinding.models import HybridPose, PlannedBallTarget
 from path.pathfinding.planner import RoutePlanningFacade
 from config import AppConfig
 from perception.vision.debug import DebugRenderer
-from perception.vision.models import CalibrationState
+from perception.vision.models import CalibrationState, RedCrossSpec, RedZoneDetection
 from perception.vision.pipeline import VisionPipeline, VisionFrameResult
 
 
@@ -53,6 +54,7 @@ HEADING_STEP_RAD = math.radians(1.0)
 
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
+CROSS_WINDOW_NAME = "Place Red Cross"
 STATUS_BAR_HEIGHT = 170
 
 
@@ -128,18 +130,30 @@ def _corner_on_mouse(event: int, x: int, y: int, _flags: int, state: CornerSelec
             state.done = True
 
 
-def _draw_corner_overlay(frame: np.ndarray, state: CornerSelectionState) -> np.ndarray:
-    """Draw point markers, polylines, loupe, and help text on the selector view."""
-    overlay = frame.copy()
-    h, w = overlay.shape[:2]
+def _cross_on_mouse(event: int, x: int, y: int, _flags: int, state: CornerSelectionState) -> None:
+    """Collect up to 2 corner clicks for the red-cross placement window."""
+    w, h = state.frame_size
+    if w > 0 and h > 0:
+        state.cursor = (int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1)))
 
-    # Loupe
-    crop_sz = 40
-    scale = 5
-    padding = 12
+    if event == cv2.EVENT_RBUTTONDOWN:
+        state.points.clear()
+        state.done = False
+        return
+
+    if event == cv2.EVENT_LBUTTONDOWN and len(state.points) < 2:
+        state.points.append(state.cursor)
+        if len(state.points) == 2:
+            state.done = True
+
+
+def _draw_loupe(overlay: np.ndarray, cursor: tuple[int, int],
+                crop_sz: int = 40, scale: int = 5, padding: int = 12) -> None:
+    """Draw a magnified crosshair loupe of the area under the cursor (top-right)."""
+    h, w = overlay.shape[:2]
     crop_w = min(crop_sz, w)
     crop_h = min(crop_sz, h)
-    cx, cy = state.cursor
+    cx, cy = cursor
     x0 = max(0, cx - crop_w // 2)
     x1 = x0 + crop_w
     if x1 > w:
@@ -165,6 +179,14 @@ def _draw_corner_overlay(frame: np.ndarray, state: CornerSelectionState) -> np.n
     lcy = dy0 + vis.shape[0] // 2
     cv2.line(overlay, (lcx, dy0), (lcx, dy1), (0, 255, 255), 1)
     cv2.line(overlay, (dx0, lcy), (dx1, lcy), (0, 255, 255), 1)
+
+
+def _draw_corner_overlay(frame: np.ndarray, state: CornerSelectionState) -> np.ndarray:
+    """Draw point markers, polylines, loupe, and help text on the selector view."""
+    overlay = frame.copy()
+    h, w = overlay.shape[:2]
+
+    _draw_loupe(overlay, state.cursor)
 
     # Points
     for i, pt in enumerate(state.points, start=1):
@@ -261,6 +283,11 @@ class MainGui:
     _latest_observations: dict[int, RobotMarkerObservation] = field(default_factory=dict)
     _latest_parallax: object | None = None
 
+    # Manual red-cross obstacle state
+    _cross_spec: RedCrossSpec | None = None
+    _cross_window_open: bool = False
+    _cross_state: CornerSelectionState = field(default_factory=CornerSelectionState)
+
     # Dimensions derived from config
     _left_w: int = 0
     _left_h: int = 0
@@ -274,10 +301,177 @@ class MainGui:
         self.params = self.pipeline.default_params()
         self._seed_geometry_params()
         self._load_robot_calibration()
+        self._load_field_corners()
+        self._load_cross()
         self._route_planner = RoutePlanningFacade(
             field_config=self.config.field,
             robot_config=self.config.robot,
             planner_config=self.config.planner,
+        )
+
+    def _load_field_corners(self) -> None:
+        """Restore the saved manual top-down warp, if a corners file exists."""
+        corners_path = self.config.paths.field_corners_file
+        if corners_path is None or not corners_path.exists():
+            return
+        calibrator = self.pipeline.preprocessor.homography_calibrator
+        if calibrator.load_manual_corners(corners_path):
+            self.message = f"Field corners loaded from {corners_path.name} — warp active"
+        else:
+            self.message = "Saved field corners file invalid — press Set Corners"
+
+    # ------------------------------------------------------------------
+    # Manual red-cross placement (click tip corner, then armpit corner)
+    # ------------------------------------------------------------------
+
+    def _start_cross_placement(self) -> None:
+        """Open the zoomed cross-placement window (top-down view + loupe)."""
+        if self.pipeline.preprocessor.homography_calibrator.transform_matrix is None:
+            self.message = "Set field corners before placing the cross"
+            return
+        if self.camera is None and self.static_image is None:
+            self.message = "No camera — cannot place cross"
+            return
+        self._cross_state.clear()
+        self._cross_window_open = True
+        cv2.namedWindow(CROSS_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(CROSS_WINDOW_NAME, _cross_on_mouse, self._cross_state)
+        self.message = "Cross window: click an arm TIP corner, then its inner ARMPIT corner"
+
+    def _close_cross_window(self) -> None:
+        self._cross_window_open = False
+        try:
+            cv2.destroyWindow(CROSS_WINDOW_NAME)
+        except cv2.error:
+            pass
+
+    def _tick_cross_window(self, raw_frame: np.ndarray) -> None:
+        """Drive the zoomed cross-placement window for one frame."""
+        if not self._cross_window_open:
+            return
+
+        try:
+            if cv2.getWindowProperty(CROSS_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                self._close_cross_window()
+                self.message = "Cross placement cancelled"
+                return
+        except cv2.error:
+            self._close_cross_window()
+            self.message = "Cross placement cancelled"
+            return
+
+        # Show the top-down (warped) view, where the cross is rectified and pixels
+        # map linearly to field cm.
+        undistorted = self.pipeline.preprocessor.undistort(raw_frame)
+        topdown = self.pipeline.preprocessor.homography_calibrator.warp(undistorted)
+        if topdown is None:
+            self.message = "No top-down warp — set field corners first"
+            self._close_cross_window()
+            return
+
+        state = self._cross_state
+        state.frame_size = (topdown.shape[1], topdown.shape[0])
+        if state.cursor == (0, 0):
+            state.cursor = (topdown.shape[1] // 2, topdown.shape[0] // 2)
+
+        view = topdown.copy()
+        _draw_loupe(view, state.cursor)
+
+        # Live preview: anchor + (second click or current cursor)
+        if len(state.points) >= 1:
+            tip_px = state.points[0]
+            armpit_px = state.points[1] if len(state.points) == 2 else state.cursor
+            self._draw_cross_preview(view, tip_px, armpit_px)
+
+        labels = ["TIP corner", "ARMPIT corner"]
+        for i, point in enumerate(state.points):
+            cv2.circle(view, point, 5, (255, 0, 0), -1, cv2.LINE_AA)
+            cv2.putText(view, labels[i] if i < len(labels) else "", (point[0] + 8, point[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2, cv2.LINE_AA)
+
+        help_lines = [
+            f"Points: {len(state.points)}/2",
+            "1) Click an arm TIP corner",
+            "2) Click that arm's inner ARMPIT corner",
+            "Size scales with the gap. Right click/r: reset. q/Esc: cancel",
+        ]
+        for i, text in enumerate(help_lines):
+            cv2.putText(view, text, (16, 28 + i * 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.imshow(CROSS_WINDOW_NAME, view)
+
+        if state.done:
+            tip_cm = self.pipeline.mapper.topdown_px_to_field_cm(state.points[0])
+            armpit_cm = self.pipeline.mapper.topdown_px_to_field_cm(state.points[1])
+            self._cross_spec = RedCrossSpec.from_tip_and_armpit(tip_cm, armpit_cm)
+            self._save_cross()
+            self._close_cross_window()
+
+    def _draw_cross_preview(self, image: np.ndarray, tip_px: tuple[int, int], armpit_px: tuple[int, int]) -> None:
+        """Draw a cross preview in the window from two top-down pixel corners."""
+        mapper = self.pipeline.mapper
+        spec = RedCrossSpec.from_tip_and_armpit(
+            mapper.topdown_px_to_field_cm(tip_px),
+            mapper.topdown_px_to_field_cm(armpit_px),
+        )
+        poly = np.array(
+            [mapper.field_cm_to_topdown_pixel(p) for p in spec.polygon_cm()],
+            dtype=np.int32,
+        ).reshape(-1, 1, 2)
+        cv2.polylines(image, [poly], True, (0, 0, 255), 2, cv2.LINE_AA)
+        center = mapper.field_cm_to_topdown_pixel(spec.center_cm)
+        cv2.drawMarker(image, (int(round(center[0])), int(round(center[1]))),
+                       (0, 255, 255), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+
+    def _save_cross(self) -> None:
+        path = self.config.paths.red_cross_file
+        if self._cross_spec is None or path is None:
+            return
+        try:
+            path.write_text(json.dumps(self._cross_spec.to_dict(), indent=2), encoding="utf-8")
+            cx, cy = self._cross_spec.center_cm
+            self.message = f"Red cross placed at ({cx:.1f}, {cy:.1f}) cm — saved to {path.name}"
+        except OSError as exc:
+            self.message = f"Red cross placed (save failed: {exc})"
+
+    def _load_cross(self) -> None:
+        """Restore the saved red cross, if a file exists."""
+        path = self.config.paths.red_cross_file
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        spec = RedCrossSpec.from_dict(data)
+        if spec is not None:
+            self._cross_spec = spec
+            self.message = f"Red cross loaded from {path.name}"
+
+    def cross_red_zone(self) -> RedZoneDetection | None:
+        """Expose the placed cross as a RedZoneDetection for occupancy/logic.
+
+        Integration hook: appending this to ``VisionFrameResult.red_zones`` before
+        the occupancy grid is built makes the manual cross an avoidance obstacle.
+        """
+        if self._cross_spec is None:
+            return None
+        mapper = self.pipeline.mapper
+        points = np.array(
+            [mapper.field_cm_to_topdown_pixel(p) for p in self._cross_spec.polygon_cm()],
+            dtype=np.int32,
+        )
+        contour = points.reshape(-1, 1, 2)
+        x, y, w, h = cv2.boundingRect(points)
+        cx, cy = mapper.field_cm_to_topdown_pixel(self._cross_spec.center_cm)
+        center_px = (int(round(cx)), int(round(cy)))
+        return RedZoneDetection(
+            contour=contour,
+            corrected_contour=contour,
+            bounding_box=(int(x), int(y), int(w), int(h)),
+            center=center_px,
+            corrected_center=center_px,
+            area=float(cv2.contourArea(points)),
         )
 
     def _seed_geometry_params(self) -> None:
@@ -334,12 +528,13 @@ class MainGui:
         x0 = 20
         rows = [
             GuiButton("Set Corners", "set_corners", (x0, y, bw, bh)),
-            GuiButton("Calib Robot", "calib_robot", (x0 + (bw + gap), y, bw, bh)),
-            GuiButton("Guide Test", "guidance_test", (x0 + 2 * (bw + gap), y, bw, bh)),
-            GuiButton("Manual", "manual", (x0 + 3 * (bw + gap), y, bw, bh)),
-            GuiButton("Auto", "auto", (x0 + 4 * (bw + gap), y, bw, bh)),
-            GuiButton("Stop", "stop", (x0 + 5 * (bw + gap), y, bw, bh)),
-            GuiButton("Quit", "quit", (x0 + 6 * (bw + gap), y, bw, bh)),
+            GuiButton("Set Cross", "set_cross", (x0 + (bw + gap), y, bw, bh)),
+            GuiButton("Calib Robot", "calib_robot", (x0 + 2 * (bw + gap), y, bw, bh)),
+            GuiButton("Guide Test", "guidance_test", (x0 + 3 * (bw + gap), y, bw, bh)),
+            GuiButton("Manual", "manual", (x0 + 4 * (bw + gap), y, bw, bh)),
+            GuiButton("Auto", "auto", (x0 + 5 * (bw + gap), y, bw, bh)),
+            GuiButton("Stop", "stop", (x0 + 6 * (bw + gap), y, bw, bh)),
+            GuiButton("Quit", "quit", (x0 + 7 * (bw + gap), y, bw, bh)),
         ]
         # Second row: calibration controls (depends on sub-phase)
         if self.mode == AppMode.CALIBRATE:
@@ -399,6 +594,8 @@ class MainGui:
             return
         if action == "set_corners":
             self._open_corner_window()
+        elif action == "set_cross":
+            self._start_cross_placement()
         elif action == "calib_robot":
             self._start_calibration()
         elif action == "calib_spin":
@@ -489,10 +686,16 @@ class MainGui:
         cv2.imshow(CORNER_WINDOW_NAME, view)
 
         if self._corner_state.done:
-            # Feed the 4 corners into the pipeline's HomographyCalibrator
+            # Feed the 4 corners into the pipeline's HomographyCalibrator and persist
+            # them so the warp is restored automatically on the next launch.
             calibrator = self.pipeline.preprocessor.homography_calibrator
             calibrator.set_manual_points(self._corner_state.points)
-            self.message = "Field corners set — top-down warp active"
+            corners_path = self.config.paths.field_corners_file
+            try:
+                calibrator.save_manual_corners(corners_path, self._corner_state.frame_size)
+                self.message = f"Field corners set and saved to {corners_path.name} — warp active"
+            except OSError as exc:
+                self.message = f"Field corners set — warp active (save failed: {exc})"
             self._close_corner_window()
 
     # ------------------------------------------------------------------
@@ -977,8 +1180,20 @@ class MainGui:
     # ------------------------------------------------------------------
 
     def _process_frame(self, raw_frame: np.ndarray) -> VisionFrameResult:
+        # HSV cross detection is disabled; the central cross is the manually
+        # placed one, fed in as a red zone so it flows into the occupancy grid
+        # and both panel overlays.
         skip = self.mode == AppMode.AUTO and self._tracked_balls is not None
-        return self.pipeline.process(raw_frame, params=self.params, use_aruco=True, skip_ball_detection=skip)
+        cross = self.cross_red_zone()
+        extra_red_zones = [cross] if cross is not None else []
+        return self.pipeline.process(
+            raw_frame,
+            params=self.params,
+            use_aruco=True,
+            skip_ball_detection=skip,
+            detect_red_zones=False,
+            extra_red_zones=extra_red_zones,
+        )
 
     def _estimate_pose(self, result: VisionFrameResult) -> None:
         topdown = result.preprocessed.topdown
@@ -1174,7 +1389,7 @@ class MainGui:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
 
         cv2.putText(canvas,
-                    "Keys: q/Esc quit | f set corners | c calib robot | g guidance test | a auto | s stop",
+                    "Keys: q/Esc quit | f set corners | x set cross | c calib robot | g guidance test | a auto | s stop",
                     (20, y0 + 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
 
@@ -1183,6 +1398,7 @@ class MainGui:
             bx, by, bw, bh = button.rect
             is_active = (
                 (button.action == "set_corners" and self._corner_window_open)
+                or (button.action == "set_cross" and self._cross_window_open)
                 or (button.action == "calib_robot" and self.mode == AppMode.CALIBRATE)
                 or (button.action == "guidance_test" and self.mode == AppMode.GUIDANCE_TEST)
                 or (button.action == "manual" and self.mode == AppMode.MANUAL)
@@ -1215,6 +1431,10 @@ class MainGui:
         # Drive the corner-selection window if open
         if self._corner_window_open and raw_frame is not None:
             self._tick_corner_window(raw_frame)
+
+        # Drive the cross-placement window if open
+        if self._cross_window_open and raw_frame is not None:
+            self._tick_cross_window(raw_frame)
 
         if raw_frame is not None:
             result = self._process_frame(raw_frame)
@@ -1257,6 +1477,9 @@ class MainGui:
             if self._corner_window_open:
                 self._close_corner_window()
                 self.message = "Corner selection cancelled"
+            elif self._cross_window_open:
+                self._close_cross_window()
+                self.message = "Cross placement cancelled"
             else:
                 self.closed = True
         elif key == ord("f"):
@@ -1265,12 +1488,17 @@ class MainGui:
             self._handle_button("guidance_test")
         elif key == ord("r") and self._corner_window_open:
             self._corner_state.points.clear()
+        elif key == ord("r") and self._cross_window_open:
+            self._cross_state.points.clear()
+            self._cross_state.done = False
         elif key == ord("m"):
             self._handle_button("manual")
         elif key == ord("a"):
             self._handle_button("auto")
         elif key == ord("c"):
             self._handle_button("calib_robot")
+        elif key == ord("x"):
+            self._handle_button("set_cross")
         elif key == ord("s"):
             self._handle_button("stop")
 
@@ -1293,6 +1521,8 @@ class MainGui:
         self._disconnect_guidance()
         if self._corner_window_open:
             self._close_corner_window()
+        if self._cross_window_open:
+            self._close_cross_window()
         if self.camera is not None:
             self.camera.release()
         cv2.destroyWindow(WINDOW_NAME)

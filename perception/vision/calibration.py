@@ -8,6 +8,7 @@ into these deterministic helpers.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -389,6 +390,47 @@ class HomographyCalibrator:
         self.transform_matrix = self.build_manual_topdown_transform(self.manual_points)
         self.calibration_state = CalibrationState.CALIBRATED_MANUAL
         return self.transform_matrix
+
+    def save_manual_corners(self, path: Path, frame_size: tuple[int, int]) -> None:
+        """Persist the 4 manual field corners so the warp reloads on next launch.
+
+        ``frame_size`` is the undistorted frame the corners were clicked in; it is
+        stored for validation since the corner pixels only make sense at that
+        resolution.
+        """
+        if len(self.manual_points) != 4:
+            return
+        data = {
+            "points": [[int(x), int(y)] for x, y in self.manual_points],
+            "frame_size": [int(frame_size[0]), int(frame_size[1])],
+            "topdown_size": [int(self.camera.topdown_warp_size[0]), int(self.camera.topdown_warp_size[1])],
+        }
+        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def load_manual_corners(self, path: Path) -> bool:
+        """Load saved field corners and rebuild the manual warp; return success.
+
+        The corners are stored in undistorted-frame pixels, which fully determine
+        the transform together with the current top-down size — so a change in
+        warp size doesn't block reuse, and a camera/resolution change just warrants
+        re-running Set Corners.
+        """
+        corners_path = Path(path)
+        if not corners_path.exists():
+            return False
+        try:
+            data = json.loads(corners_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        points = data.get("points")
+        if not isinstance(points, list) or len(points) != 4:
+            return False
+        try:
+            parsed = [(int(x), int(y)) for x, y in points]
+        except (TypeError, ValueError):
+            return False
+        self.set_manual_points(parsed)
+        return True
 
     def calibrate_from_aruco_frame(self, undistorted_frame: np.ndarray) -> HomographyCalibrationResult:
         """Attempt automatic homography calibration from visible ArUco markers."""

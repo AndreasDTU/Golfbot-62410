@@ -273,6 +273,7 @@ class MainGui:
     _tracked_balls: list | None = None        # fixed positions from last full scan
     _crop_missing_counts: dict = field(default_factory=dict)  # track_id → consecutive missing frames
     _last_crop_missing: set = field(default_factory=set)      # track_ids missing on last check
+    _crop_hsv_ranges: dict = field(default_factory=dict)      # track_id → (lower, upper) per-ball HSV
 
     # Robot self-calibration state
     _calib_collector: RobotCalibrationCollector | None = None
@@ -763,6 +764,7 @@ class MainGui:
         self._tracked_balls = None
         self._crop_missing_counts = {}
         self._last_crop_missing = set()
+        self._crop_hsv_ranges = {}
         if self._guidance is not None:
             self._guidance.clear_route()
         if self._commander is not None:
@@ -821,6 +823,7 @@ class MainGui:
         captured_grid = result.occupancy_grid.copy()
         captured_balls = list(result.smoothed_ball_coordinates)
         captured_pose = self.robot_pose
+        captured_frame = result.frame_for_detection
 
         self._connecting = True
         self.message = "Connecting and planning route..."
@@ -873,6 +876,10 @@ class MainGui:
                 self._brain_state = None
                 self._tracked_balls = list(captured_balls)
                 self._crop_missing_counts = {}
+                self._crop_hsv_ranges = (
+                    self.pipeline.calibrate_crop_hsv(captured_frame, captured_balls, self.params)
+                    if captured_frame is not None else {}
+                )
                 self.mode = AppMode.AUTO
                 self.message = f"Brain running — {brain.step_count} steps"
             except Exception as exc:
@@ -931,6 +938,7 @@ class MainGui:
             self.params,
             robot_pose_cm=robot_xy,
             robot_radius_cm=robot_radius,
+            per_ball_hsv=self._crop_hsv_ranges,
         )
         self._last_crop_missing = missing_now
 
@@ -976,6 +984,10 @@ class MainGui:
         self._brain_route_points = plan.points
         self._tracked_balls = list(result.smoothed_ball_coordinates)
         self._crop_missing_counts = {}
+        self._crop_hsv_ranges = (
+            self.pipeline.calibrate_crop_hsv(result.frame_for_detection, result.smoothed_ball_coordinates, self.params)
+            if result.frame_for_detection is not None else {}
+        )
         self.message = f"Replanned — {self._brain.step_count} steps"
         log_event("BRAIN", "replanned after rescan", steps=self._brain.step_count)
 
@@ -1250,16 +1262,27 @@ class MainGui:
             )
         robot_radius_px = robot_radius_cm * px_per_cm
 
+        # Draw robot exclusion circle so operator can see which crops are protected
+        if robot_px is not None:
+            cv2.circle(
+                image,
+                (int(round(robot_px[0])), int(round(robot_px[1]))),
+                int(round(robot_radius_px)),
+                (80, 80, 80),
+                1,
+                cv2.LINE_AA,
+            )
+
         for ball in self._tracked_balls:
+            if ball.label != "white":
+                continue  # orange balls not monitored via HSV
             cx, cy = self.pipeline.mapper.field_cm_to_topdown_pixel((ball.cm_x, ball.cm_y))
             cx, cy = int(round(cx)), int(round(cy))
 
-            # Determine colour
             if robot_px is not None:
                 dist = ((cx - robot_px[0]) ** 2 + (cy - robot_px[1]) ** 2) ** 0.5
                 if dist < robot_radius_px:
-                    color = (120, 120, 120)  # grey — robot over crop
-                    cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), color, 1, cv2.LINE_AA)
+                    cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), (120, 120, 120), 1, cv2.LINE_AA)
                     continue
 
             color = (60, 60, 200) if ball.track_id in self._last_crop_missing else (60, 200, 60)

@@ -45,58 +45,100 @@ def _grab_camera_frame() -> np.ndarray | None:
     return frame if ret else None
 
 
-def _check_crop(frame: np.ndarray, cx: int, cy: int, params: dict) -> tuple[bool, np.ndarray, np.ndarray]:
-    """Return (present, crop_bgr, mask_bgr)."""
-    half = params["crop_size"] // 2
+def _auto_hsv(frame: np.ndarray, cx: int, cy: int, crop_size: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """Compute per-crop HSV bounds via Otsu on whiteness score (V − S)."""
+    half = crop_size // 2
     h, w = frame.shape[:2]
     x1, y1 = max(0, cx - half), max(0, cy - half)
     x2, y2 = min(w, cx + half), min(h, cy + half)
     if x2 <= x1 or y2 <= y1:
-        blank = np.zeros((params["crop_size"], params["crop_size"], 3), dtype=np.uint8)
-        return False, blank, blank
+        return None
+    crop = frame[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    whiteness = np.clip(v_ch - s_ch, 0, 255).astype(np.uint8)
+    _, ball_mask = cv2.threshold(whiteness, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ball_pixels = ball_mask > 0
+    if ball_pixels.sum() < 4:
+        return None
+    h_b, s_b, v_b = h_ch[ball_pixels], s_ch[ball_pixels], v_ch[ball_pixels]
+    lower = np.array([max(0,   int(h_b.mean() - 1.5 * h_b.std())),
+                      max(0,   int(s_b.mean() - 1.5 * s_b.std())),
+                      max(0,   int(v_b.mean() - 1.5 * v_b.std()))], dtype=np.uint8)
+    upper = np.array([min(180, int(h_b.mean() + 1.5 * h_b.std())),
+                      min(255, int(s_b.mean() + 1.5 * s_b.std())),
+                      min(255, int(v_b.mean() + 1.5 * v_b.std()))], dtype=np.uint8)
+    return lower, upper
+
+
+def _check_crop(frame: np.ndarray, cx: int, cy: int, params: dict) -> tuple[bool, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (present, crop_bgr, manual_mask_bgr, auto_mask_bgr)."""
+    half = params["crop_size"] // 2
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, cx - half), max(0, cy - half)
+    x2, y2 = min(w, cx + half), min(h, cy + half)
+    cs = params["crop_size"]
+    blank = np.zeros((cs, cs, 3), dtype=np.uint8)
+    if x2 <= x1 or y2 <= y1:
+        return False, blank, blank, blank
 
     crop = frame[y1:y2, x1:x2].copy()
     hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     lower = np.array([params["h_min"], params["s_min"], params["v_min"]], dtype=np.uint8)
     upper = np.array([params["h_max"], params["s_max"], params["v_max"]], dtype=np.uint8)
     mask  = cv2.inRange(hsv, lower, upper)
-    fraction = float(np.count_nonzero(mask)) / mask.size
 
-    # Pad crop to square if clipped at frame edge
-    cs = params["crop_size"]
+    # Auto HSV mask
+    auto = _auto_hsv(frame, cx, cy, params["crop_size"])
+    if auto is not None:
+        auto_mask = cv2.inRange(hsv, auto[0], auto[1])
+    else:
+        auto_mask = np.zeros_like(mask)
+
+    # Pad to square if clipped at frame edge
     if crop.shape[0] != cs or crop.shape[1] != cs:
-        padded = np.zeros((cs, cs, 3), dtype=np.uint8)
-        padded[:crop.shape[0], :crop.shape[1]] = crop
-        crop = padded
-        mask_pad = np.zeros((cs, cs), dtype=np.uint8)
-        mask_pad[:mask.shape[0], :mask.shape[1]] = mask
-        mask = mask_pad
+        def _pad(arr: np.ndarray, fill: int = 0) -> np.ndarray:
+            p = np.full((cs, cs) if arr.ndim == 2 else (cs, cs, arr.shape[2]), fill, dtype=arr.dtype)
+            p[:arr.shape[0], :arr.shape[1]] = arr
+            return p
+        crop = _pad(crop)
+        mask = _pad(mask)
+        auto_mask = _pad(auto_mask)
 
-    present = fraction >= 0.03          # same default as crop_min_pixel_fraction
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    return present, crop, mask_bgr
+    fraction = float(np.count_nonzero(mask)) / (cs * cs)
+    present = fraction >= 0.03
+    return present, crop, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), cv2.cvtColor(auto_mask, cv2.COLOR_GRAY2BGR)
 
 
 def _build_right_panel(frame: np.ndarray, balls: list[tuple[int, int]], params: dict) -> np.ndarray:
-    """Build a vertical strip showing each ball's crop and HSV mask."""
+    """Build a vertical strip: crop | manual mask | auto mask per ball."""
     cs = params["crop_size"]
     row_h = cs + 4
-    panel_h = max(40, row_h * max(1, len(balls)) + 10)
+    panel_h = max(40, row_h * max(1, len(balls)) + 24)
     panel = np.full((panel_h, PANEL_W, 3), 30, dtype=np.uint8)
 
-    cv2.putText(panel, "crop | mask", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+    cv2.putText(panel, "crop | manual | auto", (8, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1)
 
     for i, (cx, cy) in enumerate(balls):
-        present, crop, mask_bgr = _check_crop(frame, cx, cy, params)
-        y0 = 24 + i * row_h
+        present, crop, mask_bgr, auto_bgr = _check_crop(frame, cx, cy, params)
+        y0 = 20 + i * row_h
         if y0 + cs > panel_h:
             break
-        panel[y0:y0 + cs, 2:2 + cs] = crop
-        panel[y0:y0 + cs, cs + 6:cs + 6 + cs] = mask_bgr
+        col = 2
+        panel[y0:y0 + cs, col:col + cs] = crop;        col += cs + 3
+        panel[y0:y0 + cs, col:col + cs] = mask_bgr;    col += cs + 3
+        panel[y0:y0 + cs, col:col + cs] = auto_bgr
+
+        auto = _auto_hsv(frame, cx, cy, params["crop_size"])
         color = (60, 200, 60) if present else (60, 60, 200)
         label = f"#{i+1} {'OK' if present else 'MISS'}"
-        cv2.putText(panel, label, (cs * 2 + 12, y0 + cs // 2 + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        if auto is not None:
+            auto_label = f"A H{auto[0][0]}-{auto[1][0]} S{auto[0][1]}-{auto[1][1]} V{auto[0][2]}-{auto[1][2]}"
+        else:
+            auto_label = "auto: n/a"
+        right_x = cs * 3 + 12
+        cv2.putText(panel, label,      (right_x, y0 + cs // 2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
+        cv2.putText(panel, auto_label, (right_x, y0 + cs // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (140, 180, 140), 1)
 
     return panel
 
@@ -104,7 +146,7 @@ def _build_right_panel(frame: np.ndarray, balls: list[tuple[int, int]], params: 
 def _draw_overlay(canvas: np.ndarray, balls: list[tuple[int, int]], params: dict) -> None:
     half = params["crop_size"] // 2
     for cx, cy in balls:
-        present, _, _ = _check_crop(canvas, cx, cy, params)
+        present, _, _, _ = _check_crop(canvas, cx, cy, params)
         color = (60, 200, 60) if present else (60, 60, 200)
         cv2.rectangle(canvas, (cx - half, cy - half), (cx + half, cy + half), color, 2, cv2.LINE_AA)
         cv2.drawMarker(canvas, (cx, cy), color, cv2.MARKER_CROSS, 10, 1, cv2.LINE_AA)

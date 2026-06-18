@@ -144,6 +144,64 @@ class VisionPipeline:
             "camera_center_y_cm": float(defaults["cam_center_y"]),
         }
 
+    def calibrate_crop_hsv(
+        self,
+        topdown_frame: np.ndarray,
+        balls: list[SmoothedBallCoordinate],
+        params: dict[str, object],
+    ) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+        """Compute per-ball HSV thresholds by maximising ball-vs-floor separation.
+
+        Uses Otsu's threshold on a whiteness score (V − S) to isolate the ball
+        region, then derives lower/upper HSV bounds from the ball pixels.
+        Only white balls are calibrated; orange balls are tracked by YOLO position.
+        """
+        crop_size = int(params.get("crop_size", 60))
+        half = crop_size // 2
+        h_frame, w_frame = topdown_frame.shape[:2]
+        result: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+        for ball in balls:
+            if ball.label != "white":
+                continue
+            cx, cy = self.mapper.field_cm_to_topdown_pixel((ball.cm_x, ball.cm_y))
+            cx, cy = int(round(cx)), int(round(cy))
+            x1, y1 = max(0, cx - half), max(0, cy - half)
+            x2, y2 = min(w_frame, cx + half), min(h_frame, cy + half)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            crop = topdown_frame[y1:y2, x1:x2]
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).astype(np.float32)
+            h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+            # Whiteness score: high for white pixels, low for coloured/dark floor
+            whiteness = np.clip(v_ch - s_ch, 0, 255).astype(np.uint8)
+            _, ball_mask = cv2.threshold(whiteness, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            ball_pixels = ball_mask > 0
+            if ball_pixels.sum() < 4:
+                continue
+
+            h_ball = h_ch[ball_pixels]
+            s_ball = s_ch[ball_pixels]
+            v_ball = v_ch[ball_pixels]
+
+            lower = np.array([
+                max(0,   int(h_ball.mean() - 1.5 * h_ball.std())),
+                max(0,   int(s_ball.mean() - 1.5 * s_ball.std())),
+                max(0,   int(v_ball.mean() - 1.5 * v_ball.std())),
+            ], dtype=np.uint8)
+            upper = np.array([
+                min(180, int(h_ball.mean() + 1.5 * h_ball.std())),
+                min(255, int(s_ball.mean() + 1.5 * s_ball.std())),
+                min(255, int(v_ball.mean() + 1.5 * v_ball.std())),
+            ], dtype=np.uint8)
+
+            result[ball.track_id] = (lower, upper)
+
+        return result
+
     def check_ball_crops(
         self,
         topdown_frame: np.ndarray,
@@ -151,15 +209,17 @@ class VisionPipeline:
         params: dict[str, object],
         robot_pose_cm: tuple[float, float] | None = None,
         robot_radius_cm: float = 20.0,
+        per_ball_hsv: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> set[int]:
-        """Return track_ids of balls not found in their expected crop region.
+        """Return track_ids of white balls not found in their expected crop region.
 
-        Each ball is checked by extracting a fixed crop around its last known
-        topdown-pixel position and running an HSV threshold inside it.  Crops
-        that overlap the robot footprint are skipped (ball may be occluded).
+        Orange balls are skipped — their positions come from YOLO and do not need
+        HSV verification.  Crops overlapping the robot footprint are also skipped.
+        Per-ball HSV ranges from calibrate_crop_hsv() take priority over the
+        global fallback built from params.
         """
         crop_size = int(params.get("crop_size", 60))
-        lower = np.array(
+        fallback_lower = np.array(
             [
                 int(params.get("crop_white_h_min", 0)),
                 int(params.get("crop_white_s_min", 0)),
@@ -167,7 +227,7 @@ class VisionPipeline:
             ],
             dtype=np.uint8,
         )
-        upper = np.array(
+        fallback_upper = np.array(
             [
                 int(params.get("crop_white_h_max", 180)),
                 int(params.get("crop_white_s_max", 40)),
@@ -188,6 +248,9 @@ class VisionPipeline:
         missing: set[int] = set()
 
         for ball in balls:
+            if ball.label != "white":
+                continue  # orange positions trusted from YOLO, no HSV check needed
+
             cx, cy = self.mapper.field_cm_to_topdown_pixel((ball.cm_x, ball.cm_y))
             cx, cy = int(round(cx)), int(round(cy))
 
@@ -201,6 +264,11 @@ class VisionPipeline:
             if x2 <= x1 or y2 <= y1:
                 missing.add(ball.track_id)
                 continue
+
+            if per_ball_hsv and ball.track_id in per_ball_hsv:
+                lower, upper = per_ball_hsv[ball.track_id]
+            else:
+                lower, upper = fallback_lower, fallback_upper
 
             crop = topdown_frame[y1:y2, x1:x2]
             hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)

@@ -300,6 +300,8 @@ class DriveConfig:
     edge_max_gain_scale: float = 1.6
     near_zone_cm: float = 15.0
     near_zone_move_speed_pct: float = 7.0
+    # Predictive stop: stop this many degrees before the target to compensate for motor coast
+    turn_coast_deg: float = 0.0
     # Heading correction
     adjust_gain: float = 0.5
     # Route tracking

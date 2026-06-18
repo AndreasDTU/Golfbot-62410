@@ -155,7 +155,7 @@ class GuidanceController:
             distance, heading_error = self._compute_geometry(pose, target)
 
         # 6. Large heading error — rotate in place.
-        if abs(heading_error) > self._config.max_heading_for_forward_rad:
+        if abs(heading_error) > self._config.max_heading_for_forward_rad or (distance < self._ball_arrival_cm and abs(heading_error) > self._final_heading_tolerance_rad):
             ok = self._commander.turn(math.degrees(heading_error))
             self._log(
                 "TURNING", dist=distance,

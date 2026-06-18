@@ -191,6 +191,36 @@ def _point_inside_field(
     return R <= x <= field_w - R and R <= y <= field_h - R
 
 
+def _candidate_origin_inside_inflated_cross(
+    inp: RoutePlannerInput,
+    candidate: StationCandidate,
+) -> bool:
+    """Return whether a station origin is already owned by the inflated cross."""
+    return _point_inside_inflated_cross(
+        candidate.x_cm,
+        candidate.y_cm,
+        inp.obstacle,
+        inp.robot_radius_cm,
+    )
+
+
+def _has_cross_clear_orange_candidate(
+    inp: RoutePlannerInput,
+    candidates: list[StationCandidate],
+    uncovered: set[int],
+) -> bool:
+    """Return whether the first-orange choice has any cross-clear station."""
+    orange = set(_orange_ball_indices(inp.geometry_result))
+    if not orange:
+        return False
+    for candidate in candidates:
+        if not (set(candidate.covered_ball_indices) & orange & uncovered):
+            continue
+        if not _candidate_origin_inside_inflated_cross(inp, candidate):
+            return True
+    return False
+
+
 def _cross_bounding_corners(
     obs: ObstacleGeometry, R: float, margin: float = 1.0,
 ) -> list[tuple[float, float]]:
@@ -1062,10 +1092,13 @@ def _shared_node_station_candidates(
         for candidate in shared_candidates
         for ball_idx in candidate.covered_ball_indices
     }
+    orange_indices = set(_orange_ball_indices(geometry_result))
 
     fallback_candidates_by_origin: dict[tuple[int, int], StationCandidate] = {}
     for ball_idx, ball in enumerate(balls):
-        if not ball.reachable or ball_idx in shared_covered:
+        if not ball.reachable:
+            continue
+        if ball_idx in shared_covered and ball_idx not in orange_indices:
             continue
         for pose in _spread_pickup_poses(
             ball.valid_points,
@@ -1563,10 +1596,21 @@ def _prune_candidates_for_optimal_search(
     anchors = [inp.start_pose]
     if inp.unload_pose is not None:
         anchors.append(inp.unload_pose)
+    orange_mask = 0
+    for ball_idx in _orange_ball_indices(inp.geometry_result):
+        orange_mask |= 1 << ball_idx
 
     selected: list[StationCandidate] = []
     for mask in sorted(by_mask):
         mask_candidates = by_mask[mask]
+        if mask & orange_mask:
+            cross_clear_candidates = [
+                candidate
+                for candidate in mask_candidates
+                if not _candidate_origin_inside_inflated_cross(inp, candidate)
+            ]
+            if cross_clear_candidates:
+                mask_candidates = cross_clear_candidates
         if len(mask_candidates) <= INTERSECTION_OPTIMAL_CANDIDATES_PER_MASK:
             selected.extend(mask_candidates)
             continue
@@ -1621,6 +1665,11 @@ def _intersection_nearest_candidate_sequence(
         best_cover_point: CoverPoint | None = None
         best_key: tuple[float, float, float, float] | None = None
         require_orange = not sequence and bool(orange & uncovered)
+        prefer_cross_clear_orange = require_orange and _has_cross_clear_orange_candidate(
+            inp,
+            candidates,
+            uncovered,
+        )
 
         for candidate in candidates:
             cover_point = _cover_point_from_station_candidate(
@@ -1632,6 +1681,8 @@ def _intersection_nearest_candidate_sequence(
                 continue
             covered = set(cover_point.covered_ball_indices)
             if require_orange and not covered & orange:
+                continue
+            if prefer_cross_clear_orange and _candidate_origin_inside_inflated_cross(inp, candidate):
                 continue
             active_obstacles = _ball_obstacles_for_indices(
                 inp.geometry_result,
@@ -1691,6 +1742,11 @@ def _plan_intersection_optimal_route(inp: RoutePlannerInput) -> RouteStrategyRes
     orange_mask = 0
     for ball_idx in _orange_ball_indices(inp.geometry_result):
         orange_mask |= 1 << ball_idx
+    has_cross_clear_first_orange_candidate = bool(orange_mask) and any(
+        (candidate_masks[index] & orange_mask)
+        and not _candidate_origin_inside_inflated_cross(inp, candidate)
+        for index, candidate in enumerate(candidates)
+    )
     candidate_poses = [
         _station_candidate_pose(candidate)
         for candidate in candidates
@@ -1806,8 +1862,14 @@ def _plan_intersection_optimal_route(inp: RoutePlannerInput) -> RouteStrategyRes
             added_mask = candidate_mask & ~mask
             if added_mask == 0:
                 continue
-            if mask == 0 and orange_mask and not candidate_mask & orange_mask:
-                continue
+            if mask == 0 and orange_mask:
+                if not candidate_mask & orange_mask:
+                    continue
+                if (
+                    has_cross_clear_first_orange_candidate
+                    and _candidate_origin_inside_inflated_cross(inp, candidates[next_idx])
+                ):
+                    continue
             next_mask = mask | candidate_mask
             active_mask = full_mask & ~next_mask
             from_pose = pose_for_position(position_idx)
@@ -1874,6 +1936,11 @@ def _plan_intersection_priority_route(inp: RoutePlannerInput) -> RouteStrategyRe
 
         entries: list[tuple[float, float, StationCandidate, CoverPoint, set[int]]] = []
         require_orange = not cover_points and bool(orange & uncovered)
+        prefer_cross_clear_orange = require_orange and _has_cross_clear_orange_candidate(
+            inp,
+            candidates,
+            uncovered,
+        )
         for candidate in candidates:
             cover_point = _cover_point_from_station_candidate(
                 inp.geometry_result,
@@ -1884,6 +1951,8 @@ def _plan_intersection_priority_route(inp: RoutePlannerInput) -> RouteStrategyRe
                 continue
             covered = set(cover_point.covered_ball_indices)
             if require_orange and not covered & orange:
+                continue
+            if prefer_cross_clear_orange and _candidate_origin_inside_inflated_cross(inp, candidate):
                 continue
             direct_lower_bound = _dist(
                 current_pose.x_cm, current_pose.y_cm,

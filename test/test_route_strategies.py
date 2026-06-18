@@ -195,6 +195,63 @@ def _manual_shared_origin_pickup_geometry() -> PickupGeometryResult:
     )
 
 
+def _manual_orange_near_cross_pickup_geometry() -> PickupGeometryResult:
+    """Geometry where orange has unsafe shared nodes plus a safe fallback."""
+    mask = np.ones((101, 121), dtype=bool)
+    ring_radius_cm = 10.0
+    return PickupGeometryResult(
+        legal_region_mask=mask,
+        eroded_field_mask=mask,
+        dilated_obstacle_mask=np.zeros_like(mask),
+        ring_radius_cm=ring_radius_cm,
+        mouth_radius_cm=0.0,
+        tube_forward_cm=ring_radius_cm,
+        tube_right_cm=0.0,
+        balls=(
+            BallPickupResult(
+                ball_x_cm=60.0,
+                ball_y_cm=50.0,
+                track_id=1,
+                label="orange",
+                ring_radius_cm=ring_radius_cm,
+                valid_points=(
+                    PickupPose(
+                        x_cm=50.0,
+                        y_cm=50.0,
+                        theta_rad=0.0,
+                        reach_offset_cm=0.0,
+                    ),
+                    PickupPose(
+                        x_cm=60.0,
+                        y_cm=40.0,
+                        theta_rad=math.pi * 0.5,
+                        reach_offset_cm=0.0,
+                    ),
+                ),
+                invalid_angles_rad=(),
+                reachable=True,
+            ),
+            BallPickupResult(
+                ball_x_cm=60.0,
+                ball_y_cm=52.0,
+                track_id=2,
+                label="white",
+                ring_radius_cm=ring_radius_cm,
+                valid_points=(PickupPose(
+                    x_cm=60.0,
+                    y_cm=62.0,
+                    theta_rad=-math.pi * 0.5,
+                    reach_offset_cm=0.0,
+                ),),
+                invalid_angles_rad=(),
+                reachable=True,
+            ),
+        ),
+        field_width_cm=120.0,
+        field_height_cm=100.0,
+    )
+
+
 class TestOrangeFirstRequirement:
     def test_all_strategies_visit_orange_stop_first(self) -> None:
         pickup_geometry = _manual_pickup_geometry(
@@ -297,6 +354,35 @@ class TestOrangeFirstRequirement:
             if edge.from_index == 0 and edge.to_index == 1
         )
         assert math.isfinite(first_edge.total_distance_cm)
+
+    def test_intersection_strategies_prefer_cross_clear_first_orange_station(self) -> None:
+        pickup_geometry = _manual_orange_near_cross_pickup_geometry()
+        route_input = RoutePlannerInput(
+            geometry_result=pickup_geometry,
+            obstacle=ObstacleGeometry(
+                center_x_cm=60.0,
+                center_y_cm=51.0,
+                half_size_cm=5.0,
+                half_arm_width_cm=2.0,
+            ),
+            start_pose=HybridPose(x_cm=40.0, y_cm=40.0, theta_rad=0.0),
+            robot_radius_cm=5.0,
+            field_width_cm=120.0,
+            field_height_cm=100.0,
+        )
+
+        for strategy_cls in (
+            IntersectionPriorityStrategy,
+            IntersectionNearestStrategy,
+            IntersectionOptimalStrategy,
+        ):
+            result = strategy_cls().plan(route_input)
+            first_cover = result.cover_points[result.ordered_indices[0]]
+            first_pose = result.route_plan.pickup_poses[0]
+
+            assert first_cover.covered_ball_indices[0] == 0
+            assert math.isclose(first_pose.x_cm, 60.0)
+            assert math.isclose(first_pose.y_cm, 40.0)
 
 
 class TestIntersectionPriorityStrategy:

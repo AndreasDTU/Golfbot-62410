@@ -18,6 +18,13 @@ All notable larger additions and behavioral changes to this repository should be
   - Changing the route-view strategy now also updates the shared route-planning
     facade used for AUTO planning.
 
+- Made intersection-focused route strategies avoid cross-owned pickup stations
+  for the mandatory first orange pickup when a cross-clear orange station is
+  available.
+  - Shared-node strategies now retain orange fallback pickup points even when
+    orange also has shared intersections, so `intersection-nearest` and
+    `intersection-optimal` can choose a safer first orange approach.
+
 ## 2026-06-17
 
 ### Added

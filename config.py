@@ -6,7 +6,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field as dataclass_field
+from enum import Enum
 from pathlib import Path
+
+
+class RouteStrategyName(str, Enum):
+    SET_COVER_NEAREST = "set_cover_nearest"
+    INTERSECTION_PRIORITY = "intersection_priority"
+    INTERSECTION_NEAREST = "intersection_nearest"
+    INTERSECTION_OPTIMAL = "intersection_optimal"
+    LEGACY_HYBRID_ASTAR = "legacy_hybrid_astar"
 
 
 @dataclass(frozen=True)
@@ -106,8 +115,6 @@ class RobotGeometryConfig:
     tuned_footprint_rear_from_origin_cm: float = 10.1
     tuned_tube_offset_cm: float = 17.1
     tuned_tube_right_offset_cm: float = 0.0
-    tube_width_cm: float = 6.0
-    tuned_unload_extension_cm: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -130,7 +137,13 @@ class DetectionConfig:
     calib_z_cm: int = 7
     heading_tuning: int = 180
 
-    def trackbar_defaults(self, field: FieldConfig, robot: RobotGeometryConfig) -> dict[str, int]:
+    def trackbar_defaults(
+        self,
+        field: FieldConfig,
+        robot: RobotGeometryConfig,
+        planner: PlannerConfig | None = None,
+    ) -> dict[str, int]:
+        planner = planner or PlannerConfig()
         return {
             "red1_h_min": self.red1_h_min,
             "red1_h_max": self.red1_h_max,
@@ -154,7 +167,7 @@ class DetectionConfig:
             "robot_rear_cmx10": int(round(robot.tuned_footprint_rear_from_origin_cm * 10.0)),
             "tube_forward_cmx10": int(round(robot.tuned_tube_offset_cm * 10.0)),
             "tube_right_cmx10": int(round((robot.tuned_tube_right_offset_cm + 50.0) * 10.0)),
-            "unload_extension_cmx10": int(round(robot.tuned_unload_extension_cm * 10.0)),
+            "unload_extension_cmx10": int(round(planner.unload_extension_cm * 10.0)),
         }
 
 
@@ -222,6 +235,7 @@ class TrackbarConfig:
 class PlannerConfig:
     """Route-planning tuning."""
 
+    route_strategy: RouteStrategyName = RouteStrategyName.INTERSECTION_PRIORITY
     theta_bins: int = 36
     step_cm: float = 4.0
     goal_tolerance_cm: float = 4.0
@@ -252,6 +266,10 @@ class PlannerConfig:
     ball_warning_cost: float = 50.0
     ball_close_clearance_cm: float = 5.0
     ball_warning_clearance_cm: float = 10.0
+    # Pickup tube geometry (moved from RobotGeometryConfig)
+    tube_width_cm: float = 6.0
+    mouth_radius_cm: float = 2.0
+    unload_extension_cm: float = 30.0
 
     @property
     def route_target_reached_cm(self) -> float:

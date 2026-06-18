@@ -27,6 +27,14 @@ from localization.localization import RobotCalibrationCollector, RobotPoseEstima
 from localization.models import RobotCalibrationRuntime, RobotMarkerObservation, RobotPose
 from path.pathfinding.models import HybridPose, PlannedBallTarget
 from path.pathfinding.planner import RoutePlanningFacade
+from path.pickup_geometry import compute_pickup_geometry
+from path.route_strategy import ObstacleGeometry, RoutePlannerInput
+from path.tools.pickup_visualizer import (
+    STRATEGY_OPTIONS,
+    draw_pickup_geometry,
+    draw_route_plan,
+    draw_strategy_label,
+)
 from config import AppConfig
 from perception.vision.debug import DebugRenderer
 from perception.vision.models import CalibrationState, RedCrossSpec, RedZoneDetection
@@ -55,6 +63,7 @@ HEADING_STEP_RAD = math.radians(1.0)
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
 CROSS_WINDOW_NAME = "Place Red Cross"
+ROUTE_VIEW_WINDOW_NAME = "Route View"
 STATUS_BAR_HEIGHT = 170
 
 
@@ -289,6 +298,12 @@ class MainGui:
     _cross_window_open: bool = False
     _cross_state: CornerSelectionState = field(default_factory=CornerSelectionState)
 
+    # Route View window state
+    _route_view_open: bool = False
+    _route_view_strategy_index: int = 0
+    _route_view_cache_id: int = 0
+    _route_view_cached_image: np.ndarray | None = None
+
     # Dimensions derived from config
     _left_w: int = 0
     _left_h: int = 0
@@ -478,11 +493,15 @@ class MainGui:
     def _seed_geometry_params(self) -> None:
         """Ensure live geometry keys exist in params, defaulting from config."""
         robot = self.config.robot
+        planner = self.config.planner
         self.params.setdefault("robot_width_cm", robot.tuned_footprint_width_cm)
         self.params.setdefault("robot_front_cm", robot.tuned_footprint_front_from_origin_cm)
         self.params.setdefault("robot_rear_cm", robot.tuned_footprint_rear_from_origin_cm)
         self.params.setdefault("tube_forward_cm", robot.tuned_tube_offset_cm)
         self.params.setdefault("tube_right_cm", robot.tuned_tube_right_offset_cm)
+        self.params.setdefault("tube_width_cm", planner.tube_width_cm)
+        self.params.setdefault("mouth_radius_cm", planner.mouth_radius_cm)
+        self.params.setdefault("unload_extension_cm", planner.unload_extension_cm)
         self.params.setdefault("heading_tuning_rad", 0.0)
         # Crop monitor HSV params (white ball detection in fixed crops)
         self.params.setdefault("crop_size", 60)
@@ -532,10 +551,11 @@ class MainGui:
             GuiButton("Set Cross", "set_cross", (x0 + (bw + gap), y, bw, bh)),
             GuiButton("Calib Robot", "calib_robot", (x0 + 2 * (bw + gap), y, bw, bh)),
             GuiButton("Guide Test", "guidance_test", (x0 + 3 * (bw + gap), y, bw, bh)),
-            GuiButton("Manual", "manual", (x0 + 4 * (bw + gap), y, bw, bh)),
-            GuiButton("Auto", "auto", (x0 + 5 * (bw + gap), y, bw, bh)),
-            GuiButton("Stop", "stop", (x0 + 6 * (bw + gap), y, bw, bh)),
-            GuiButton("Quit", "quit", (x0 + 7 * (bw + gap), y, bw, bh)),
+            GuiButton("Route View", "route_view", (x0 + 4 * (bw + gap), y, bw, bh)),
+            GuiButton("Manual", "manual", (x0 + 5 * (bw + gap), y, bw, bh)),
+            GuiButton("Auto", "auto", (x0 + 6 * (bw + gap), y, bw, bh)),
+            GuiButton("Stop", "stop", (x0 + 7 * (bw + gap), y, bw, bh)),
+            GuiButton("Quit", "quit", (x0 + 8 * (bw + gap), y, bw, bh)),
         ]
         # Second row: calibration controls (depends on sub-phase)
         if self.mode == AppMode.CALIBRATE:
@@ -605,6 +625,8 @@ class MainGui:
             self._save_calibration()
         elif action == "calib_cancel":
             self._cancel_calibration()
+        elif action == "route_view":
+            self._open_route_view()
         elif action == "guidance_test":
             if self._block_during_calibration():
                 return
@@ -1205,6 +1227,181 @@ class MainGui:
         self.mode = AppMode.IDLE
 
     # ------------------------------------------------------------------
+    # Route View window (pickup geometry + route visualization)
+    # ------------------------------------------------------------------
+
+    def _open_route_view(self) -> None:
+        """Open or re-focus the Route View secondary window."""
+        if self._route_view_open:
+            return
+        self._route_view_open = True
+        self._route_view_cache_id = 0
+        self._route_view_cached_image = None
+        cv2.namedWindow(ROUTE_VIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.createTrackbar(
+            "Strategy", ROUTE_VIEW_WINDOW_NAME,
+            self._route_view_strategy_index, len(STRATEGY_OPTIONS) - 1,
+            lambda _v: None,
+        )
+        cv2.resizeWindow(
+            ROUTE_VIEW_WINDOW_NAME,
+            self._right_w, self._right_h,
+        )
+        self.message = "Route View opened — use Strategy trackbar to switch"
+
+    def _close_route_view(self) -> None:
+        self._route_view_open = False
+        self._route_view_cached_image = None
+        try:
+            cv2.destroyWindow(ROUTE_VIEW_WINDOW_NAME)
+        except cv2.error:
+            pass
+
+    def _tick_route_view(self) -> None:
+        """Render one frame of the Route View window."""
+        if not self._route_view_open:
+            return
+
+        # Check if window was closed by user
+        try:
+            if cv2.getWindowProperty(ROUTE_VIEW_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                self._close_route_view()
+                return
+        except cv2.error:
+            self._close_route_view()
+            return
+
+        # Read trackbar
+        tb = cv2.getTrackbarPos("Strategy", ROUTE_VIEW_WINDOW_NAME)
+        if 0 <= tb < len(STRATEGY_OPTIONS):
+            strategy_changed = tb != self._route_view_strategy_index
+            self._route_view_strategy_index = tb
+        else:
+            strategy_changed = False
+
+        result = self._last_result
+        if result is None or result.occupancy_grid is None:
+            placeholder = np.full(
+                (self._right_h, self._right_w, 3), (40, 40, 40), dtype=np.uint8,
+            )
+            cv2.putText(
+                placeholder, "Waiting for perception data...",
+                (20, self._right_h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA,
+            )
+            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, placeholder)
+            return
+
+        # Cache check: skip recompute if data unchanged and strategy unchanged
+        cache_id = id(result)
+        pose_id = id(self.robot_pose)
+        combined_id = hash((cache_id, pose_id, self._route_view_strategy_index))
+        if combined_id == self._route_view_cache_id and self._route_view_cached_image is not None:
+            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, self._route_view_cached_image)
+            return
+        self._route_view_cache_id = combined_id
+
+        # Build base schematic
+        frame_shape = (
+            result.preprocessed.topdown.shape
+            if result.preprocessed.topdown is not None
+            else (self._left_h, self._left_w, 3)
+        )
+        camera_center = (
+            float(self.params.get("camera_center_x", self._left_w / 2)),
+            float(self.params.get("camera_center_y", self._left_h / 2)),
+        )
+        image = self.renderer.draw_schematic(
+            frame_shape=frame_shape,
+            red_zones=result.red_zones,
+            smoothed_ball_coordinates=result.smoothed_ball_coordinates,
+            camera_center_pixels=camera_center,
+            robot_pose=self.robot_pose,
+            params=self.params,
+        )
+
+        # Compute pickup geometry
+        geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+        field_w = self.config.field.width_cm
+        field_h = self.config.field.height_cm
+        targets = [
+            PlannedBallTarget(
+                track_id=b.track_id,
+                label=b.label,
+                x_cm=b.cm_x,
+                y_cm=b.cm_y,
+                node_cm=self.pipeline.mapper.field_metric_cm_to_grid_node(
+                    (b.cm_x, b.cm_y),
+                ),
+            )
+            for b in result.smoothed_ball_coordinates
+        ]
+
+        if not targets:
+            draw_strategy_label(image, STRATEGY_OPTIONS[self._route_view_strategy_index])
+            self._route_view_cached_image = image
+            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
+            return
+
+        geometry_result = compute_pickup_geometry(
+            field_w, field_h, result.occupancy_grid, targets, geometry,
+        )
+        mapper = self.renderer.mapper
+        draw_pickup_geometry(image, geometry_result, mapper, self.config.field)
+
+        # Build obstacle from cross spec
+        if self._cross_spec is not None:
+            cs = self._cross_spec
+            obstacle = ObstacleGeometry(
+                center_x_cm=cs.center_cm[0],
+                center_y_cm=cs.center_cm[1],
+                half_size_cm=cs.length_cm / 2.0,
+                half_arm_width_cm=cs.arm_width_cm / 2.0,
+                angle_rad=cs.angle_rad,
+            )
+        else:
+            obstacle = ObstacleGeometry(
+                center_x_cm=-1000.0,
+                center_y_cm=-1000.0,
+                half_size_cm=0.0,
+                half_arm_width_cm=0.0,
+            )
+
+        # Build start pose and route
+        if self.robot_pose is not None:
+            start_pose = HybridPose(
+                x_cm=self.robot_pose.x_cm,
+                y_cm=self.robot_pose.y_cm,
+                theta_rad=self.robot_pose.heading_rad,
+            )
+        else:
+            start_pose = HybridPose(x_cm=20.0, y_cm=20.0, theta_rad=0.0)
+
+        margin = self._route_planner.hybrid_config.unload_staging_margin_cm
+        unload_pose = self._route_planner.hybrid_planner.small_goal_unload_pose(geometry, margin)
+        unload_goal_cm = self._route_planner.hybrid_planner.small_goal_center_cm()
+
+        route_input = RoutePlannerInput(
+            geometry_result=geometry_result,
+            obstacle=obstacle,
+            start_pose=start_pose,
+            robot_radius_cm=geometry_result.ring_radius_cm,
+            field_width_cm=field_w,
+            field_height_cm=field_h,
+            unload_pose=unload_pose,
+            unload_goal_cm=unload_goal_cm,
+        )
+
+        strategy_option = STRATEGY_OPTIONS[self._route_view_strategy_index]
+        strategy = strategy_option.create()
+        strategy_result = strategy.plan(route_input)
+        draw_route_plan(image, strategy_result, geometry_result, mapper, self.config.field)
+        draw_strategy_label(image, strategy_option)
+
+        self._route_view_cached_image = image
+        cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
+
+    # ------------------------------------------------------------------
     # Per-frame processing
     # ------------------------------------------------------------------
 
@@ -1429,7 +1626,7 @@ class MainGui:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
 
         cv2.putText(canvas,
-                    "Keys: q/Esc quit | f set corners | x set cross | c calib robot | g guidance test | a auto | s stop",
+                    "Keys: q/Esc quit | f corners | x cross | c calib | g guide | v route | a auto | s stop",
                     (20, y0 + 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
 
@@ -1439,6 +1636,7 @@ class MainGui:
             is_active = (
                 (button.action == "set_corners" and self._corner_window_open)
                 or (button.action == "set_cross" and self._cross_window_open)
+                or (button.action == "route_view" and self._route_view_open)
                 or (button.action == "calib_robot" and self.mode == AppMode.CALIBRATE)
                 or (button.action == "guidance_test" and self.mode == AppMode.GUIDANCE_TEST)
                 or (button.action == "manual" and self.mode == AppMode.MANUAL)
@@ -1475,6 +1673,10 @@ class MainGui:
         # Drive the cross-placement window if open
         if self._cross_window_open and raw_frame is not None:
             self._tick_cross_window(raw_frame)
+
+        # Drive the route view window if open
+        if self._route_view_open:
+            self._tick_route_view()
 
         if raw_frame is not None:
             result = self._process_frame(raw_frame)
@@ -1539,6 +1741,8 @@ class MainGui:
             self._handle_button("calib_robot")
         elif key == ord("x"):
             self._handle_button("set_cross")
+        elif key == ord("v"):
+            self._handle_button("route_view")
         elif key == ord("s"):
             self._handle_button("stop")
 
@@ -1563,6 +1767,8 @@ class MainGui:
             self._close_corner_window()
         if self._cross_window_open:
             self._close_cross_window()
+        if self._route_view_open:
+            self._close_route_view()
         if self.camera is not None:
             self.camera.release()
         cv2.destroyWindow(WINDOW_NAME)

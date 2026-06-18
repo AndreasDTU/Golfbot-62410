@@ -20,7 +20,7 @@ import numpy as np
 
 from localization.models import RobotCalibrationRuntime, RobotGeometry, RobotMarkerObservation, RobotPose
 from perception.vision.calibration import HomographyCalibrator
-from config import CameraConfig, FieldConfig, RobotCalibrationConfig, RobotGeometryConfig
+from config import CameraConfig, FieldConfig, PlannerConfig, RobotCalibrationConfig, RobotGeometryConfig
 from perception.vision.geometry import CoordinateMapper, ParallaxCorrector
 from perception.vision.models import ParallaxConfig
 
@@ -118,9 +118,11 @@ class RobotPoseEstimator:
         robot_config: RobotGeometryConfig | None = None,
         mapper: CoordinateMapper | None = None,
         marker_detector: RobotMarkerDetector | None = None,
+        planner_config: PlannerConfig | None = None,
     ) -> None:
         self.field = field_config or FieldConfig()
         self.robot_config = robot_config or RobotGeometryConfig()
+        self.planner_config = planner_config or PlannerConfig()
         self.mapper = mapper or CoordinateMapper(self.field)
         self.marker_detector = marker_detector or RobotMarkerDetector(marker_ids=self.robot_config.marker_ids)
 
@@ -133,7 +135,9 @@ class RobotPoseEstimator:
             rear_cm=float(params.get("robot_rear_cm", self.robot_config.tuned_footprint_rear_from_origin_cm)),
             tube_forward_cm=float(params.get("tube_forward_cm", self.robot_config.tuned_tube_offset_cm)),
             tube_right_cm=float(params.get("tube_right_cm", self.robot_config.tuned_tube_right_offset_cm)),
-            unload_extension_cm=float(params.get("unload_extension_cm", self.robot_config.tuned_unload_extension_cm)),
+            tube_width_cm=float(params.get("tube_width_cm", self.planner_config.tube_width_cm)),
+            mouth_radius_cm=float(params.get("mouth_radius_cm", self.planner_config.mouth_radius_cm)),
+            unload_extension_cm=float(params.get("unload_extension_cm", self.planner_config.unload_extension_cm)),
         )
 
     def parallax_config_from_live_params(
@@ -458,6 +462,8 @@ class RobotCalibrationCollector:
             "rear_cm": float(geometry.rear_cm),
             "tube_forward_cm": float(geometry.tube_forward_cm),
             "tube_right_cm": float(geometry.tube_right_cm),
+            "tube_width_cm": float(geometry.tube_width_cm),
+            "mouth_radius_cm": float(geometry.mouth_radius_cm),
             "unload_extension_cm": float(geometry.unload_extension_cm),
             "heading_tuning_rad": float(heading_tuning_rad),
             "heading_tuning_deg": math.degrees(float(heading_tuning_rad)),
@@ -493,6 +499,8 @@ class RobotCalibrationCollector:
             "rear_cm": "robot_rear_cm",
             "tube_forward_cm": "tube_forward_cm",
             "tube_right_cm": "tube_right_cm",
+            "tube_width_cm": "tube_width_cm",
+            "mouth_radius_cm": "mouth_radius_cm",
             "unload_extension_cm": "unload_extension_cm",
             "heading_tuning_rad": "heading_tuning_rad",
         }

@@ -13,6 +13,43 @@ from localization.models import DriveControlState, DriveRuntime, RobotGeometry, 
 from config import DriveConfig, FieldConfig
 
 
+def classify_segments_from_geometry(
+    route: list[HybridPose],
+    pickup_poses: list[HybridPose],
+) -> list[RouteSegmentType]:
+    """Derive segment types from route geometry and pickup identity.
+
+    Logic:
+    1. Default all segments to TRANSIT
+    2. Zero-length segments -> PIVOT
+    3. Segments ending at a pickup pose (matched by ``id()``) -> CREEP
+    4. Zero-length segment before a CREEP -> PIVOT
+    """
+    segment_count = max(0, len(route) - 1)
+    if segment_count == 0:
+        return []
+
+    segment_types = [RouteSegmentType.TRANSIT] * segment_count
+    pickup_ids = {id(pose) for pose in pickup_poses}
+
+    for index in range(segment_count):
+        start, end = route[index], route[index + 1]
+        if math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm) <= 1e-6:
+            segment_types[index] = RouteSegmentType.PIVOT
+
+    for index in range(segment_count):
+        if id(route[index + 1]) in pickup_ids:
+            segment_types[index] = RouteSegmentType.CREEP
+            if index >= 1 and segment_types[index - 1] == RouteSegmentType.PIVOT:
+                pass  # already PIVOT
+            elif index >= 1:
+                prev_start, prev_end = route[index - 1], route[index]
+                if math.hypot(prev_end.x_cm - prev_start.x_cm, prev_end.y_cm - prev_start.y_cm) <= 1e-6:
+                    segment_types[index - 1] = RouteSegmentType.PIVOT
+
+    return segment_types
+
+
 class WheelCommandController:
     """Translate route tracking error into bounded differential-drive speeds."""
 
@@ -320,7 +357,7 @@ class DriveSafetyGuard:
         robot_pose: RobotPose,
         route: list[HybridPose],
         drive_runtime: DriveRuntime,
-        segment_types: list[RouteSegmentType] | None = None,
+        pickup_poses: list[HybridPose] | None = None,
     ) -> RouteTrackingError | None:
         """Project only onto the current/future route window to avoid path-intersection jumps."""
         self.reset_route_progress_if_needed(route, drive_runtime)
@@ -329,7 +366,8 @@ class DriveSafetyGuard:
             len(route) - 2,
             start_segment + max(0, int(self.config.route_tracking_lookahead_segments)),
         )
-        if segment_types is not None:
+        segment_types = classify_segments_from_geometry(route, pickup_poses or [])
+        if segment_types:
             for idx in range(start_segment, end_segment + 1):
                 if idx < len(segment_types) and segment_types[idx] == RouteSegmentType.PIVOT:
                     end_segment = max(start_segment, idx - 1)
@@ -353,7 +391,7 @@ class DriveSafetyGuard:
         route: list[HybridPose] | None,
         drive_runtime: DriveRuntime | None,
         clear_route_cache: Callable[[], None] | None = None,
-        segment_types: list[RouteSegmentType] | None = None,
+        pickup_poses: list[HybridPose] | None = None,
     ) -> None:
         """Stop on excessive XTE before route cache updates can hide the error."""
         if (
@@ -365,7 +403,7 @@ class DriveSafetyGuard:
             return
 
         tracking_error = self.compute_progressive_tracking_error(
-            robot_pose, route, drive_runtime, segment_types=segment_types,
+            robot_pose, route, drive_runtime, pickup_poses=pickup_poses,
         )
         if tracking_error is None or tracking_error.xte_cm <= self.config.max_cross_track_error_cm:
             return
@@ -389,7 +427,7 @@ class DriveSafetyGuard:
         local_goal_poses: list[HybridPose] | None = None,
         dt_s: float | None = None,
         robot_geometry: RobotGeometry | None = None,
-        segment_types: list[RouteSegmentType] | None = None,
+        pickup_poses: list[HybridPose] | None = None,
     ) -> None:
         """Run the master-controller step after perception and route-cache update."""
         if drive_runtime is None:
@@ -413,7 +451,7 @@ class DriveSafetyGuard:
             return
 
         tracking_error = self.compute_progressive_tracking_error(
-            robot_pose, route, drive_runtime, segment_types=segment_types,
+            robot_pose, route, drive_runtime, pickup_poses=pickup_poses,
         )
         drive_runtime.last_error = tracking_error
         if tracking_error is None:

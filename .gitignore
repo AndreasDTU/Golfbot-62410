@@ -223,5 +223,5 @@ graphify-out/
 robot/robot_drive_calibration.json
 
 #camera and cross
-field_corners.json
-red_cross.json
+data/field_corners.json
+data/red_cross.json

@@ -744,7 +744,7 @@ class TightCornerPickupTests(unittest.TestCase):
         final_pose = segment[-1]
         self.assertLessEqual(abs(final_pose.theta_rad - math.radians(-135.0)), math.radians(9.0))
         tube = planner.tube_center_for_pose(final_pose, geometry)
-        capture_tolerance_cm = planner.robot_config.tube_width_cm * 0.5 + planner.config.ball_radius_cm
+        capture_tolerance_cm = planner.config.tube_width_cm * 0.5 + planner.config.ball_radius_cm
         self.assertLessEqual(np.hypot(tube[0] - ball_point[0], tube[1] - ball_point[1]), capture_tolerance_cm)
 
     def test_four_tight_corner_balls_remain_reachable_in_sequence(self) -> None:

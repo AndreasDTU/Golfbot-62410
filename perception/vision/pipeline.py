@@ -103,7 +103,11 @@ class VisionPipeline:
         The shape mirrors the legacy ``read_hsv_ranges`` dictionary so extracted
         components can be wired into the old app incrementally.
         """
-        defaults = self.config.detection.trackbar_defaults(self.config.field, self.config.robot)
+        defaults = self.config.detection.trackbar_defaults(
+            self.config.field,
+            self.config.robot,
+            self.config.planner,
+        )
         camera_center_px = self.mapper.field_cm_to_topdown_pixel(
             (
                 float(defaults["cam_center_x"]),

@@ -486,11 +486,15 @@ class MainGui:
     def _seed_geometry_params(self) -> None:
         """Ensure live geometry keys exist in params, defaulting from config."""
         robot = self.config.robot
+        planner = self.config.planner
         self.params.setdefault("robot_width_cm", robot.tuned_footprint_width_cm)
         self.params.setdefault("robot_front_cm", robot.tuned_footprint_front_from_origin_cm)
         self.params.setdefault("robot_rear_cm", robot.tuned_footprint_rear_from_origin_cm)
         self.params.setdefault("tube_forward_cm", robot.tuned_tube_offset_cm)
         self.params.setdefault("tube_right_cm", robot.tuned_tube_right_offset_cm)
+        self.params.setdefault("tube_width_cm", planner.tube_width_cm)
+        self.params.setdefault("mouth_radius_cm", planner.mouth_radius_cm)
+        self.params.setdefault("unload_extension_cm", planner.unload_extension_cm)
         self.params.setdefault("heading_tuning_rad", 0.0)
 
     def _load_robot_calibration(self) -> None:

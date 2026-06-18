@@ -2,6 +2,16 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-06-18
+
+### Changed
+
+- Moved pickup tube width, mouth radius, and unload extension defaults out of
+  `RobotGeometryConfig` and into planner-owned geometry defaults.
+  - Vision default params, localization fallback geometry, hybrid planner
+    config construction, debug footprint rendering, and saved geometry tuning
+    now read those values from the live `RobotGeometry`/planner config path.
+
 ## 2026-06-17
 
 ### Added

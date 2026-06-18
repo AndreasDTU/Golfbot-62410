@@ -103,3 +103,4 @@ class HybridPlannerConfig:
     ball_warning_cost: float = 50.0
     ball_close_clearance_cm: float = 5.0
     ball_warning_clearance_cm: float = 10.0
+    tube_width_cm: float = 6.0

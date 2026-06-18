@@ -122,7 +122,7 @@ class RobotFootprintCollisionChecker:
             dtype=np.float32,
         )
 
-        tube_half_width = self.robot_config.tube_width_cm * 0.5
+        tube_half_width = self.geometry.tube_width_cm * 0.5
         tube_front = center + forward * self.geometry.tube_forward_cm + right * self.geometry.tube_right_cm
         tube_rear = front_center + right * self.geometry.tube_right_cm
         tube = np.array(
@@ -707,7 +707,7 @@ class HybridAStarPlanner:
         if heading_rad is None:
             return []
         cfg = config or self.config
-        max_backoff_cm = max(0.0, self.robot_config.tube_width_cm * 0.5 + cfg.ball_radius_cm)
+        max_backoff_cm = max(0.0, cfg.tube_width_cm * 0.5 + cfg.ball_radius_cm)
         backoff_steps = max(1, int(math.ceil(max_backoff_cm / 0.5)))
         candidates: list[HybridPose] = []
         seen: set[tuple[int, int, int]] = set()
@@ -2088,6 +2088,7 @@ class RoutePlanningFacade:
             ball_warning_cost=self.planner_config.ball_warning_cost,
             ball_close_clearance_cm=self.planner_config.ball_close_clearance_cm,
             ball_warning_clearance_cm=self.planner_config.ball_warning_clearance_cm,
+            tube_width_cm=self.planner_config.tube_width_cm,
         )
         self.hybrid_planner = HybridAStarPlanner(self.field, self.robot_config, self.hybrid_config)
         self.legacy_planner = LegacyAStarPlanner()

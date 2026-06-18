@@ -52,8 +52,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     mapper = pipeline.mapper
-    pose_estimator = RobotPoseEstimator(config.field, config.robot, mapper)
-    renderer = DebugRenderer(config.field, config.windows, config.robot, config.drive, mapper)
+    pose_estimator = RobotPoseEstimator(config.field, config.robot, mapper, planner_config=config.planner)
+    renderer = DebugRenderer(config.field, config.windows, config.robot, config.drive, mapper, config.planner)
 
     camera = None
     static_image = None

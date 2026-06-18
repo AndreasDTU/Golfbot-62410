@@ -21,7 +21,7 @@ from localization.models import (
     RobotMarkerObservation,
     RobotPose,
 )
-from config import DriveConfig, FieldConfig, RobotGeometryConfig, WindowConfig
+from config import DriveConfig, FieldConfig, PlannerConfig, RobotGeometryConfig, WindowConfig
 from perception.vision.geometry import CoordinateMapper
 from perception.vision.models import BallDetection, RedZoneDetection, SmoothedBallCoordinate
 
@@ -47,16 +47,23 @@ class DebugRenderer:
         robot_config: RobotGeometryConfig | None = None,
         drive_config: DriveConfig | None = None,
         mapper: CoordinateMapper | None = None,
+        planner_config: PlannerConfig | None = None,
     ) -> None:
         self.field = field_config or FieldConfig()
         self.window = window_config or WindowConfig()
         self.robot_config = robot_config or RobotGeometryConfig()
         self.drive_config = drive_config or DriveConfig()
         self.mapper = mapper or CoordinateMapper(self.field, window_config=self.window)
+        self.planner_config = planner_config or PlannerConfig()
 
     def robot_geometry_from_params(self, params: dict[str, object] | None) -> RobotGeometry:
         """Read live robot geometry, falling back to tuned defaults."""
-        return RobotPoseEstimator(self.field, self.robot_config, self.mapper).robot_geometry_from_params(params)
+        return RobotPoseEstimator(
+            self.field,
+            self.robot_config,
+            self.mapper,
+            planner_config=self.planner_config,
+        ).robot_geometry_from_params(params)
 
     def route_velocity_color_for_speed(self, speed_pct: float) -> tuple[int, int, int]:
         """Map a profiled speed to a BGR heatmap color."""
@@ -403,7 +410,7 @@ class DebugRenderer:
         forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
         right = (math.sin(pose.theta_rad), -math.cos(pose.theta_rad))
         half_width_cm = geometry.width_cm * 0.5
-        tube_half_width_cm = self.robot_config.tube_width_cm * 0.5
+        tube_half_width_cm = geometry.tube_width_cm * 0.5
 
         front_center = (
             pose.x_cm + forward[0] * geometry.front_cm,
@@ -446,7 +453,7 @@ class DebugRenderer:
             return []
         forward = (math.cos(pose.theta_rad), math.sin(pose.theta_rad))
         right = (math.sin(pose.theta_rad), -math.cos(pose.theta_rad))
-        half_width_cm = self.robot_config.tube_width_cm * 0.5
+        half_width_cm = geometry.tube_width_cm * 0.5
         rear_center = (
             pose.x_cm - forward[0] * geometry.rear_cm,
             pose.y_cm - forward[1] * geometry.rear_cm,

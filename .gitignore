@@ -221,3 +221,7 @@ graphify-out/
 
 # Robot-local runtime drive calibration values
 robot/robot_drive_calibration.json
+
+#camera and cross
+field_corners.json
+red_cross.json

@@ -291,7 +291,7 @@ class ConnectionConfig:
 class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
-    drive_speed_pct: float = 100.0
+    drive_speed_pct: float = 90.0
     max_speed_pct: float = 100.0
     max_heading_for_forward_rad: float = math.radians(15.0)
     turn_speed_pct: float = 25.0

@@ -154,8 +154,9 @@ class GuidanceController:
             target = self._waypoints[self._cursor]
             distance, heading_error = self._compute_geometry(pose, target)
 
+        max_heading_error = math.radians(4) if (is_last and distance < self._waypoint_arrival_cm) else self._config.max_heading_for_forward_rad
         # 6. Large heading error — rotate in place.
-        if abs(heading_error) > self._config.max_heading_for_forward_rad:
+        if abs(heading_error) > max_heading_error:
             ok = self._commander.turn(math.degrees(heading_error))
             self._log(
                 "TURNING", dist=distance,

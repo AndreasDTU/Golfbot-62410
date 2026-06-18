@@ -250,10 +250,15 @@ class RobotCommander:
     # ------------------------------------------------------------------
 
     def turn(self, degrees: float) -> bool:
-        """In-place rotation.  *degrees* = remaining angle (positive = CCW)."""
+        """In-place rotation.  *degrees* = remaining angle (positive = CCW).
+
+        Stops early by turn_coast_deg to compensate for motor coast overshoot.
+        """
         if not math.isfinite(degrees):
             self.last_error = "non-finite turn angle rejected"
             return False
+        if abs(degrees) <= self._config.turn_coast_deg:
+            return self.stop()
         speed = self._target_speed_for_angle(degrees)
         sign = 1.0 if degrees >= 0 else -1.0
         self._base_speed = 0.0

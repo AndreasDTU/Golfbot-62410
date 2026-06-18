@@ -892,7 +892,11 @@ class MainGui:
                 geometry = self.pose_estimator.robot_geometry_from_params(self.params)
 
                 plan = self._route_planner.plan_route(
-                    captured_grid, targets, start_pose, geometry,
+                    captured_grid,
+                    targets,
+                    start_pose,
+                    geometry,
+                    cross_spec=self._cross_spec,
                 )
 
                 if not plan.points:
@@ -1025,7 +1029,13 @@ class MainGui:
             theta_rad=self.robot_pose.heading_rad,
         )
         geometry = self.pose_estimator.robot_geometry_from_params(self.params)
-        plan = self._route_planner.plan_route(result.occupancy_grid, targets, start_pose, geometry)
+        plan = self._route_planner.plan_route(
+            result.occupancy_grid,
+            targets,
+            start_pose,
+            geometry,
+            cross_spec=self._cross_spec,
+        )
 
         if not plan.points:
             self.message = "Rescan: no route found — stopping"

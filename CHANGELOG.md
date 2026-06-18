@@ -25,6 +25,9 @@ All notable larger additions and behavioral changes to this repository should be
     orange also has shared intersections, so `intersection-nearest` and
     `intersection-optimal` can choose a safer first orange approach.
 
+- Made AUTO route planning and displacement replanning use the same manually
+  placed cross obstacle as the Route View preview.
+
 ## 2026-06-17
 
 ### Added

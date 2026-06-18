@@ -19,6 +19,7 @@ import numpy as np
 from brain.brain import BrainController
 from brain.models import BrainState
 from control.commander import RobotCommander
+from control.telemetry import log_event
 from control.spin_calibration import SpinController, SpinStatus
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
@@ -246,6 +247,11 @@ class MainGui:
     _brain_route_points: list[HybridPose] | None = None
     _last_result: VisionFrameResult | None = None
 
+    # Crop monitor state (ROI-based ball tracking during AUTO mode)
+    _tracked_balls: list | None = None        # fixed positions from last full scan
+    _crop_missing_counts: dict = field(default_factory=dict)  # track_id → consecutive missing frames
+    _last_crop_missing: set = field(default_factory=set)      # track_ids missing on last check
+
     # Robot self-calibration state
     _calib_collector: RobotCalibrationCollector | None = None
     _calib_runtime: RobotCalibrationRuntime | None = None
@@ -283,6 +289,16 @@ class MainGui:
         self.params.setdefault("tube_forward_cm", robot.tuned_tube_offset_cm)
         self.params.setdefault("tube_right_cm", robot.tuned_tube_right_offset_cm)
         self.params.setdefault("heading_tuning_rad", 0.0)
+        # Crop monitor HSV params (white ball detection in fixed crops)
+        self.params.setdefault("crop_size", 60)
+        self.params.setdefault("crop_white_h_min", 0)
+        self.params.setdefault("crop_white_h_max", 180)
+        self.params.setdefault("crop_white_s_min", 0)
+        self.params.setdefault("crop_white_s_max", 40)
+        self.params.setdefault("crop_white_v_min", 200)
+        self.params.setdefault("crop_white_v_max", 255)
+        self.params.setdefault("crop_min_pixel_fraction", 0.03)
+        self.params.setdefault("crop_missing_threshold", 5)
 
     def _load_robot_calibration(self) -> None:
         cal_path = self.config.paths.robot_calibration_file
@@ -541,6 +557,9 @@ class MainGui:
         self._brain_state = None
         self._brain_route_points = None
         self._last_brain_time = None
+        self._tracked_balls = None
+        self._crop_missing_counts = {}
+        self._last_crop_missing = set()
         if self._guidance is not None:
             self._guidance.clear_route()
         if self._commander is not None:
@@ -649,6 +668,8 @@ class MainGui:
                 self._brain_route_points = plan.points
                 self._last_brain_time = None
                 self._brain_state = None
+                self._tracked_balls = list(captured_balls)
+                self._crop_missing_counts = {}
                 self.mode = AppMode.AUTO
                 self.message = f"Brain running — {brain.step_count} steps"
             except Exception as exc:
@@ -676,6 +697,84 @@ class MainGui:
         self._last_brain_time = now
 
         self._brain_state = self._brain.tick(self.robot_pose, dt_s)
+
+        if (
+            self._brain_state == BrainState.ERROR
+            and self._brain.error_message == "ball_displaced"
+            and self._last_result is not None
+            and self._last_result.smoothed_ball_coordinates
+            and self._last_result.occupancy_grid is not None
+            and self.robot_pose is not None
+        ):
+            self._replan_after_displacement()
+
+    def _tick_crop_monitor(self) -> None:
+        """Check fixed HSV crops for each tracked ball; trigger rescan if any are missing."""
+        if self.mode != AppMode.AUTO or self._tracked_balls is None:
+            return
+        result = self._last_result
+        if result is None or result.frame_for_detection is None:
+            return
+
+        robot_xy = (
+            (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose is not None else None
+        )
+        robot_radius = float(self.params.get("robot_radius_cm", 15.0))
+        threshold = int(self.params.get("crop_missing_threshold", 5))
+
+        missing_now = self.pipeline.check_ball_crops(
+            result.frame_for_detection,
+            self._tracked_balls,
+            self.params,
+            robot_pose_cm=robot_xy,
+            robot_radius_cm=robot_radius,
+        )
+        self._last_crop_missing = missing_now
+
+        for ball in self._tracked_balls:
+            tid = ball.track_id
+            if tid in missing_now:
+                self._crop_missing_counts[tid] = self._crop_missing_counts.get(tid, 0) + 1
+            else:
+                self._crop_missing_counts[tid] = 0
+
+        if any(c >= threshold for c in self._crop_missing_counts.values()):
+            self._tracked_balls = None
+            self._crop_missing_counts = {}
+            if self._brain is not None:
+                self._brain.signal_ball_displaced()
+
+    def _replan_after_displacement(self) -> None:
+        """Replan route from the current snapshot after a ball-displaced error."""
+        result = self._last_result
+        targets = [
+            PlannedBallTarget(
+                track_id=b.track_id,
+                label=b.label,
+                x_cm=b.cm_x,
+                y_cm=b.cm_y,
+                node_cm=self.pipeline.mapper.field_metric_cm_to_grid_node((b.cm_x, b.cm_y)),
+            )
+            for b in result.smoothed_ball_coordinates
+        ]
+        start_pose = HybridPose(
+            x_cm=self.robot_pose.x_cm,
+            y_cm=self.robot_pose.y_cm,
+            theta_rad=self.robot_pose.heading_rad,
+        )
+        geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+        plan = self._route_planner.plan_route(result.occupancy_grid, targets, start_pose, geometry)
+
+        if not plan.points:
+            self.message = "Rescan: no route found — stopping"
+            return
+
+        self._brain.load_route(plan)
+        self._brain_route_points = plan.points
+        self._tracked_balls = list(result.smoothed_ball_coordinates)
+        self._crop_missing_counts = {}
+        self.message = f"Replanned — {self._brain.step_count} steps"
+        log_event("BRAIN", "replanned after rescan", steps=self._brain.step_count)
 
     # ------------------------------------------------------------------
     # Robot self-calibration (spin -> fit center -> align body -> save)
@@ -878,7 +977,8 @@ class MainGui:
     # ------------------------------------------------------------------
 
     def _process_frame(self, raw_frame: np.ndarray) -> VisionFrameResult:
-        return self.pipeline.process(raw_frame, params=self.params, use_aruco=True)
+        skip = self.mode == AppMode.AUTO and self._tracked_balls is not None
+        return self.pipeline.process(raw_frame, params=self.params, use_aruco=True, skip_ball_detection=skip)
 
     def _estimate_pose(self, result: VisionFrameResult) -> None:
         topdown = result.preprocessed.topdown
@@ -907,11 +1007,48 @@ class MainGui:
         else:
             left = self.renderer.make_topdown_placeholder("No top-down warp — click Set Corners")
 
+        if self._tracked_balls is not None:
+            self._draw_crop_overlay(left)
         if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
             left = cv2.resize(left, (self._left_w, self._left_h), interpolation=cv2.INTER_LINEAR)
         if self.mode == AppMode.CALIBRATE:
             self._draw_calibration_overlay(left)
         return left
+
+    def _draw_crop_overlay(self, image: np.ndarray) -> None:
+        """Draw crop monitor boxes on the topdown frame.
+
+        Green = ball present, Red = missing, Grey = skipped (robot over crop).
+        """
+        if not self._tracked_balls:
+            return
+        crop_size = int(self.params.get("crop_size", 60))
+        robot_radius_cm = float(self.params.get("robot_radius_cm", 15.0))
+        half = crop_size // 2
+        h, w = image.shape[:2]
+        px_per_cm = w / self.pipeline.config.field.width_cm
+
+        robot_px = None
+        if self.robot_pose is not None:
+            robot_px = self.pipeline.mapper.field_cm_to_topdown_pixel(
+                (self.robot_pose.x_cm, self.robot_pose.y_cm)
+            )
+        robot_radius_px = robot_radius_cm * px_per_cm
+
+        for ball in self._tracked_balls:
+            cx, cy = self.pipeline.mapper.field_cm_to_topdown_pixel((ball.cm_x, ball.cm_y))
+            cx, cy = int(round(cx)), int(round(cy))
+
+            # Determine colour
+            if robot_px is not None:
+                dist = ((cx - robot_px[0]) ** 2 + (cy - robot_px[1]) ** 2) ** 0.5
+                if dist < robot_radius_px:
+                    color = (120, 120, 120)  # grey — robot over crop
+                    cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), color, 1, cv2.LINE_AA)
+                    continue
+
+            color = (60, 60, 200) if ball.track_id in self._last_crop_missing else (60, 200, 60)
+            cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), color, 2, cv2.LINE_AA)
 
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.
@@ -1084,6 +1221,7 @@ class MainGui:
             self._last_result = result
             self._estimate_pose(result)
             self._tick_guidance()
+            self._tick_crop_monitor()
             self._tick_brain()
             self._tick_calibration()
             left = self._build_left_panel(result)

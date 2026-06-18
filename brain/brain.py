@@ -47,6 +47,7 @@ class BrainController:
         self._step_cursor: int = 0
         self._intent: BrainIntent = BrainIntent(action=IntentAction.STOP)
         self._error_message: str = ""
+        self._ball_displaced: bool = False
 
     # ------------------------------------------------------------------
     # Public properties
@@ -90,6 +91,7 @@ class BrainController:
         self._step_cursor = 0
         self._state = BrainState.IDLE
         self._error_message = ""
+        self._ball_displaced = False
         self._intent = BrainIntent(action=IntentAction.STOP)
         self._guidance.clear_route()
         log_event("BRAIN", "route loaded", steps=len(self._steps))
@@ -100,6 +102,7 @@ class BrainController:
         self._step_cursor = 0
         self._state = BrainState.IDLE
         self._error_message = ""
+        self._ball_displaced = False
         self._intent = BrainIntent(action=IntentAction.STOP)
         self._guidance.clear_route()
         log_event("BRAIN", "reset")
@@ -107,6 +110,10 @@ class BrainController:
     # ------------------------------------------------------------------
     # Per-frame tick
     # ------------------------------------------------------------------
+
+    def signal_ball_displaced(self) -> None:
+        """Flag that a tracked ball has moved; Brain will error on the next tick."""
+        self._ball_displaced = True
 
     def tick(self, pose: RobotPose | None, dt_s: float) -> BrainState:
         """Advance the FSM by one frame.
@@ -123,6 +130,17 @@ class BrainController:
         BrainState
             The FSM state after this tick.
         """
+        if self._ball_displaced:
+            self._ball_displaced = False
+            self._steps = []
+            self._step_cursor = 0
+            self._intent = BrainIntent(action=IntentAction.STOP)
+            self._error_message = "ball_displaced"
+            self._state = BrainState.ERROR
+            self._guidance.clear_route()
+            log_event("BRAIN", "ERROR", reason="ball_displaced")
+            return self._state
+
         if self._state == BrainState.DONE:
             return self._state
 

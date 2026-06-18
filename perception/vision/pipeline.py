@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 from perception.vision.calibration import HomographyCalibrator, UndistortionProvider
@@ -143,6 +144,72 @@ class VisionPipeline:
             "camera_center_y_cm": float(defaults["cam_center_y"]),
         }
 
+    def check_ball_crops(
+        self,
+        topdown_frame: np.ndarray,
+        balls: list[SmoothedBallCoordinate],
+        params: dict[str, object],
+        robot_pose_cm: tuple[float, float] | None = None,
+        robot_radius_cm: float = 20.0,
+    ) -> set[int]:
+        """Return track_ids of balls not found in their expected crop region.
+
+        Each ball is checked by extracting a fixed crop around its last known
+        topdown-pixel position and running an HSV threshold inside it.  Crops
+        that overlap the robot footprint are skipped (ball may be occluded).
+        """
+        crop_size = int(params.get("crop_size", 60))
+        lower = np.array(
+            [
+                int(params.get("crop_white_h_min", 0)),
+                int(params.get("crop_white_s_min", 0)),
+                int(params.get("crop_white_v_min", 200)),
+            ],
+            dtype=np.uint8,
+        )
+        upper = np.array(
+            [
+                int(params.get("crop_white_h_max", 180)),
+                int(params.get("crop_white_s_max", 40)),
+                int(params.get("crop_white_v_max", 255)),
+            ],
+            dtype=np.uint8,
+        )
+        min_fraction = float(params.get("crop_min_pixel_fraction", 0.03))
+
+        h_frame, w_frame = topdown_frame.shape[:2]
+        px_per_cm = w_frame / self.config.field.width_cm
+        robot_radius_px = robot_radius_cm * px_per_cm
+        robot_px: tuple[float, float] | None = None
+        if robot_pose_cm is not None:
+            robot_px = self.mapper.field_cm_to_topdown_pixel(robot_pose_cm)
+
+        half = crop_size // 2
+        missing: set[int] = set()
+
+        for ball in balls:
+            cx, cy = self.mapper.field_cm_to_topdown_pixel((ball.cm_x, ball.cm_y))
+            cx, cy = int(round(cx)), int(round(cy))
+
+            if robot_px is not None:
+                dist = ((cx - robot_px[0]) ** 2 + (cy - robot_px[1]) ** 2) ** 0.5
+                if dist < robot_radius_px:
+                    continue
+
+            x1, y1 = max(0, cx - half), max(0, cy - half)
+            x2, y2 = min(w_frame, cx + half), min(h_frame, cy + half)
+            if x2 <= x1 or y2 <= y1:
+                missing.add(ball.track_id)
+                continue
+
+            crop = topdown_frame[y1:y2, x1:x2]
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, lower, upper)
+            if float(np.count_nonzero(mask)) / mask.size < min_fraction:
+                missing.add(ball.track_id)
+
+        return missing
+
     def process(
         self,
         frame: np.ndarray,
@@ -150,6 +217,7 @@ class VisionPipeline:
         use_aruco: bool = True,
         normalize_illumination: bool | None = None,
         dilate_for_legacy: bool | None = None,
+        skip_ball_detection: bool = False,
     ) -> VisionFrameResult:
         """Process one frame through the extracted vision components."""
         effective_params = self.default_params() if params is None else dict(params)
@@ -189,11 +257,19 @@ class VisionPipeline:
             effective_params,
             camera_center_pixels,
         )
-        white_balls, orange_balls, ball_masks = self.ball_detector.detect(
-            frame_for_detection,
-            effective_params,
-            camera_center_pixels,
-        )
+        if skip_ball_detection:
+            white_balls: list[BallDetection] = []
+            orange_balls: list[BallDetection] = []
+            ball_masks = {
+                "white": np.zeros(frame_for_detection.shape[:2], dtype=np.uint8),
+                "orange": np.zeros(frame_for_detection.shape[:2], dtype=np.uint8),
+            }
+        else:
+            white_balls, orange_balls, ball_masks = self.ball_detector.detect(
+                frame_for_detection,
+                effective_params,
+                camera_center_pixels,
+            )
         all_balls = white_balls + orange_balls
         smoothed = self.ball_smoother.update(all_balls, frame_for_detection.shape)
         occupancy_grid = self.occupancy_grid_builder.build(

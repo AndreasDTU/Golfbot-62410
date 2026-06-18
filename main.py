@@ -52,7 +52,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     mapper = pipeline.mapper
-    pose_estimator = RobotPoseEstimator(config.field, config.robot, mapper)
+    pose_estimator = RobotPoseEstimator(
+        config.field, config.robot, mapper, smoothing_config=config.pose_smoothing,
+    )
     renderer = DebugRenderer(config.field, config.windows, config.robot, config.drive, mapper)
 
     camera = None

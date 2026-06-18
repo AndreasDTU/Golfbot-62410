@@ -326,6 +326,27 @@ class RobotCalibrationConfig:
 
 
 @dataclass(frozen=True)
+class PoseSmoothingConfig:
+    """Exponential-moving-average smoothing of the estimated robot pose.
+
+    ArUco detection carries per-frame pixel noise, so a physically stationary
+    robot reports a pose that flickers by a few pixels/degrees each frame.
+    Guidance reads that as real heading/position error and fires micro
+    corrections, making the robot twitch.  Blending each new measurement with
+    the previous estimate (``smoothed += alpha * (raw - smoothed)``) low-passes
+    the noise while still tracking real motion.
+
+    ``alpha`` in [0, 1]: higher reacts faster but lets more noise through;
+    lower is smoother but lags real motion.  ~0.2-0.35 is the sweet spot for
+    this rig -- tune on the real robot.
+    """
+
+    enabled: bool = True
+    position_alpha: float = 0.3
+    heading_alpha: float = 0.3
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top-level configuration bundle for the detector application."""
 
@@ -341,6 +362,7 @@ class AppConfig:
     drive: DriveConfig = dataclass_field(default_factory=DriveConfig)
     telemetry: TelemetryConfig = dataclass_field(default_factory=TelemetryConfig)
     robot_calibration: RobotCalibrationConfig = dataclass_field(default_factory=RobotCalibrationConfig)
+    pose_smoothing: PoseSmoothingConfig = dataclass_field(default_factory=PoseSmoothingConfig)
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":

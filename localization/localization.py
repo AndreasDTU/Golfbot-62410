@@ -20,7 +20,7 @@ import numpy as np
 
 from localization.models import RobotCalibrationRuntime, RobotGeometry, RobotMarkerObservation, RobotPose
 from perception.vision.calibration import HomographyCalibrator
-from config import CameraConfig, FieldConfig, RobotCalibrationConfig, RobotGeometryConfig
+from config import CameraConfig, FieldConfig, PoseSmoothingConfig, RobotCalibrationConfig, RobotGeometryConfig
 from perception.vision.geometry import CoordinateMapper, ParallaxCorrector
 from perception.vision.models import ParallaxConfig
 
@@ -118,11 +118,61 @@ class RobotPoseEstimator:
         robot_config: RobotGeometryConfig | None = None,
         mapper: CoordinateMapper | None = None,
         marker_detector: RobotMarkerDetector | None = None,
+        smoothing_config: PoseSmoothingConfig | None = None,
     ) -> None:
         self.field = field_config or FieldConfig()
         self.robot_config = robot_config or RobotGeometryConfig()
         self.mapper = mapper or CoordinateMapper(self.field)
         self.marker_detector = marker_detector or RobotMarkerDetector(marker_ids=self.robot_config.marker_ids)
+        self.smoothing = smoothing_config or PoseSmoothingConfig()
+        self._reset_smoothing()
+
+    def _reset_smoothing(self) -> None:
+        """Drop the EMA filter state so the next pose re-seeds without lag.
+
+        Called on (re)acquisition gaps: if the robot vanishes and reappears
+        (or teleports while occluded), we want to snap to the fresh measurement
+        rather than crawl toward it across several frames.
+        """
+        self._smoothed_x_cm: float | None = None
+        self._smoothed_y_cm: float | None = None
+        self._smoothed_cos: float | None = None
+        self._smoothed_sin: float | None = None
+
+    def _smooth_pose(
+        self,
+        x_cm: float,
+        y_cm: float,
+        heading_rad: float,
+    ) -> tuple[float, float, float]:
+        """Blend a raw pose with the running estimate via EMA.
+
+        Position is a straight linear EMA.  Heading is filtered as a (cos, sin)
+        unit vector so the average wraps correctly across the +/-pi seam instead
+        of jumping the long way around.
+        """
+        if not self.smoothing.enabled:
+            return x_cm, y_cm, heading_rad
+
+        cos_h = math.cos(heading_rad)
+        sin_h = math.sin(heading_rad)
+
+        if self._smoothed_x_cm is None:
+            # First sample after a gap: seed directly so there is no startup lag.
+            self._smoothed_x_cm = x_cm
+            self._smoothed_y_cm = y_cm
+            self._smoothed_cos = cos_h
+            self._smoothed_sin = sin_h
+            return x_cm, y_cm, heading_rad
+
+        pos_alpha = self.smoothing.position_alpha
+        head_alpha = self.smoothing.heading_alpha
+        self._smoothed_x_cm += pos_alpha * (x_cm - self._smoothed_x_cm)
+        self._smoothed_y_cm += pos_alpha * (y_cm - self._smoothed_y_cm)
+        self._smoothed_cos += head_alpha * (cos_h - self._smoothed_cos)
+        self._smoothed_sin += head_alpha * (sin_h - self._smoothed_sin)
+        smoothed_heading = math.atan2(self._smoothed_sin, self._smoothed_cos)
+        return self._smoothed_x_cm, self._smoothed_y_cm, normalize_angle(smoothed_heading)
 
     def robot_geometry_from_params(self, params: dict[str, object] | None) -> RobotGeometry:
         """Read live robot geometry, falling back to measured defaults."""
@@ -183,6 +233,7 @@ class RobotPoseEstimator:
         observations = self.marker_detector.extract_observations(frame_bgr, parallax_config)
 
         if calibration is None:
+            self._reset_smoothing()
             return None, None, observations, parallax_config
 
         origins: list[np.ndarray] = []
@@ -196,6 +247,7 @@ class RobotPoseEstimator:
             field_headings.append(image_yaw_to_field_heading(true_image_heading))
 
         if not origins:
+            self._reset_smoothing()
             return None, None, observations, parallax_config
 
         origin = np.mean(np.array(origins, dtype=np.float32), axis=0)
@@ -210,6 +262,9 @@ class RobotPoseEstimator:
             + self.robot_config.forward_heading_offset_rad
             + float(params.get("heading_tuning_rad", 0.0))
         )
+        # Low-pass the primitive DOF before deriving the tube pose, so the tube
+        # stays geometrically consistent with the smoothed origin/heading.
+        x_cm, y_cm, heading_rad = self._smooth_pose(x_cm, y_cm, heading_rad)
         geometry = self.robot_geometry_from_params(params)
         forward = (math.cos(heading_rad), math.sin(heading_rad))
         right = (math.sin(heading_rad), -math.cos(heading_rad))

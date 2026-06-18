@@ -906,7 +906,11 @@ class MainGui:
             dt_s = max(0.001, min(0.5, now - self._last_brain_time))
         self._last_brain_time = now
 
+        prev_state = self._brain_state
         self._brain_state = self._brain.tick(self.robot_pose, dt_s)
+
+        if prev_state == BrainState.PICKUP and self._brain_state == BrainState.IDLE:
+            self._remove_collected_ball()
 
         if (
             self._brain_state == BrainState.ERROR
@@ -917,6 +921,19 @@ class MainGui:
             and self.robot_pose is not None
         ):
             self._replan_after_displacement()
+
+    def _remove_collected_ball(self) -> None:
+        """Remove the tracked ball nearest to the robot after a successful pickup."""
+        if not self._tracked_balls or self.robot_pose is None:
+            return
+        nearest = min(
+            self._tracked_balls,
+            key=lambda b: (b.cm_x - self.robot_pose.x_cm) ** 2 + (b.cm_y - self.robot_pose.y_cm) ** 2,
+        )
+        self._tracked_balls = [b for b in self._tracked_balls if b.track_id != nearest.track_id]
+        self._crop_missing_counts.pop(nearest.track_id, None)
+        self._crop_hsv_ranges.pop(nearest.track_id, None)
+        log_event("BRAIN", "ball collected — removed from crop monitor", track_id=nearest.track_id)
 
     def _tick_crop_monitor(self) -> None:
         """Check fixed HSV crops for each tracked ball; trigger rescan if any are missing."""
@@ -929,7 +946,7 @@ class MainGui:
         robot_xy = (
             (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose is not None else None
         )
-        robot_radius = float(self.params.get("robot_radius_cm", 15.0))
+        robot_radius = float(self.params.get("robot_radius_cm", 30.0))
         threshold = int(self.params.get("crop_missing_threshold", 5))
 
         missing_now = self.pipeline.check_ball_crops(
@@ -1250,7 +1267,7 @@ class MainGui:
         if not self._tracked_balls:
             return
         crop_size = int(self.params.get("crop_size", 60))
-        robot_radius_cm = float(self.params.get("robot_radius_cm", 15.0))
+        robot_radius_cm = float(self.params.get("robot_radius_cm", 30.0))
         half = crop_size // 2
         h, w = image.shape[:2]
         px_per_cm = w / self.pipeline.config.field.width_cm

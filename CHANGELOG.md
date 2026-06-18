@@ -29,6 +29,35 @@ All notable larger additions and behavioral changes to this repository should be
     all other uncollected balls block direct travel and are routed around by a
     small visibility-graph detour using cross corners and sampled ball danger
     waypoints.
+  - Optimized candidate evaluation using direct-distance lower bounds so safe
+    edges are only built while they can still beat the current best score.
+  - Made intersection route ordering locality-aware: extra balls and true
+    shared-origin intersections are bonuses, but nearby safe pickups can beat
+    farther stations that collect more balls.
+  - Added `intersection-nearest` and `intersection-optimal` visualizer
+    strategies.
+    - Both use a shared-node candidate set made from true multi-ball pickup
+      ring intersections plus bounded fallback nodes for balls with no shared
+      intersection.
+    - `intersection-nearest` greedily chooses the nearest safe next shared node
+      with no collection-count priority.
+    - `intersection-optimal` runs an exact shortest-route search over a
+      deduplicated shared-node search space, including the unload leg when
+      present.
+  - Made all pickup visualizer route strategies enforce reachable orange balls
+    as the first pickup.
+    - Shared-origin stations now order their per-ball pickup actions with
+      orange first.
+    - The set-cover strategy now preserves per-ball pickup poses at shared
+      origins so action ordering is deterministic there too.
+  - Added a shared first-leg escape path for ball-aware route strategies.
+    - If the start pose is already inside an active ball danger zone, the first
+      route edge may move monotonically out of that zone instead of treating the
+      route as impossible.
+    - Initial edges can fall back to a coarse global A* detour when the local
+      visibility detour cannot find a path to the first orange pickup.
+  - Changed the pickup visualizer's route collision radius from tube reach to
+    the robot footprint half-width; pickup rings still use tube reach.
 
 ## 2026-06-15
 

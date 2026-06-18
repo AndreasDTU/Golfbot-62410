@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from heapq import heappop, heappush
 from itertools import permutations
 
-from path.pathfinding.models import HybridPose, RoutePlan, RouteSegmentType
+from path.pathfinding.models import HybridPose, RoutePlan
 from path.pickup_geometry import PickupGeometryResult, PickupPose
 from path.route_strategy import (
     CoverPoint,
@@ -24,11 +25,42 @@ from path.route_strategy import (
 # ---------------------------------------------------------------------------
 
 QUANTIZE_PRECISION = 10  # 1 / 0.1 cm
+INTERSECTION_EXTRA_BALL_BONUS_CM = 12.0
+INTERSECTION_SHARED_ORIGIN_BONUS_CM = 4.0
+INTERSECTION_REACH_OFFSET_PENALTY = 0.25
+ISOLATED_BALL_FALLBACK_CANDIDATES = 6
+INTERSECTION_OPTIMAL_CANDIDATES_PER_MASK = 1
 
 
 def _quantize(x: float, y: float) -> tuple[int, int]:
     """Snap a position to 0.1 cm grid for grouping."""
     return (round(x * QUANTIZE_PRECISION), round(y * QUANTIZE_PRECISION))
+
+
+def _orange_ball_indices(geometry_result: PickupGeometryResult) -> tuple[int, ...]:
+    """Return reachable orange-ball indices, preserving detection order."""
+    return tuple(
+        index for index, ball in enumerate(geometry_result.balls)
+        if ball.reachable and ball.label.strip().lower() == "orange"
+    )
+
+
+def _sort_ball_indices_orange_first(
+    geometry_result: PickupGeometryResult,
+    indices: set[int] | tuple[int, ...] | list[int],
+) -> tuple[int, ...]:
+    """Sort ball indices with orange balls first, then stable numeric order."""
+    orange = set(_orange_ball_indices(geometry_result))
+    return tuple(sorted(indices, key=lambda index: (index not in orange, index)))
+
+
+def _covers_orange(
+    geometry_result: PickupGeometryResult,
+    indices: set[int] | tuple[int, ...] | list[int],
+) -> bool:
+    """Return whether a set of ball indices includes a reachable orange ball."""
+    orange = set(_orange_ball_indices(geometry_result))
+    return any(index in orange for index in indices)
 
 
 @dataclass(frozen=True)
@@ -428,6 +460,25 @@ def _segment_hits_any_ball_obstacle(
     )
 
 
+def _segment_exits_ball_obstacle(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    obstacle: BallObstacle,
+) -> bool:
+    """Return whether a segment moves monotonically out of a start-owned ball zone."""
+    if not _point_inside_ball_obstacle(p0[0], p0[1], obstacle):
+        return False
+    d0 = _dist(p0[0], p0[1], obstacle.x_cm, obstacle.y_cm)
+    d1 = _dist(p1[0], p1[1], obstacle.x_cm, obstacle.y_cm)
+    if d1 < d0 - 1e-9:
+        return False
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+    cx = obstacle.x_cm - p0[0]
+    cy = obstacle.y_cm - p0[1]
+    return (dx * cx + dy * cy) <= 1e-9
+
+
 def _find_detour_path(
     x0: float, y0: float, x1: float, y1: float,
     obs: ObstacleGeometry, R: float,
@@ -502,13 +553,136 @@ def _segment_valid_with_ball_obstacles(
     obs: ObstacleGeometry,
     robot_radius_cm: float,
     ball_obstacles: tuple[BallObstacle, ...],
+    escape_obstacles: tuple[BallObstacle, ...] = (),
 ) -> bool:
     """Return whether a segment clears the cross and all active balls."""
     if not _polyline_clears_inflated_cross((p0, p1), obs, robot_radius_cm):
         return False
-    if _segment_hits_any_ball_obstacle(p0[0], p0[1], p1[0], p1[1], ball_obstacles):
-        return False
+    escape_indices = {obstacle.ball_index for obstacle in escape_obstacles}
+    for obstacle in ball_obstacles:
+        if obstacle.ball_index in escape_indices and _segment_exits_ball_obstacle(
+            p0, p1, obstacle,
+        ):
+            continue
+        if _segment_hits_ball_obstacle(p0[0], p0[1], p1[0], p1[1], obstacle):
+            return False
     return True
+
+
+def _find_grid_detour_path_with_ball_obstacles(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    obs: ObstacleGeometry,
+    robot_radius_cm: float,
+    field_w: float,
+    field_h: float,
+    ball_obstacles: tuple[BallObstacle, ...],
+    escape_obstacles: tuple[BallObstacle, ...],
+    resolution_cm: float = 4.0,
+    max_expansions: int = 5000,
+) -> tuple[tuple[float, float], ...] | None:
+    """Find a coarse global detour path for the first leg when local visibility fails."""
+    if not _point_inside_field(x0, y0, field_w, field_h, robot_radius_cm):
+        return None
+    if not _point_inside_field(x1, y1, field_w, field_h, robot_radius_cm):
+        return None
+
+    def to_cell(x_cm: float, y_cm: float) -> tuple[int, int]:
+        return (round(x_cm / resolution_cm), round(y_cm / resolution_cm))
+
+    def to_point(cell: tuple[int, int]) -> tuple[float, float]:
+        return (
+            min(field_w - robot_radius_cm, max(robot_radius_cm, cell[0] * resolution_cm)),
+            min(field_h - robot_radius_cm, max(robot_radius_cm, cell[1] * resolution_cm)),
+        )
+
+    start_cell = to_cell(x0, y0)
+    end_cell = to_cell(x1, y1)
+    open_heap: list[tuple[float, float, tuple[int, int]]] = []
+    heappush(open_heap, (_dist(x0, y0, x1, y1), 0.0, start_cell))
+    best_cost: dict[tuple[int, int], float] = {start_cell: 0.0}
+    previous: dict[tuple[int, int], tuple[int, int]] = {}
+    visited: set[tuple[int, int]] = set()
+    max_x = math.ceil(field_w / resolution_cm)
+    max_y = math.ceil(field_h / resolution_cm)
+    neighbor_steps = (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    )
+
+    expansions = 0
+    while open_heap and expansions < max_expansions:
+        _priority, cost, cell = heappop(open_heap)
+        if cell in visited:
+            continue
+        visited.add(cell)
+        expansions += 1
+        if cell == end_cell:
+            break
+
+        p0 = (x0, y0) if cell == start_cell else to_point(cell)
+        for dx, dy in neighbor_steps:
+            neighbor = (cell[0] + dx, cell[1] + dy)
+            if not (0 <= neighbor[0] <= max_x and 0 <= neighbor[1] <= max_y):
+                continue
+            p1 = (x1, y1) if neighbor == end_cell else to_point(neighbor)
+            if not _point_inside_field(p1[0], p1[1], field_w, field_h, robot_radius_cm):
+                continue
+            if not _segment_valid_with_ball_obstacles(
+                p0,
+                p1,
+                obs,
+                robot_radius_cm,
+                ball_obstacles,
+                escape_obstacles,
+            ):
+                continue
+            next_cost = cost + _dist(p0[0], p0[1], p1[0], p1[1])
+            if next_cost >= best_cost.get(neighbor, math.inf):
+                continue
+            best_cost[neighbor] = next_cost
+            previous[neighbor] = cell
+            heuristic = _dist(p1[0], p1[1], x1, y1)
+            heappush(open_heap, (next_cost + heuristic, next_cost, neighbor))
+
+    if end_cell not in best_cost:
+        return None
+
+    cells: list[tuple[int, int]] = []
+    current = end_cell
+    while current != start_cell:
+        cells.append(current)
+        current = previous[current]
+    cells.append(start_cell)
+    cells.reverse()
+
+    points = [
+        (x0, y0) if cell == start_cell else (x1, y1) if cell == end_cell else to_point(cell)
+        for cell in cells
+    ]
+
+    simplified: list[tuple[float, float]] = [points[0]]
+    index = 0
+    while index < len(points) - 1:
+        best_next = index + 1
+        for candidate_index in range(len(points) - 1, index, -1):
+            if _segment_valid_with_ball_obstacles(
+                simplified[-1],
+                points[candidate_index],
+                obs,
+                robot_radius_cm,
+                ball_obstacles,
+                escape_obstacles,
+            ):
+                best_next = candidate_index
+                break
+        simplified.append(points[best_next])
+        index = best_next
+
+    return tuple(simplified[1:-1])
 
 
 def _find_detour_path_with_ball_obstacles(
@@ -521,6 +695,7 @@ def _find_detour_path_with_ball_obstacles(
     field_w: float,
     field_h: float,
     ball_obstacles: tuple[BallObstacle, ...],
+    allow_start_ball_escape: bool = False,
 ) -> tuple[tuple[float, float], ...] | None:
     """Find a detour path that clears the cross and active ball obstacles."""
     direct_raw_blocked = (
@@ -530,7 +705,11 @@ def _find_detour_path_with_ball_obstacles(
     if not direct_raw_blocked:
         return ()
 
-    if _point_inside_any_ball_obstacle(x0, y0, ball_obstacles):
+    start_escape_obstacles = tuple(
+        obstacle for obstacle in ball_obstacles
+        if _point_inside_ball_obstacle(x0, y0, obstacle)
+    )
+    if start_escape_obstacles and not allow_start_ball_escape:
         return None
     if _point_inside_any_ball_obstacle(x1, y1, ball_obstacles):
         return None
@@ -578,8 +757,9 @@ def _find_detour_path_with_ball_obstacles(
                 continue
             p0 = nodes[current]
             p1 = nodes[neighbor]
+            escape_obstacles = start_escape_obstacles if current == start_idx else ()
             if not _segment_valid_with_ball_obstacles(
-                p0, p1, obs, robot_radius_cm, ball_obstacles,
+                p0, p1, obs, robot_radius_cm, ball_obstacles, escape_obstacles,
             ):
                 continue
             candidate_dist = distances[current] + _dist(p0[0], p0[1], p1[0], p1[1])
@@ -588,6 +768,19 @@ def _find_detour_path_with_ball_obstacles(
                 previous[neighbor] = current
 
     if not math.isfinite(distances[end_idx]):
+        if allow_start_ball_escape:
+            return _find_grid_detour_path_with_ball_obstacles(
+                x0,
+                y0,
+                x1,
+                y1,
+                obs,
+                robot_radius_cm,
+                field_w,
+                field_h,
+                ball_obstacles,
+                start_escape_obstacles,
+            )
         return None
 
     path_indices: list[int] = []
@@ -658,23 +851,21 @@ def _greedy_set_cover(
     """
     balls = geometry_result.balls
 
-    # Build inverse map: quantized position -> (PickupPose, set of ball indices)
-    # For each position, keep the "best" PickupPose (prefer reach_offset == 0).
-    pos_map: dict[tuple[int, int], tuple[PickupPose, set[int]]] = {}
+    # Build inverse map: quantized position -> per-ball best pickup pose.
+    pos_map: dict[tuple[int, int], dict[int, PickupPose]] = {}
 
     for ball_idx, ball in enumerate(balls):
         if not ball.reachable:
             continue
         for pose in ball.valid_points:
             key = _quantize(pose.x_cm, pose.y_cm)
-            if key in pos_map:
-                existing_pose, indices = pos_map[key]
-                indices.add(ball_idx)
-                # Prefer exact-ring pose
-                if pose.reach_offset_cm == 0.0 and existing_pose.reach_offset_cm != 0.0:
-                    pos_map[key] = (pose, indices)
-            else:
-                pos_map[key] = (pose, {ball_idx})
+            by_ball = pos_map.setdefault(key, {})
+            existing_pose = by_ball.get(ball_idx)
+            if (
+                existing_pose is None
+                or abs(pose.reach_offset_cm) < abs(existing_pose.reach_offset_cm)
+            ):
+                by_ball[ball_idx] = pose
 
     uncovered: set[int] = {
         i for i, b in enumerate(balls) if b.reachable
@@ -686,9 +877,13 @@ def _greedy_set_cover(
         best_count = 0
         best_exact = False
 
-        for key, (pose, indices) in pos_map.items():
+        for key, poses_by_ball in pos_map.items():
+            indices = set(poses_by_ball)
             overlap = len(indices & uncovered)
-            exact = pose.reach_offset_cm == 0.0
+            exact = any(
+                poses_by_ball[index].reach_offset_cm == 0.0
+                for index in indices & uncovered
+            )
             if overlap > best_count or (overlap == best_count and exact and not best_exact):
                 best_key = key
                 best_count = overlap
@@ -697,19 +892,27 @@ def _greedy_set_cover(
         if best_key is None or best_count == 0:
             break
 
-        pose, indices = pos_map[best_key]
-        covered = tuple(sorted(indices & uncovered))
-
-        # Create one HybridPose that will be reused by identity in the RoutePlan.
-        hybrid = HybridPose(
-            x_cm=pose.x_cm,
-            y_cm=pose.y_cm,
-            theta_rad=pose.theta_rad,
+        poses_by_ball = pos_map[best_key]
+        indices = set(poses_by_ball)
+        covered = _sort_ball_indices_orange_first(
+            geometry_result,
+            indices & uncovered,
         )
+        pickup_poses = tuple(
+            HybridPose(
+                x_cm=poses_by_ball[index].x_cm,
+                y_cm=poses_by_ball[index].y_cm,
+                theta_rad=poses_by_ball[index].theta_rad,
+            )
+            for index in covered
+        )
+        source_pickup = poses_by_ball[covered[0]]
+
         cover_points.append(CoverPoint(
-            pose=hybrid,
-            source_pickup=pose,
+            pose=pickup_poses[0],
+            source_pickup=source_pickup,
             covered_ball_indices=covered,
+            pickup_poses=pickup_poses,
         ))
         uncovered -= indices
 
@@ -785,6 +988,123 @@ def _intersection_station_candidates(
     return list(candidates_by_origin.values())
 
 
+def _spread_pickup_poses(
+    poses: tuple[PickupPose, ...],
+    max_count: int,
+) -> tuple[PickupPose, ...]:
+    """Return a deterministic spread of pickup poses around one ball."""
+    if len(poses) <= max_count:
+        return tuple(sorted(poses, key=lambda pose: (abs(pose.reach_offset_cm), pose.theta_rad)))
+
+    min_offset = min(abs(pose.reach_offset_cm) for pose in poses)
+    best_ring = sorted(
+        (pose for pose in poses if abs(abs(pose.reach_offset_cm) - min_offset) <= 1e-9),
+        key=lambda pose: pose.theta_rad,
+    )
+    source = best_ring if len(best_ring) >= max_count else sorted(
+        poses,
+        key=lambda pose: (abs(pose.reach_offset_cm), pose.theta_rad),
+    )
+    if len(source) <= max_count:
+        return tuple(source)
+
+    selected: list[PickupPose] = []
+    used: set[int] = set()
+    for i in range(max_count):
+        index = round(i * (len(source) - 1) / (max_count - 1))
+        while index in used and index + 1 < len(source):
+            index += 1
+        while index in used and index > 0:
+            index -= 1
+        used.add(index)
+        selected.append(source[index])
+    return tuple(selected)
+
+
+def _shared_node_station_candidates(
+    geometry_result: PickupGeometryResult,
+) -> list[StationCandidate]:
+    """Generate multi-ball intersection nodes plus bounded isolated-ball fallbacks."""
+    candidates_by_origin: dict[tuple[int, int], StationCandidate] = {}
+    balls = geometry_result.balls
+    R = geometry_result.ring_radius_cm
+
+    def add_candidate(candidate: StationCandidate | None) -> None:
+        if candidate is None or len(candidate.covered_ball_indices) < 2:
+            return
+        key = _quantize(candidate.x_cm, candidate.y_cm)
+        current = candidates_by_origin.get(key)
+        if _better_candidate(candidate, current):
+            candidates_by_origin[key] = candidate
+
+    for i, a in enumerate(balls):
+        if not a.reachable:
+            continue
+        for j in range(i + 1, len(balls)):
+            b = balls[j]
+            if not b.reachable:
+                continue
+            for x_cm, y_cm in _circle_intersections(
+                a.ball_x_cm, a.ball_y_cm, b.ball_x_cm, b.ball_y_cm, R,
+            ):
+                add_candidate(
+                    _candidate_from_origin(
+                        geometry_result,
+                        x_cm,
+                        y_cm,
+                        from_ring_intersection=True,
+                    )
+                )
+
+    shared_candidates = list(candidates_by_origin.values())
+    shared_covered = {
+        ball_idx
+        for candidate in shared_candidates
+        for ball_idx in candidate.covered_ball_indices
+    }
+
+    fallback_candidates_by_origin: dict[tuple[int, int], StationCandidate] = {}
+    for ball_idx, ball in enumerate(balls):
+        if not ball.reachable or ball_idx in shared_covered:
+            continue
+        for pose in _spread_pickup_poses(
+            ball.valid_points,
+            ISOLATED_BALL_FALLBACK_CANDIDATES,
+        ):
+            candidate = _candidate_from_origin(
+                geometry_result,
+                pose.x_cm,
+                pose.y_cm,
+                from_ring_intersection=False,
+            )
+            if candidate is None:
+                continue
+            key = _quantize(candidate.x_cm, candidate.y_cm)
+            current = fallback_candidates_by_origin.get(key)
+            if _better_candidate(candidate, current):
+                fallback_candidates_by_origin[key] = candidate
+
+    return [
+        *sorted(
+            shared_candidates,
+            key=lambda candidate: (
+                candidate.x_cm,
+                candidate.y_cm,
+                candidate.total_abs_reach_offset_cm,
+            ),
+        ),
+        *sorted(
+            fallback_candidates_by_origin.values(),
+            key=lambda candidate: (
+                min(candidate.covered_ball_indices),
+                candidate.total_abs_reach_offset_cm,
+                candidate.x_cm,
+                candidate.y_cm,
+            ),
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Graph + nearest-neighbor
 # ---------------------------------------------------------------------------
@@ -852,6 +1172,7 @@ def _build_edge_with_ball_obstacles(
     field_w: float,
     field_h: float,
     ball_obstacles: tuple[BallObstacle, ...],
+    allow_start_ball_escape: bool = False,
 ) -> RouteEdge:
     """Build one edge using hard active ball obstacles plus the cross."""
     x0, y0 = from_pose.x_cm, from_pose.y_cm
@@ -867,12 +1188,36 @@ def _build_edge_with_ball_obstacles(
             obs, robot_radius_cm,
             field_w, field_h,
             ball_obstacles,
+            allow_start_ball_escape=allow_start_ball_escape,
         )
     return _edge_from_detour_path(
         from_index, to_index,
         x0, y0, x1, y1,
         direct_blocked,
         detour_path,
+    )
+
+
+def _build_strategy_edge_with_ball_obstacles(
+    inp: RoutePlannerInput,
+    from_index: int,
+    to_index: int,
+    from_pose: HybridPose,
+    to_pose: HybridPose,
+    ball_obstacles: tuple[BallObstacle, ...],
+) -> RouteEdge:
+    """Build a strategy edge, allowing only the real first leg to escape start zones."""
+    return _build_edge_with_ball_obstacles(
+        from_index,
+        to_index,
+        from_pose,
+        to_pose,
+        inp.obstacle,
+        inp.robot_radius_cm,
+        inp.field_width_cm,
+        inp.field_height_cm,
+        ball_obstacles,
+        allow_start_ball_escape=from_index == 0,
     )
 
 
@@ -917,6 +1262,24 @@ def _nearest_neighbor_order(
     return order
 
 
+def _force_orange_first_order(
+    geometry_result: PickupGeometryResult,
+    cover_points: list[CoverPoint],
+    ordered_indices: list[int],
+) -> list[int]:
+    """Move the first orange-covering stop to the front when orange is reachable."""
+    if not _orange_ball_indices(geometry_result):
+        return ordered_indices
+    for order_pos, cover_idx in enumerate(ordered_indices):
+        if _covers_orange(geometry_result, cover_points[cover_idx].covered_ball_indices):
+            return [
+                cover_idx,
+                *ordered_indices[:order_pos],
+                *ordered_indices[order_pos + 1:],
+            ]
+    return ordered_indices
+
+
 # ---------------------------------------------------------------------------
 # RoutePlan assembly
 # ---------------------------------------------------------------------------
@@ -942,7 +1305,6 @@ def _assemble_route_plan(
     """
     points: list[HybridPose] = [start_pose]
     pickup_poses: list[HybridPose] = []
-    segment_types: list[RouteSegmentType] = []
 
     def append_edge_detour(edge: RouteEdge | None) -> None:
         if edge is None or not edge.blocked:
@@ -952,7 +1314,6 @@ def _assemble_route_plan(
             detour_points = (edge.detour_waypoint,)
         for waypoint in detour_points:
             points.append(waypoint)
-            segment_types.append(RouteSegmentType.TRANSIT)
 
     prev_graph = 0  # start node
     for cover_idx in ordered_indices:
@@ -963,11 +1324,8 @@ def _assemble_route_plan(
 
         cp = cover_points[cover_idx]
         station_pickup_poses = cp.pickup_poses or (cp.pose,)
-        for pickup_index, pickup_pose in enumerate(station_pickup_poses):
+        for pickup_pose in station_pickup_poses:
             points.append(pickup_pose)
-            segment_types.append(
-                RouteSegmentType.CREEP if pickup_index == 0 else RouteSegmentType.PIVOT
-            )
             pickup_poses.append(pickup_pose)
 
         prev_graph = graph_idx
@@ -977,27 +1335,32 @@ def _assemble_route_plan(
         edge = edges.get((prev_graph, unload_graph_index))
         append_edge_detour(edge)
         points.append(unload_pose)
-        segment_types.append(RouteSegmentType.TRANSIT)
 
     return RoutePlan(
         points=points,
-        active_target=None,
         pickup_poses=pickup_poses,
         unload_pose=unload_pose,
         unload_goal_cm=unload_goal_cm,
-        segment_types=segment_types,
     )
 
 
 def _cover_point_from_station_candidate(
+    geometry_result: PickupGeometryResult,
     candidate: StationCandidate,
     uncovered: set[int],
 ) -> CoverPoint | None:
     """Convert a station candidate into a CoverPoint for the remaining balls."""
-    pickup_pairs = tuple(
-        (ball_idx, pose)
+    poses_by_ball = {
+        ball_idx: pose
         for ball_idx, pose in candidate.pickup_poses_by_ball
         if ball_idx in uncovered
+    }
+    pickup_pairs = tuple(
+        (ball_idx, poses_by_ball[ball_idx])
+        for ball_idx in _sort_ball_indices_orange_first(
+            geometry_result,
+            tuple(poses_by_ball),
+        )
     )
     if not pickup_pairs:
         return None
@@ -1011,12 +1374,488 @@ def _cover_point_from_station_candidate(
     )
 
 
+def _intersection_candidate_score(
+    travel_distance_cm: float,
+    candidate: StationCandidate,
+    covered_count: int,
+) -> float:
+    """Score an intersection route candidate, keeping travel distance dominant."""
+    extra_ball_count = max(0, covered_count - 1)
+    score = travel_distance_cm
+    score -= extra_ball_count * INTERSECTION_EXTRA_BALL_BONUS_CM
+    if covered_count > 1 and candidate.from_ring_intersection:
+        score -= INTERSECTION_SHARED_ORIGIN_BONUS_CM
+    score += (
+        candidate.total_abs_reach_offset_cm
+        * INTERSECTION_REACH_OFFSET_PENALTY
+    )
+    return score
+
+
+def _reachable_ball_mask(geometry_result: PickupGeometryResult) -> int:
+    """Return a bit mask for every reachable ball."""
+    mask = 0
+    for ball_idx, ball in enumerate(geometry_result.balls):
+        if ball.reachable:
+            mask |= 1 << ball_idx
+    return mask
+
+
+def _candidate_ball_mask(candidate: StationCandidate) -> int:
+    """Return the full ball coverage mask for one station candidate."""
+    mask = 0
+    for ball_idx in candidate.covered_ball_indices:
+        mask |= 1 << ball_idx
+    return mask
+
+
+def _mask_to_indices(mask: int) -> set[int]:
+    """Convert a ball bit mask into a set of ball indices."""
+    indices: set[int] = set()
+    ball_idx = 0
+    while mask:
+        if mask & 1:
+            indices.add(ball_idx)
+        mask >>= 1
+        ball_idx += 1
+    return indices
+
+
+def _station_candidate_pose(candidate: StationCandidate) -> HybridPose:
+    """Return a pose at the candidate origin for distance-only search edges."""
+    return HybridPose(
+        x_cm=candidate.x_cm,
+        y_cm=candidate.y_cm,
+        theta_rad=candidate.source_pickup.theta_rad,
+    )
+
+
+def _build_route_from_candidate_sequence(
+    inp: RoutePlannerInput,
+    sequence: list[StationCandidate],
+) -> RouteStrategyResult:
+    """Assemble a RouteStrategyResult from an already chosen candidate sequence."""
+    uncovered: set[int] = {
+        i for i, b in enumerate(inp.geometry_result.balls) if b.reachable
+    }
+    cover_points: list[CoverPoint] = []
+    ordered: list[int] = []
+    edges: dict[tuple[int, int], RouteEdge] = {}
+    current_pose = inp.start_pose
+    current_graph = 0
+
+    for candidate in sequence:
+        cover_point = _cover_point_from_station_candidate(
+            inp.geometry_result,
+            candidate,
+            uncovered,
+        )
+        if cover_point is None:
+            continue
+        covered = set(cover_point.covered_ball_indices)
+        next_graph = len(cover_points) + 1
+        active_obstacles = _ball_obstacles_for_indices(
+            inp.geometry_result,
+            uncovered - covered,
+            inp.robot_radius_cm,
+        )
+        edge = _build_strategy_edge_with_ball_obstacles(
+            inp,
+            current_graph,
+            next_graph,
+            current_pose,
+            cover_point.pose,
+            active_obstacles,
+        )
+        if not math.isfinite(edge.total_distance_cm):
+            break
+
+        cover_points.append(cover_point)
+        ordered.append(len(cover_points) - 1)
+        edges[(edge.from_index, edge.to_index)] = edge
+        uncovered -= covered
+        current_pose = cover_point.pose
+        current_graph = edge.to_index
+
+    unload_graph_index: int | None = None
+    if inp.unload_pose is not None:
+        unload_graph_index = len(cover_points) + 1
+        active_obstacles = _ball_obstacles_for_indices(
+            inp.geometry_result,
+            uncovered,
+            inp.robot_radius_cm,
+        )
+        unload_edge = _build_strategy_edge_with_ball_obstacles(
+            inp,
+            current_graph,
+            unload_graph_index,
+            current_pose,
+            inp.unload_pose,
+            active_obstacles,
+        )
+        edges[(unload_edge.from_index, unload_edge.to_index)] = unload_edge
+
+    route_plan = _assemble_route_plan(
+        inp.start_pose,
+        cover_points,
+        ordered,
+        edges,
+        unload_pose=inp.unload_pose,
+        unload_goal_cm=inp.unload_goal_cm,
+        unload_graph_index=unload_graph_index,
+    )
+    return RouteStrategyResult(
+        cover_points=tuple(cover_points),
+        ordered_indices=tuple(ordered),
+        edges=tuple(edges.values()),
+        route_plan=route_plan,
+    )
+
+
+def _route_strategy_total_distance(result: RouteStrategyResult) -> float:
+    """Return total distance along a strategy result's selected route edges."""
+    edge_by_nodes = {
+        (edge.from_index, edge.to_index): edge
+        for edge in result.edges
+    }
+    total = 0.0
+    prev_graph = 0
+    for cover_idx in result.ordered_indices:
+        graph_idx = cover_idx + 1
+        edge = edge_by_nodes.get((prev_graph, graph_idx))
+        if edge is None:
+            return math.inf
+        total += edge.total_distance_cm
+        prev_graph = graph_idx
+    if result.route_plan.unload_pose is not None:
+        unload_edges = [
+            edge for edge in result.edges
+            if edge.from_index == prev_graph
+            and edge.to_index > len(result.cover_points)
+        ]
+        if len(unload_edges) != 1:
+            return math.inf
+        total += unload_edges[0].total_distance_cm
+    return total
+
+
+def _candidate_sequence_mask(sequence: list[StationCandidate]) -> int:
+    """Return all balls covered by a candidate sequence."""
+    mask = 0
+    for candidate in sequence:
+        mask |= _candidate_ball_mask(candidate)
+    return mask
+
+
+def _prune_candidates_for_optimal_search(
+    inp: RoutePlannerInput,
+    candidates: list[StationCandidate],
+    full_mask: int,
+) -> list[StationCandidate]:
+    """Bound duplicate same-coverage candidates for the exact route search."""
+    by_mask: dict[int, list[StationCandidate]] = {}
+    for candidate in candidates:
+        mask = _candidate_ball_mask(candidate) & full_mask
+        if mask == 0:
+            continue
+        by_mask.setdefault(mask, []).append(candidate)
+
+    anchors = [inp.start_pose]
+    if inp.unload_pose is not None:
+        anchors.append(inp.unload_pose)
+
+    selected: list[StationCandidate] = []
+    for mask in sorted(by_mask):
+        mask_candidates = by_mask[mask]
+        if len(mask_candidates) <= INTERSECTION_OPTIMAL_CANDIDATES_PER_MASK:
+            selected.extend(mask_candidates)
+            continue
+
+        chosen: list[StationCandidate] = []
+        for anchor in anchors:
+            if len(chosen) >= INTERSECTION_OPTIMAL_CANDIDATES_PER_MASK:
+                break
+            best = min(
+                mask_candidates,
+                key=lambda candidate: (
+                    _dist(anchor.x_cm, anchor.y_cm, candidate.x_cm, candidate.y_cm),
+                    candidate.total_abs_reach_offset_cm,
+                    candidate.x_cm,
+                    candidate.y_cm,
+                ),
+            )
+            if best not in chosen:
+                chosen.append(best)
+
+        for candidate in sorted(
+            mask_candidates,
+            key=lambda item: (
+                item.total_abs_reach_offset_cm,
+                item.x_cm,
+                item.y_cm,
+            ),
+        ):
+            if len(chosen) >= INTERSECTION_OPTIMAL_CANDIDATES_PER_MASK:
+                break
+            if candidate not in chosen:
+                chosen.append(candidate)
+        selected.extend(chosen)
+
+    return selected
+
+
+def _intersection_nearest_candidate_sequence(
+    inp: RoutePlannerInput,
+    candidates: list[StationCandidate],
+) -> list[StationCandidate]:
+    """Choose shared-node candidates by nearest safe edge."""
+    uncovered: set[int] = {
+        i for i, b in enumerate(inp.geometry_result.balls) if b.reachable
+    }
+    sequence: list[StationCandidate] = []
+    current_pose = inp.start_pose
+    orange = set(_orange_ball_indices(inp.geometry_result))
+
+    while uncovered:
+        best_candidate: StationCandidate | None = None
+        best_cover_point: CoverPoint | None = None
+        best_key: tuple[float, float, float, float] | None = None
+        require_orange = not sequence and bool(orange & uncovered)
+
+        for candidate in candidates:
+            cover_point = _cover_point_from_station_candidate(
+                inp.geometry_result,
+                candidate,
+                uncovered,
+            )
+            if cover_point is None:
+                continue
+            covered = set(cover_point.covered_ball_indices)
+            if require_orange and not covered & orange:
+                continue
+            active_obstacles = _ball_obstacles_for_indices(
+                inp.geometry_result,
+                uncovered - covered,
+                inp.robot_radius_cm,
+            )
+            edge = _build_strategy_edge_with_ball_obstacles(
+                inp,
+                0 if not sequence else 1,
+                1,
+                current_pose,
+                cover_point.pose,
+                active_obstacles,
+            )
+            if not math.isfinite(edge.total_distance_cm):
+                continue
+            key = (
+                edge.total_distance_cm,
+                candidate.total_abs_reach_offset_cm,
+                candidate.x_cm,
+                candidate.y_cm,
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_candidate = candidate
+                best_cover_point = cover_point
+
+        if best_candidate is None or best_cover_point is None:
+            break
+
+        sequence.append(best_candidate)
+        uncovered -= set(best_cover_point.covered_ball_indices)
+        current_pose = best_cover_point.pose
+
+    return sequence
+
+
+def _plan_intersection_nearest_route(inp: RoutePlannerInput) -> RouteStrategyResult:
+    """Build a route by nearest-first traversal of shared pickup nodes."""
+    candidates = _shared_node_station_candidates(inp.geometry_result)
+    sequence = _intersection_nearest_candidate_sequence(inp, candidates)
+    return _build_route_from_candidate_sequence(inp, sequence)
+
+
+def _plan_intersection_optimal_route(inp: RoutePlannerInput) -> RouteStrategyResult:
+    """Find the shortest safe route through the shared-node candidate space."""
+    candidates = _shared_node_station_candidates(inp.geometry_result)
+    if not candidates:
+        return _build_route_from_candidate_sequence(inp, [])
+
+    full_mask = _reachable_ball_mask(inp.geometry_result)
+    candidates = _prune_candidates_for_optimal_search(inp, candidates, full_mask)
+    candidate_masks = [
+        _candidate_ball_mask(candidate) & full_mask
+        for candidate in candidates
+    ]
+    orange_mask = 0
+    for ball_idx in _orange_ball_indices(inp.geometry_result):
+        orange_mask |= 1 << ball_idx
+    candidate_poses = [
+        _station_candidate_pose(candidate)
+        for candidate in candidates
+    ]
+    incumbent_sequence = _intersection_nearest_candidate_sequence(inp, candidates)
+    incumbent_result = _build_route_from_candidate_sequence(inp, incumbent_sequence)
+    incumbent_mask = _candidate_sequence_mask(incumbent_sequence) & full_mask
+    if incumbent_mask == full_mask:
+        best_terminal_cost = _route_strategy_total_distance(incumbent_result)
+    else:
+        best_terminal_cost = math.inf
+
+    start_state = (0, -1)
+    best_cost: dict[tuple[int, int], float] = {start_state: 0.0}
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    heap: list[tuple[float, int, int]] = [(0.0, 0, -1)]
+    edge_cache: dict[tuple[int, int, int], float] = {}
+    unload_cache: dict[tuple[int, int], float] = {}
+    obstacle_cache: dict[int, tuple[BallObstacle, ...]] = {}
+    best_terminal_state: tuple[int, int] | None = None
+    best_partial_state = start_state
+    best_partial_key = (0, -0.0)
+
+    def pose_for_position(position_idx: int) -> HybridPose:
+        if position_idx < 0:
+            return inp.start_pose
+        return candidate_poses[position_idx]
+
+    def obstacles_for_mask(active_mask: int) -> tuple[BallObstacle, ...]:
+        cached = obstacle_cache.get(active_mask)
+        if cached is not None:
+            return cached
+        obstacles = _ball_obstacles_for_indices(
+            inp.geometry_result,
+            _mask_to_indices(active_mask),
+            inp.robot_radius_cm,
+        )
+        obstacle_cache[active_mask] = obstacles
+        return obstacles
+
+    def edge_distance(from_idx: int, to_idx: int, active_mask: int) -> float:
+        key = (from_idx, to_idx, active_mask)
+        cached = edge_cache.get(key)
+        if cached is not None:
+            return cached
+        edge = _build_edge_with_ball_obstacles(
+            0,
+            1,
+            pose_for_position(from_idx),
+            candidate_poses[to_idx],
+            inp.obstacle,
+            inp.robot_radius_cm,
+            inp.field_width_cm,
+            inp.field_height_cm,
+            obstacles_for_mask(active_mask),
+            allow_start_ball_escape=from_idx < 0,
+        )
+        edge_cache[key] = edge.total_distance_cm
+        return edge.total_distance_cm
+
+    def unload_distance(from_idx: int, active_mask: int) -> float:
+        if inp.unload_pose is None:
+            return 0.0
+        key = (from_idx, active_mask)
+        cached = unload_cache.get(key)
+        if cached is not None:
+            return cached
+        edge = _build_edge_with_ball_obstacles(
+            0,
+            1,
+            pose_for_position(from_idx),
+            inp.unload_pose,
+            inp.obstacle,
+            inp.robot_radius_cm,
+            inp.field_width_cm,
+            inp.field_height_cm,
+            obstacles_for_mask(active_mask),
+            allow_start_ball_escape=from_idx < 0,
+        )
+        unload_cache[key] = edge.total_distance_cm
+        return edge.total_distance_cm
+
+    while heap:
+        cost, mask, position_idx = heappop(heap)
+        state = (mask, position_idx)
+        if cost != best_cost.get(state):
+            continue
+        if cost >= best_terminal_cost:
+            break
+
+        partial_key = (mask.bit_count(), -cost)
+        if partial_key > best_partial_key:
+            best_partial_key = partial_key
+            best_partial_state = state
+
+        if mask == full_mask:
+            if inp.unload_pose is not None:
+                direct_unload = _dist(
+                    pose_for_position(position_idx).x_cm,
+                    pose_for_position(position_idx).y_cm,
+                    inp.unload_pose.x_cm,
+                    inp.unload_pose.y_cm,
+                )
+                if cost + direct_unload >= best_terminal_cost:
+                    continue
+            terminal = cost + unload_distance(position_idx, 0)
+            if terminal < best_terminal_cost:
+                best_terminal_cost = terminal
+                best_terminal_state = state
+            continue
+
+        for next_idx, candidate_mask in enumerate(candidate_masks):
+            added_mask = candidate_mask & ~mask
+            if added_mask == 0:
+                continue
+            if mask == 0 and orange_mask and not candidate_mask & orange_mask:
+                continue
+            next_mask = mask | candidate_mask
+            active_mask = full_mask & ~next_mask
+            from_pose = pose_for_position(position_idx)
+            to_pose = candidate_poses[next_idx]
+            direct_lower_bound = _dist(
+                from_pose.x_cm, from_pose.y_cm,
+                to_pose.x_cm, to_pose.y_cm,
+            )
+            if cost + direct_lower_bound >= best_terminal_cost:
+                continue
+            distance = edge_distance(position_idx, next_idx, active_mask)
+            if not math.isfinite(distance):
+                continue
+            next_cost = cost + distance
+            next_state = (next_mask, next_idx)
+            if next_cost < best_cost.get(next_state, math.inf):
+                best_cost[next_state] = next_cost
+                parent[next_state] = state
+                heappush(heap, (next_cost, next_mask, next_idx))
+
+    if best_terminal_state is None:
+        if incumbent_mask == full_mask:
+            return incumbent_result
+        final_state = best_partial_state
+    else:
+        final_state = best_terminal_state
+
+    selected_indices: list[int] = []
+    while final_state != start_state:
+        selected_indices.append(final_state[1])
+        final_state = parent[final_state]
+    selected_indices.reverse()
+    selected_sequence = [candidates[index] for index in selected_indices]
+    selected_result = _build_route_from_candidate_sequence(inp, selected_sequence)
+    if best_terminal_state is not None:
+        return selected_result
+    if _route_strategy_total_distance(incumbent_result) <= _route_strategy_total_distance(selected_result):
+        return incumbent_result
+    return selected_result
+
+
 def _plan_intersection_priority_route(inp: RoutePlannerInput) -> RouteStrategyResult:
     """Build an intersection-priority route with active ball hard obstacles."""
     candidates = _intersection_station_candidates(inp.geometry_result)
     uncovered: set[int] = {
         i for i, b in enumerate(inp.geometry_result.balls) if b.reachable
     }
+    orange = set(_orange_ball_indices(inp.geometry_result))
     cover_points: list[CoverPoint] = []
     ordered: list[int] = []
     edges: dict[tuple[int, int], RouteEdge] = {}
@@ -1028,45 +1867,108 @@ def _plan_intersection_priority_route(inp: RoutePlannerInput) -> RouteStrategyRe
         best_candidate: StationCandidate | None = None
         best_cover_point: CoverPoint | None = None
         best_edge: RouteEdge | None = None
-        best_score: tuple[int, int, float, float] | None = None
+        best_score = math.inf
+        best_distance = math.inf
+        best_covered_count = -1
         next_graph = len(cover_points) + 1
 
+        entries: list[tuple[float, float, StationCandidate, CoverPoint, set[int]]] = []
+        require_orange = not cover_points and bool(orange & uncovered)
         for candidate in candidates:
-            cover_point = _cover_point_from_station_candidate(candidate, uncovered)
+            cover_point = _cover_point_from_station_candidate(
+                inp.geometry_result,
+                candidate,
+                uncovered,
+            )
             if cover_point is None:
                 continue
-
             covered = set(cover_point.covered_ball_indices)
+            if require_orange and not covered & orange:
+                continue
+            direct_lower_bound = _dist(
+                current_pose.x_cm, current_pose.y_cm,
+                cover_point.pose.x_cm, cover_point.pose.y_cm,
+            )
+            lower_bound_score = _intersection_candidate_score(
+                direct_lower_bound,
+                candidate,
+                len(covered),
+            )
+            entries.append((
+                lower_bound_score,
+                direct_lower_bound,
+                candidate,
+                cover_point,
+                covered,
+            ))
+
+        entries.sort(key=lambda entry: (
+            entry[0],
+            entry[1],
+            -len(entry[4]),
+            not entry[2].from_ring_intersection,
+            entry[2].total_abs_reach_offset_cm,
+            entry[3].pose.x_cm,
+            entry[3].pose.y_cm,
+        ))
+
+        for (
+            lower_bound_score,
+            _direct_lower_bound,
+            candidate,
+            cover_point,
+            covered,
+        ) in entries:
+            if lower_bound_score > best_score:
+                break
+
             active_obstacles = _ball_obstacles_for_indices(
                 inp.geometry_result,
                 uncovered - covered,
                 danger_radius_cm,
             )
-            edge = _build_edge_with_ball_obstacles(
+            edge = _build_strategy_edge_with_ball_obstacles(
+                inp,
                 current_graph,
                 next_graph,
                 current_pose,
                 cover_point.pose,
-                inp.obstacle,
-                inp.robot_radius_cm,
-                inp.field_width_cm,
-                inp.field_height_cm,
                 active_obstacles,
             )
             if not math.isfinite(edge.total_distance_cm):
                 continue
 
-            score = (
-                -len(covered),
-                0 if candidate.from_ring_intersection else 1,
+            covered_count = len(covered)
+            score = _intersection_candidate_score(
                 edge.total_distance_cm,
-                candidate.total_abs_reach_offset_cm,
+                candidate,
+                covered_count,
             )
-            if best_score is None or score < best_score:
+            if (
+                score < best_score
+                or (
+                    score == best_score
+                    and edge.total_distance_cm < best_distance
+                )
+                or (
+                    score == best_score
+                    and edge.total_distance_cm == best_distance
+                    and covered_count > best_covered_count
+                )
+                or (
+                    score == best_score
+                    and edge.total_distance_cm == best_distance
+                    and covered_count == best_covered_count
+                    and candidate.total_abs_reach_offset_cm
+                    < (best_candidate.total_abs_reach_offset_cm if best_candidate else math.inf)
+                )
+            ):
                 best_candidate = candidate
                 best_cover_point = cover_point
                 best_edge = edge
                 best_score = score
+                best_distance = edge.total_distance_cm
+                best_covered_count = covered_count
 
         if best_candidate is None or best_cover_point is None or best_edge is None:
             break
@@ -1086,15 +1988,12 @@ def _plan_intersection_priority_route(inp: RoutePlannerInput) -> RouteStrategyRe
             uncovered,
             danger_radius_cm,
         )
-        unload_edge = _build_edge_with_ball_obstacles(
+        unload_edge = _build_strategy_edge_with_ball_obstacles(
+            inp,
             current_graph,
             unload_graph_index,
             current_pose,
             inp.unload_pose,
-            inp.obstacle,
-            inp.robot_radius_cm,
-            inp.field_width_cm,
-            inp.field_height_cm,
             active_obstacles,
         )
         edges[(unload_edge.from_index, unload_edge.to_index)] = unload_edge
@@ -1144,6 +2043,7 @@ class SetCoverNearestNeighborStrategy:
         # Step 5: nearest-neighbor ordering (cover points only; unload is
         # always the terminal node and excluded from the greedy tour)
         ordered = _nearest_neighbor_order(len(cover_points), edges)
+        ordered = _force_orange_first_order(inp.geometry_result, cover_points, ordered)
 
         # Step 6: flatten to RoutePlan
         route_plan = _assemble_route_plan(
@@ -1166,3 +2066,17 @@ class IntersectionPriorityStrategy:
 
     def plan(self, inp: RoutePlannerInput) -> RouteStrategyResult:
         return _plan_intersection_priority_route(inp)
+
+
+class IntersectionNearestStrategy:
+    """Route strategy that visits shared pickup nodes by nearest safe edge."""
+
+    def plan(self, inp: RoutePlannerInput) -> RouteStrategyResult:
+        return _plan_intersection_nearest_route(inp)
+
+
+class IntersectionOptimalStrategy:
+    """Route strategy that minimizes total distance through shared pickup nodes."""
+
+    def plan(self, inp: RoutePlannerInput) -> RouteStrategyResult:
+        return _plan_intersection_optimal_route(inp)

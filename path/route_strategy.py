@@ -26,6 +26,7 @@ class ObstacleGeometry:
     center_y_cm: float
     half_size_cm: float       # 10.0 for 20 cm cross
     half_arm_width_cm: float  # 1.5 for 3 cm arm
+    angle_rad: float = 0.0   # rotation angle; 0 = axis-aligned (OBB TODO)
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ class RoutePlannerInput:
     geometry_result: PickupGeometryResult
     obstacle: ObstacleGeometry
     start_pose: HybridPose
-    robot_radius_cm: float   # R (tube reach), used for obstacle inflation
+    robot_radius_cm: float   # collision/danger inflation radius for route edges
     field_width_cm: float
     field_height_cm: float
     unload_pose: HybridPose | None = None          # staging pose for unload

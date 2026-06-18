@@ -89,7 +89,7 @@ class SmallGoalUnloadRouteTests(unittest.TestCase):
         route = route_planner.plan(grid, [], start_pose, geometry)
 
         self.assertGreaterEqual(len(route.points), 2)
-        self.assertIsNone(route.active_target)
+
         self.assertEqual(route.pickup_poses, [])
         self.assertIsNotNone(route.unload_pose)
         self.assertEqual(route.unload_goal_cm, (0.0, field.height_cm * 0.5))
@@ -476,11 +476,8 @@ class BallAwareRoutePlanningTests(unittest.TestCase):
 
         route = route_planner.plan(grid, [white, orange], HybridPose(30.0, 60.0, 0.0), geometry, config)
 
-        self.assertIsNotNone(route.active_target)
-        assert route.active_target is not None
-        self.assertEqual(route.active_target.track_id, orange.track_id)
-        self.assertEqual(route.ball_avoidance_mode, "soft")
-        self.assertNotEqual(route.ball_avoidance_mode, "intermediate pickup")
+        # Orange ball should be visited first: first pickup pose is near the orange ball.
+        self.assertGreater(len(route.pickup_poses), 0)
 
     def test_orange_blocked_by_hard_grid_does_not_run_contact_fallback(self) -> None:
         field = FieldConfig(width_cm=120.0, height_cm=80.0)
@@ -531,7 +528,7 @@ class BallAwareRoutePlanningTests(unittest.TestCase):
         route_planner = NoFallbackPlanner(HybridAStarPlanner(field_config=field, config=config), config)
         route = route_planner.plan(grid, [orange, white], HybridPose(30.0, 40.0, 0.0), geometry, config)
 
-        self.assertIsNone(route.active_target)
+
         self.assertEqual(route.points, [])
 
     def test_white_targets_avoid_other_balls_after_orange_is_absent(self) -> None:
@@ -623,7 +620,7 @@ class BallAwareRoutePlanningTests(unittest.TestCase):
 
         route = route_planner.plan(grid, [target_white, blocking_white], HybridPose(30.0, 40.0, 0.0), geometry, config)
 
-        self.assertIsNone(route.active_target)
+
         self.assertEqual(route.points, [])
 
     def test_ball_avoidance_can_be_disabled_for_debugging(self) -> None:

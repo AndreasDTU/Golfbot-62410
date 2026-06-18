@@ -15,12 +15,13 @@ from path.pathfinding.models import (
     HybridPlannerConfig,
     HybridPose,
     PlannedBallTarget,
+    RedCrossSpec,
     RoutePlan,
     RouteSegmentType,
     RouteTrackingError,
 )
 from localization.models import RobotGeometry, RobotPose
-from config import FieldConfig, PlannerConfig, RobotGeometryConfig
+from config import FieldConfig, PlannerConfig, RobotGeometryConfig, RouteStrategyName
 
 SearchKey = tuple[int, int, int]
 FORWARD_GEAR = 1
@@ -1931,17 +1932,11 @@ class GreedyRoutePlanner:
         cfg = config or self.config
         if not ball_targets:
             unload_segment, unload_pose, unload_goal_cm = self.plan_unload_segment(grid, start_pose, geometry, cfg)
-            segment_types = self.classify_route_segments(unload_segment, [])
-            segment_speeds_pct = self.hybrid_planner.segment_speeds_for_types(segment_types, cfg)
             return RoutePlan(
                 points=unload_segment,
-                active_target=None,
                 pickup_poses=[],
                 unload_pose=unload_pose,
                 unload_goal_cm=unload_goal_cm,
-                ball_avoidance_mode="disabled" if not cfg.avoid_non_target_balls_enabled else "soft",
-                segment_types=segment_types,
-                segment_speeds_pct=segment_speeds_pct,
             )
 
         unvisited = list(ball_targets)
@@ -1949,15 +1944,13 @@ class GreedyRoutePlanner:
         route: list[HybridPose] = [current_pose]
         pickup_poses: list[HybridPose] = []
         active_target: PlannedBallTarget | None = None
-        active_ball_obstacles: list[PlannedBallTarget] = []
-        ball_avoidance_mode = "disabled" if not cfg.avoid_non_target_balls_enabled else "soft"
 
         orange_targets = sorted(
             [target for target in unvisited if target.label == "orange"],
             key=lambda target: math.hypot(target.x_cm - current_pose.x_cm, target.y_cm - current_pose.y_cm),
         )
         for orange_target in orange_targets:
-            orange_segment, orange_obstacles, orange_mode = self.plan_target_segment_with_ball_avoidance(
+            orange_segment, _orange_obstacles, _orange_mode = self.plan_target_segment_with_ball_avoidance(
                 grid,
                 unvisited,
                 current_pose,
@@ -1972,15 +1965,13 @@ class GreedyRoutePlanner:
                 )
                 continue
             active_target = orange_target
-            active_ball_obstacles = orange_obstacles
-            ball_avoidance_mode = orange_mode
             route.extend(orange_segment[1:])
             current_pose = orange_segment[-1]
             pickup_poses.append(current_pose)
             break
 
         if orange_targets and active_target is None:
-            return RoutePlan(points=[], active_target=None, pickup_poses=[])
+            return RoutePlan(points=[], pickup_poses=[])
 
         if active_target is not None:
             unvisited = [target for target in unvisited if target.track_id != active_target.track_id]
@@ -1994,11 +1985,9 @@ class GreedyRoutePlanner:
             )
             chosen_target: PlannedBallTarget | None = None
             chosen_segment: list[HybridPose] = []
-            chosen_obstacles: list[PlannedBallTarget] = []
-            blocked_candidates: list[tuple[PlannedBallTarget, list[PlannedBallTarget]]] = []
 
             for candidate in nearest_candidates:
-                segment, obstacle_targets, mode = self.plan_target_segment_with_ball_avoidance(
+                segment, _obstacle_targets, _mode = self.plan_target_segment_with_ball_avoidance(
                     grid,
                     unvisited,
                     current_pose,
@@ -2009,11 +1998,7 @@ class GreedyRoutePlanner:
                 if segment:
                     chosen_target = candidate
                     chosen_segment = segment
-                    chosen_obstacles = obstacle_targets
-                    if ball_avoidance_mode != "soft":
-                        ball_avoidance_mode = mode
                     break
-                blocked_candidates.append((candidate, obstacle_targets))
                 print(
                     f"Hybrid A* could not route to target {candidate.track_id} "
                     f"({candidate.label}); trying next target."
@@ -2028,7 +2013,6 @@ class GreedyRoutePlanner:
             unvisited.remove(chosen_target)
             if active_target is None:
                 active_target = chosen_target
-                active_ball_obstacles = chosen_obstacles
 
         unload_pose: HybridPose | None = None
         unload_goal_cm: tuple[float, float] | None = None
@@ -2039,20 +2023,11 @@ class GreedyRoutePlanner:
         else:
             route = []
 
-        segment_types = self.classify_route_segments(route, pickup_poses)
-        segment_speeds_pct = self.hybrid_planner.segment_speeds_for_types(segment_types, cfg)
-
         return RoutePlan(
             points=route,
-            active_target=active_target,
             pickup_poses=pickup_poses,
             unload_pose=unload_pose,
             unload_goal_cm=unload_goal_cm,
-            ball_obstacles=active_ball_obstacles,
-            ball_obstacle_radius_cm=self.ball_obstacle_radius_cm(cfg, geometry) if cfg.avoid_non_target_balls_enabled else 0.0,
-            ball_avoidance_mode=ball_avoidance_mode,
-            segment_types=segment_types,
-            segment_speeds_pct=segment_speeds_pct,
         )
 
 
@@ -2117,6 +2092,49 @@ class RoutePlanningFacade:
         self.hybrid_planner = HybridAStarPlanner(self.field, self.robot_config, self.hybrid_config)
         self.legacy_planner = LegacyAStarPlanner()
         self.route_planner = route_planner or GreedyRoutePlanner(self.hybrid_planner, self.hybrid_config)
+        self._active_strategy: RouteStrategyName = self.planner_config.route_strategy
+
+        # Lazy-import geometry strategies to avoid circular dependency at module level.
+        from path.route_v1 import (
+            IntersectionNearestStrategy,
+            IntersectionOptimalStrategy,
+            IntersectionPriorityStrategy,
+            SetCoverNearestNeighborStrategy,
+        )
+        self._geometry_strategies: dict[RouteStrategyName, object] = {
+            RouteStrategyName.SET_COVER_NEAREST: SetCoverNearestNeighborStrategy(),
+            RouteStrategyName.INTERSECTION_PRIORITY: IntersectionPriorityStrategy(),
+            RouteStrategyName.INTERSECTION_NEAREST: IntersectionNearestStrategy(),
+            RouteStrategyName.INTERSECTION_OPTIMAL: IntersectionOptimalStrategy(),
+        }
+
+    def set_strategy(self, name: RouteStrategyName) -> None:
+        """Switch the active routing strategy at runtime."""
+        self._active_strategy = name
+
+    @staticmethod
+    def _obstacle_from_cross_spec(
+        cross_spec: RedCrossSpec | None,
+        field_config: FieldConfig,
+    ) -> "ObstacleGeometry":
+        """Convert a RedCrossSpec into the ObstacleGeometry used by v1 strategies."""
+        from path.route_strategy import ObstacleGeometry
+
+        if cross_spec is None:
+            # Dummy obstacle far outside the field so collision checks pass trivially.
+            return ObstacleGeometry(
+                center_x_cm=-1000.0,
+                center_y_cm=-1000.0,
+                half_size_cm=0.0,
+                half_arm_width_cm=0.0,
+            )
+        return ObstacleGeometry(
+            center_x_cm=cross_spec.center_x_cm,
+            center_y_cm=cross_spec.center_y_cm,
+            half_size_cm=cross_spec.half_size_cm,
+            half_arm_width_cm=cross_spec.half_arm_width_cm,
+            angle_rad=cross_spec.angle_rad,
+        )
 
     def plan_route(
         self,
@@ -2124,10 +2142,44 @@ class RoutePlanningFacade:
         ball_targets: list[PlannedBallTarget],
         start_pose: HybridPose,
         geometry: RobotGeometry,
+        cross_spec: RedCrossSpec | None = None,
         config: HybridPlannerConfig | None = None,
     ) -> RoutePlan:
-        """Plan a route through available ball targets."""
-        return self.route_planner.plan(grid, ball_targets, start_pose, geometry, config or self.hybrid_config)
+        """Plan a route through available ball targets using the active strategy."""
+        cfg = config or self.hybrid_config
+
+        if self._active_strategy == RouteStrategyName.LEGACY_HYBRID_ASTAR:
+            return self.route_planner.plan(grid, ball_targets, start_pose, geometry, cfg)
+
+        # Geometry-based strategies
+        from path.pickup_geometry import compute_pickup_geometry
+        from path.route_strategy import RoutePlannerInput
+
+        field_w = self.field.width_cm
+        field_h = self.field.height_cm
+        geometry_result = compute_pickup_geometry(field_w, field_h, grid, ball_targets, geometry)
+        obstacle = self._obstacle_from_cross_spec(cross_spec, self.field)
+
+        margin = cfg.unload_staging_margin_cm
+        unload_pose = self.hybrid_planner.small_goal_unload_pose(geometry, margin)
+        unload_goal_cm = self.hybrid_planner.small_goal_center_cm()
+
+        route_input = RoutePlannerInput(
+            geometry_result=geometry_result,
+            obstacle=obstacle,
+            start_pose=start_pose,
+            robot_radius_cm=geometry_result.ring_radius_cm,
+            field_width_cm=field_w,
+            field_height_cm=field_h,
+            unload_pose=unload_pose,
+            unload_goal_cm=unload_goal_cm,
+        )
+
+        strategy = self._geometry_strategies.get(self._active_strategy)
+        if strategy is None:
+            raise ValueError(f"Unknown route strategy: {self._active_strategy}")
+        result = strategy.plan(route_input)
+        return result.route_plan
 
     @staticmethod
     def nearest_route_distance_cm(pose: HybridPose, route: list[HybridPose]) -> float:

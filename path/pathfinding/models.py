@@ -40,15 +40,20 @@ class RoutePlan:
     """Cached route plus pickup metadata for visualization and invalidation."""
 
     points: list[HybridPose]
-    active_target: PlannedBallTarget | None
     pickup_poses: list[HybridPose]
     unload_pose: HybridPose | None = None
     unload_goal_cm: tuple[float, float] | None = None
-    ball_obstacles: list[PlannedBallTarget] | None = None
-    ball_obstacle_radius_cm: float = 0.0
-    ball_avoidance_mode: str = "disabled"
-    segment_types: list[RouteSegmentType] | None = None
-    segment_speeds_pct: list[float] | None = None
+
+
+@dataclass(frozen=True)
+class RedCrossSpec:
+    """Red cross obstacle geometry from perception, in field-cm coordinates."""
+
+    center_x_cm: float
+    center_y_cm: float
+    half_size_cm: float       # half of the overall cross span (e.g. 10 for 20 cm)
+    half_arm_width_cm: float  # half of the arm width (e.g. 1.5 for 3 cm)
+    angle_rad: float = 0.0   # rotation angle; 0 = axis-aligned
 
 
 @dataclass(frozen=True)

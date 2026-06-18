@@ -27,7 +27,6 @@ def make_plan(
     """Build a minimal RoutePlan for testing."""
     return RoutePlan(
         points=points,
-        active_target=None,
         pickup_poses=pickup_poses or [],
         unload_pose=unload_pose,
     )

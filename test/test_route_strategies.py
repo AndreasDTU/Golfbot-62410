@@ -7,7 +7,7 @@ import math
 import numpy as np
 
 from localization.models import RobotGeometry
-from path.pathfinding.models import HybridPose, PlannedBallTarget, RouteSegmentType
+from path.pathfinding.models import HybridPose, PlannedBallTarget
 from path.pickup_geometry import (
     BallPickupResult,
     PickupGeometryResult,
@@ -15,13 +15,25 @@ from path.pickup_geometry import (
     compute_pickup_geometry,
 )
 from path.route_strategy import ObstacleGeometry, RoutePlannerInput
-from path.route_v1 import IntersectionPriorityStrategy, SetCoverNearestNeighborStrategy
+from path.route_v1 import (
+    IntersectionNearestStrategy,
+    IntersectionOptimalStrategy,
+    IntersectionPriorityStrategy,
+    SetCoverNearestNeighborStrategy,
+    _ball_obstacles_for_indices,
+    _build_edge_with_ball_obstacles,
+)
 
 
-def _target(track_id: int, x_cm: float, y_cm: float) -> PlannedBallTarget:
+def _target(
+    track_id: int,
+    x_cm: float,
+    y_cm: float,
+    label: str = "white",
+) -> PlannedBallTarget:
     return PlannedBallTarget(
         track_id=track_id,
-        label="white",
+        label=label,
         x_cm=x_cm,
         y_cm=y_cm,
         node_cm=(round(x_cm), round(100.0 - y_cm)),
@@ -46,6 +58,245 @@ def _segment_distance_to_point(
     closest_x = x0 + t * dx
     closest_y = y0 + t * dy
     return math.hypot(px - closest_x, py - closest_y)
+
+
+def _route_distance(result) -> float:
+    edge_by_nodes = {
+        (edge.from_index, edge.to_index): edge
+        for edge in result.edges
+    }
+    total = 0.0
+    prev_graph = 0
+    for cover_idx in result.ordered_indices:
+        graph_idx = cover_idx + 1
+        total += edge_by_nodes[(prev_graph, graph_idx)].total_distance_cm
+        prev_graph = graph_idx
+    if result.route_plan.unload_pose is not None:
+        unload_edges = [
+            edge for edge in result.edges
+            if edge.from_index == prev_graph
+            and edge.to_index > len(result.cover_points)
+        ]
+        assert len(unload_edges) == 1
+        total += unload_edges[0].total_distance_cm
+    return total
+
+
+def _picked_ball_index_for_pose(
+    pickup_geometry: PickupGeometryResult,
+    pose: HybridPose,
+) -> int:
+    best_index = -1
+    best_distance = math.inf
+    for index, ball in enumerate(pickup_geometry.balls):
+        tip_x = (
+            pose.x_cm
+            + math.cos(pose.theta_rad) * pickup_geometry.tube_forward_cm
+            + math.sin(pose.theta_rad) * pickup_geometry.tube_right_cm
+        )
+        tip_y = (
+            pose.y_cm
+            + math.sin(pose.theta_rad) * pickup_geometry.tube_forward_cm
+            - math.cos(pose.theta_rad) * pickup_geometry.tube_right_cm
+        )
+        distance = math.hypot(tip_x - ball.ball_x_cm, tip_y - ball.ball_y_cm)
+        if distance < best_distance:
+            best_distance = distance
+            best_index = index
+    return best_index
+
+
+def _manual_pickup_geometry(
+    origins: list[tuple[float, float]],
+    labels: list[str] | None = None,
+    *,
+    field_width_cm: float = 160.0,
+    field_height_cm: float = 150.0,
+    ring_radius_cm: float = 10.0,
+) -> PickupGeometryResult:
+    labels = labels or ["white"] * len(origins)
+    mask = np.ones((round(field_height_cm) + 1, round(field_width_cm) + 1), dtype=bool)
+    balls: list[BallPickupResult] = []
+    for idx, (origin_x, origin_y) in enumerate(origins):
+        balls.append(BallPickupResult(
+            ball_x_cm=origin_x + ring_radius_cm,
+            ball_y_cm=origin_y,
+            track_id=idx + 1,
+            label=labels[idx],
+            ring_radius_cm=ring_radius_cm,
+            valid_points=(PickupPose(
+                x_cm=origin_x,
+                y_cm=origin_y,
+                theta_rad=0.0,
+                reach_offset_cm=0.0,
+            ),),
+            invalid_angles_rad=(),
+            reachable=True,
+        ))
+    return PickupGeometryResult(
+        legal_region_mask=mask,
+        eroded_field_mask=mask,
+        dilated_obstacle_mask=np.zeros_like(mask),
+        ring_radius_cm=ring_radius_cm,
+        mouth_radius_cm=0.0,
+        tube_forward_cm=ring_radius_cm,
+        tube_right_cm=0.0,
+        balls=tuple(balls),
+        field_width_cm=field_width_cm,
+        field_height_cm=field_height_cm,
+    )
+
+
+def _manual_shared_origin_pickup_geometry() -> PickupGeometryResult:
+    mask = np.ones((101, 101), dtype=bool)
+    ring_radius_cm = 10.0
+    return PickupGeometryResult(
+        legal_region_mask=mask,
+        eroded_field_mask=mask,
+        dilated_obstacle_mask=np.zeros_like(mask),
+        ring_radius_cm=ring_radius_cm,
+        mouth_radius_cm=0.0,
+        tube_forward_cm=ring_radius_cm,
+        tube_right_cm=0.0,
+        balls=(
+            BallPickupResult(
+                ball_x_cm=40.0,
+                ball_y_cm=50.0,
+                track_id=1,
+                label="white",
+                ring_radius_cm=ring_radius_cm,
+                valid_points=(PickupPose(
+                    x_cm=30.0,
+                    y_cm=50.0,
+                    theta_rad=0.0,
+                    reach_offset_cm=0.0,
+                ),),
+                invalid_angles_rad=(),
+                reachable=True,
+            ),
+            BallPickupResult(
+                ball_x_cm=30.0,
+                ball_y_cm=60.0,
+                track_id=2,
+                label="orange",
+                ring_radius_cm=ring_radius_cm,
+                valid_points=(PickupPose(
+                    x_cm=30.0,
+                    y_cm=50.0,
+                    theta_rad=math.pi * 0.5,
+                    reach_offset_cm=0.0,
+                ),),
+                invalid_angles_rad=(),
+                reachable=True,
+            ),
+        ),
+        field_width_cm=100.0,
+        field_height_cm=100.0,
+    )
+
+
+class TestOrangeFirstRequirement:
+    def test_all_strategies_visit_orange_stop_first(self) -> None:
+        pickup_geometry = _manual_pickup_geometry(
+            [
+                (20.0, 50.0),
+                (120.0, 50.0),
+            ],
+            labels=["white", "orange"],
+        )
+        route_input = RoutePlannerInput(
+            geometry_result=pickup_geometry,
+            obstacle=ObstacleGeometry(
+                center_x_cm=150.0,
+                center_y_cm=140.0,
+                half_size_cm=2.0,
+                half_arm_width_cm=1.0,
+            ),
+            start_pose=HybridPose(x_cm=18.0, y_cm=50.0, theta_rad=0.0),
+            robot_radius_cm=0.0,
+            field_width_cm=160.0,
+            field_height_cm=150.0,
+        )
+
+        for strategy_cls in (
+            SetCoverNearestNeighborStrategy,
+            IntersectionPriorityStrategy,
+            IntersectionNearestStrategy,
+            IntersectionOptimalStrategy,
+        ):
+            result = strategy_cls().plan(route_input)
+            first_cover_idx = result.ordered_indices[0]
+            first_cover = result.cover_points[first_cover_idx]
+            assert first_cover.covered_ball_indices[0] == 1
+            assert _picked_ball_index_for_pose(
+                pickup_geometry,
+                result.route_plan.pickup_poses[0],
+            ) == 1
+
+    def test_shared_origin_station_picks_orange_action_first(self) -> None:
+        pickup_geometry = _manual_shared_origin_pickup_geometry()
+        route_input = RoutePlannerInput(
+            geometry_result=pickup_geometry,
+            obstacle=ObstacleGeometry(
+                center_x_cm=90.0,
+                center_y_cm=90.0,
+                half_size_cm=2.0,
+                half_arm_width_cm=1.0,
+            ),
+            start_pose=HybridPose(x_cm=20.0, y_cm=20.0, theta_rad=0.0),
+            robot_radius_cm=0.0,
+            field_width_cm=100.0,
+            field_height_cm=100.0,
+        )
+
+        for strategy_cls in (
+            SetCoverNearestNeighborStrategy,
+            IntersectionPriorityStrategy,
+            IntersectionNearestStrategy,
+            IntersectionOptimalStrategy,
+        ):
+            result = strategy_cls().plan(route_input)
+            assert result.cover_points[0].covered_ball_indices == (1, 0)
+            assert len(result.route_plan.pickup_poses) == 2
+            assert _picked_ball_index_for_pose(
+                pickup_geometry,
+                result.route_plan.pickup_poses[0],
+            ) == 1
+
+    def test_first_orange_leg_can_escape_start_owned_ball_danger_zone(self) -> None:
+        pickup_geometry = _manual_pickup_geometry(
+            [
+                (6.0, 20.0),
+                (70.0, 20.0),
+            ],
+            labels=["white", "orange"],
+            field_width_cm=120.0,
+            field_height_cm=80.0,
+        )
+        route_input = RoutePlannerInput(
+            geometry_result=pickup_geometry,
+            obstacle=ObstacleGeometry(
+                center_x_cm=110.0,
+                center_y_cm=70.0,
+                half_size_cm=2.0,
+                half_arm_width_cm=1.0,
+            ),
+            start_pose=HybridPose(x_cm=20.0, y_cm=20.0, theta_rad=0.0),
+            robot_radius_cm=10.0,
+            field_width_cm=120.0,
+            field_height_cm=80.0,
+        )
+
+        result = IntersectionNearestStrategy().plan(route_input)
+
+        assert result.cover_points
+        first_cover = result.cover_points[result.ordered_indices[0]]
+        assert first_cover.covered_ball_indices == (1,)
+        first_edge = next(
+            edge for edge in result.edges
+            if edge.from_index == 0 and edge.to_index == 1
+        )
+        assert math.isfinite(first_edge.total_distance_cm)
 
 
 class TestIntersectionPriorityStrategy:
@@ -90,16 +341,54 @@ class TestIntersectionPriorityStrategy:
         assert cover_point.covered_ball_indices == (0, 1)
         assert len(cover_point.pickup_poses) == 2
         assert len(result.route_plan.pickup_poses) == 2
-        assert result.route_plan.segment_types == [
-            RouteSegmentType.CREEP,
-            RouteSegmentType.PIVOT,
-        ]
         first, second = result.route_plan.pickup_poses
         assert first.x_cm == second.x_cm
         assert first.y_cm == second.y_cm
         assert first.theta_rad != second.theta_rad
 
-    def test_uncollected_ball_blocks_direct_drive_to_intersection_station(self) -> None:
+    def test_near_two_ball_station_beats_far_three_ball_station(self) -> None:
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=10.0,
+            tube_right_cm=0.0,
+            mouth_radius_cm=2.0,
+            unload_extension_cm=30.0,
+        )
+        tri_h = math.sqrt(3.0) * 5.0
+        pickup_geometry = compute_pickup_geometry(
+            field_width_cm=200.0,
+            field_height_cm=120.0,
+            obstacle_grid=np.zeros((120, 200), dtype=np.uint8),
+            balls=[
+                _target(1, 50.0, 60.0),
+                _target(2, 35.0, 60.0 + tri_h),
+                _target(3, 145.0, 60.0),
+                _target(4, 130.0, 60.0 + tri_h),
+                _target(5, 130.0, 60.0 - tri_h),
+            ],
+            geometry=geometry,
+        )
+        route_input = RoutePlannerInput(
+            geometry_result=pickup_geometry,
+            obstacle=ObstacleGeometry(
+                center_x_cm=180.0,
+                center_y_cm=100.0,
+                half_size_cm=2.0,
+                half_arm_width_cm=1.0,
+            ),
+            start_pose=HybridPose(x_cm=25.0, y_cm=60.0, theta_rad=0.0),
+            robot_radius_cm=pickup_geometry.ring_radius_cm,
+            field_width_cm=200.0,
+            field_height_cm=120.0,
+        )
+
+        result = IntersectionPriorityStrategy().plan(route_input)
+
+        assert set(result.cover_points[0].covered_ball_indices) == {0, 1}
+
+    def test_uncollected_ball_obstacle_blocks_direct_edge(self) -> None:
         geometry = RobotGeometry(
             width_cm=20.0,
             front_cm=8.0,
@@ -110,47 +399,46 @@ class TestIntersectionPriorityStrategy:
             unload_extension_cm=30.0,
         )
         pickup_geometry = compute_pickup_geometry(
-            field_width_cm=100.0,
+            field_width_cm=120.0,
             field_height_cm=100.0,
-            obstacle_grid=np.zeros((100, 100), dtype=np.uint8),
-            balls=[
-                _target(1, 40.0, 50.0),
-                _target(2, 60.0, 50.0),
-                _target(3, 35.0, 38.0),
-                _target(4, 50.0, 60.0),
-            ],
+            obstacle_grid=np.zeros((100, 120), dtype=np.uint8),
+            balls=[_target(1, 60.0, 50.0)],
             geometry=geometry,
         )
-        route_input = RoutePlannerInput(
-            geometry_result=pickup_geometry,
-            obstacle=ObstacleGeometry(
-                center_x_cm=90.0,
-                center_y_cm=90.0,
-                half_size_cm=2.0,
-                half_arm_width_cm=1.0,
-            ),
-            start_pose=HybridPose(x_cm=20.0, y_cm=50.0, theta_rad=0.0),
-            robot_radius_cm=15.0,
-            field_width_cm=100.0,
-            field_height_cm=100.0,
+        obstacle = ObstacleGeometry(
+            center_x_cm=110.0,
+            center_y_cm=90.0,
+            half_size_cm=2.0,
+            half_arm_width_cm=1.0,
+        )
+        robot_radius_cm = 10.0
+        ball_obstacles = _ball_obstacles_for_indices(
+            pickup_geometry,
+            {0},
+            robot_radius_cm,
         )
 
-        result = IntersectionPriorityStrategy().plan(route_input)
-
-        assert result.cover_points[0].covered_ball_indices == (0, 1, 3)
-        first_edge = next(
-            edge for edge in result.edges
-            if edge.from_index == 0 and edge.to_index == 1
+        edge = _build_edge_with_ball_obstacles(
+            0,
+            1,
+            HybridPose(x_cm=20.0, y_cm=50.0, theta_rad=0.0),
+            HybridPose(x_cm=100.0, y_cm=50.0, theta_rad=0.0),
+            obstacle,
+            robot_radius_cm,
+            120.0,
+            100.0,
+            ball_obstacles,
         )
-        assert first_edge.blocked
-        assert first_edge.detour_waypoints
+
+        assert edge.blocked
+        assert edge.detour_waypoints
 
         route_points = [
-            route_input.start_pose,
-            *first_edge.detour_waypoints,
-            result.cover_points[0].pose,
+            HybridPose(x_cm=20.0, y_cm=50.0, theta_rad=0.0),
+            *edge.detour_waypoints,
+            HybridPose(x_cm=100.0, y_cm=50.0, theta_rad=0.0),
         ]
-        blocking_ball = pickup_geometry.balls[2]
+        blocking_ball = pickup_geometry.balls[0]
         for a, b in zip(route_points, route_points[1:]):
             assert _segment_distance_to_point(
                 blocking_ball.ball_x_cm,
@@ -159,7 +447,80 @@ class TestIntersectionPriorityStrategy:
                 a.y_cm,
                 b.x_cm,
                 b.y_cm,
-            ) > route_input.robot_radius_cm
+            ) > robot_radius_cm
+
+
+class TestSharedNodeStrategies:
+    def test_nearest_strategy_uses_nearest_node_without_collection_priority(self) -> None:
+        geometry = RobotGeometry(
+            width_cm=20.0,
+            front_cm=8.0,
+            rear_cm=10.0,
+            tube_forward_cm=10.0,
+            tube_right_cm=0.0,
+            mouth_radius_cm=2.0,
+            unload_extension_cm=30.0,
+        )
+        tri_h = math.sqrt(3.0) * 5.0
+        pickup_geometry = compute_pickup_geometry(
+            field_width_cm=200.0,
+            field_height_cm=120.0,
+            obstacle_grid=np.zeros((120, 200), dtype=np.uint8),
+            balls=[
+                _target(1, 50.0, 60.0),
+                _target(2, 145.0, 60.0),
+                _target(3, 130.0, 60.0 + tri_h),
+                _target(4, 130.0, 60.0 - tri_h),
+            ],
+            geometry=geometry,
+        )
+        route_input = RoutePlannerInput(
+            geometry_result=pickup_geometry,
+            obstacle=ObstacleGeometry(
+                center_x_cm=180.0,
+                center_y_cm=100.0,
+                half_size_cm=2.0,
+                half_arm_width_cm=1.0,
+            ),
+            start_pose=HybridPose(x_cm=25.0, y_cm=60.0, theta_rad=0.0),
+            robot_radius_cm=pickup_geometry.ring_radius_cm,
+            field_width_cm=200.0,
+            field_height_cm=120.0,
+        )
+
+        result = IntersectionNearestStrategy().plan(route_input)
+
+        assert result.cover_points[0].covered_ball_indices == (0,)
+
+    def test_optimal_strategy_can_beat_nearest_first_route(self) -> None:
+        pickup_geometry = _manual_pickup_geometry([
+            (48.2, 85.6),
+            (81.8, 35.1),
+            (111.0, 108.3),
+        ])
+        route_input = RoutePlannerInput(
+            geometry_result=pickup_geometry,
+            obstacle=ObstacleGeometry(
+                center_x_cm=150.0,
+                center_y_cm=140.0,
+                half_size_cm=2.0,
+                half_arm_width_cm=1.0,
+            ),
+            start_pose=HybridPose(x_cm=70.0, y_cm=60.0, theta_rad=0.0),
+            robot_radius_cm=0.0,
+            field_width_cm=160.0,
+            field_height_cm=150.0,
+            unload_pose=HybridPose(x_cm=70.0, y_cm=60.0, theta_rad=0.0),
+            unload_goal_cm=(70.0, 60.0),
+        )
+
+        nearest = IntersectionNearestStrategy().plan(route_input)
+        optimal = IntersectionOptimalStrategy().plan(route_input)
+
+        assert _route_distance(optimal) < _route_distance(nearest)
+        assert set().union(
+            *(set(cp.covered_ball_indices) for cp in optimal.cover_points)
+        ) == {0, 1, 2}
 
 
 class TestUnloadDetour:
@@ -208,11 +569,6 @@ class TestUnloadDetour:
         assert math.isfinite(final_edge.total_distance_cm)
         assert result.route_plan.points[-1] is unload_pose
         assert result.route_plan.points[2:-1] == list(final_edge.detour_waypoints)
-        assert result.route_plan.segment_types == [
-            RouteSegmentType.CREEP,
-            *([RouteSegmentType.TRANSIT] * len(final_edge.detour_waypoints)),
-            RouteSegmentType.TRANSIT,
-        ]
 
     def test_final_pickup_inside_cross_can_escape_to_unload_detour(self) -> None:
         mask = np.ones((100, 100), dtype=bool)

@@ -6,7 +6,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field as dataclass_field
+from enum import Enum
 from pathlib import Path
+
+
+class RouteStrategyName(str, Enum):
+    SET_COVER_NEAREST = "set_cover_nearest"
+    INTERSECTION_PRIORITY = "intersection_priority"
+    INTERSECTION_NEAREST = "intersection_nearest"
+    INTERSECTION_OPTIMAL = "intersection_optimal"
+    LEGACY_HYBRID_ASTAR = "legacy_hybrid_astar"
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,7 @@ class TrackbarConfig:
 class PlannerConfig:
     """Route-planning tuning."""
 
+    route_strategy: RouteStrategyName = RouteStrategyName.INTERSECTION_PRIORITY
     theta_bins: int = 36
     step_cm: float = 4.0
     goal_tolerance_cm: float = 4.0

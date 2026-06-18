@@ -39,7 +39,12 @@ from path.route_strategy import (
     RoutePlannerInput,
     RouteStrategyResult,
 )
-from path.route_v1 import IntersectionPriorityStrategy, SetCoverNearestNeighborStrategy
+from path.route_v1 import (
+    IntersectionNearestStrategy,
+    IntersectionOptimalStrategy,
+    IntersectionPriorityStrategy,
+    SetCoverNearestNeighborStrategy,
+)
 from path.tools.pathfinding_sandbox import (
     RANDOM_BALL_COUNT,
     RANDOM_WHITE_BALL_COUNT,
@@ -79,6 +84,8 @@ class StrategyOption:
 STRATEGY_OPTIONS = (
     StrategyOption("set-cover", "Set-cover nearest-neighbor", SetCoverNearestNeighborStrategy),
     StrategyOption("intersections", "Intersection-priority", IntersectionPriorityStrategy),
+    StrategyOption("intersection-nearest", "Intersection-nearest", IntersectionNearestStrategy),
+    StrategyOption("intersection-optimal", "Intersection-optimal", IntersectionOptimalStrategy),
 )
 
 
@@ -521,6 +528,7 @@ def _compute_and_render(
 
     # Compute route plan
     R = pickup_reach_cm(geometry)
+    collision_radius_cm = geometry.width_cm * 0.5
     obstacle = ObstacleGeometry(
         center_x_cm=config.field.width_cm * 0.5,
         center_y_cm=config.field.height_cm * 0.5,
@@ -542,7 +550,7 @@ def _compute_and_render(
         geometry_result=result,
         obstacle=obstacle,
         start_pose=start,
-        robot_radius_cm=R,
+        robot_radius_cm=collision_radius_cm,
         field_width_cm=config.field.width_cm,
         field_height_cm=config.field.height_cm,
         unload_pose=unload_pose,

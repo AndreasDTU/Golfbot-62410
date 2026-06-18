@@ -1017,8 +1017,6 @@ class DebugRenderer:
         route_segment_speeds_pct: list[float] | None = None,
         route_unload_pose_cm: HybridPose | None = None,
         route_unload_goal_cm: tuple[float, float] | None = None,
-        route_ball_obstacles: list[PlannedBallTarget] | None = None,
-        route_ball_obstacle_radius_cm: float = 0.0,
         selected_start_cm: tuple[int, int] | None = None,
         selected_ball_track_id: int | None = None,
         robot_pose: RobotPose | None = None,
@@ -1074,14 +1072,6 @@ class DebugRenderer:
 
         geometry = self.robot_geometry_from_params(params)
         if route_points_cm:
-            self.draw_ball_avoidance_debug(
-                schematic,
-                route_points_cm,
-                route_pickup_poses_cm,
-                route_ball_obstacles,
-                route_ball_obstacle_radius_cm,
-                geometry,
-            )
             self.draw_velocity_profile_route(
                 schematic,
                 route_points_cm,

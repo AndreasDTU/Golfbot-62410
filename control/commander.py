@@ -314,9 +314,11 @@ class RobotCommander:
         return self._send("collector_travel_position")
 
     def pickup_assist(self) -> str:
+        self._send("stop")
         return self._send("pickup_assist")
 
     def unload_full_cycle(self) -> str:
+        self._send("stop")
         return self._send("unload_full_cycle")
 
     def pipe_up(self, units, speed=None) -> str:

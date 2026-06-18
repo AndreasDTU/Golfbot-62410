@@ -294,7 +294,8 @@ class RobotCommander:
         """Zero wheel speeds and reset base speed."""
         self._base_speed = 0.0
         self._previous_speed = 0.0
-        return self._send_wheel_speeds(0.0, 0.0, force=force)
+        self._send("stop")
+        return True
 
     # ------------------------------------------------------------------
     # Legacy steer() — bridge for guidance code until full migration
@@ -319,6 +320,7 @@ class RobotCommander:
 
     def unload_full_cycle(self) -> str:
         self._send("stop")
+        self._send("unload_full_cycle")
         return self._send("unload_full_cycle")
 
     def pipe_up(self, units, speed=None) -> str:

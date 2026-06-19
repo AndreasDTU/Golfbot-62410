@@ -7,10 +7,69 @@ from typing import Callable
 
 import numpy as np
 
-from path.pathfinding.models import HybridPose, RouteSegmentType, RouteTrackingError
-from path.pathfinding.planner import RoutePlanningFacade
+from path.models import HybridPose, RouteSegmentType, RouteTrackingError
 from localization.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose, WheelCommand
 from config import DriveConfig, FieldConfig
+
+
+def _normalize_angle(theta_rad: float) -> float:
+    """Normalize to [-pi, pi)."""
+    return (theta_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def compute_route_tracking_error(
+    robot_pose: RobotPose,
+    route: list[HybridPose],
+    start_segment_index: int = 0,
+    end_segment_index: int | None = None,
+) -> RouteTrackingError | None:
+    """Project live robot pose onto the closest cached route segment."""
+    if len(route) < 2:
+        return None
+
+    rx = float(robot_pose.x_cm)
+    ry = float(robot_pose.y_cm)
+    best: RouteTrackingError | None = None
+    best_distance = float("inf")
+
+    first_segment = max(0, min(int(start_segment_index), len(route) - 2))
+    last_segment = len(route) - 2 if end_segment_index is None else int(end_segment_index)
+    last_segment = max(first_segment, min(last_segment, len(route) - 2))
+
+    for index in range(first_segment, last_segment + 1):
+        start = route[index]
+        end = route[index + 1]
+        sx, sy = float(start.x_cm), float(start.y_cm)
+        vx = float(end.x_cm - start.x_cm)
+        vy = float(end.y_cm - start.y_cm)
+        segment_len_sq = vx * vx + vy * vy
+        if segment_len_sq <= 1e-9:
+            continue
+
+        projection = ((rx - sx) * vx + (ry - sy) * vy) / segment_len_sq
+        clamped = float(np.clip(projection, 0.0, 1.0))
+        cx = sx + vx * clamped
+        cy = sy + vy * clamped
+        dx = rx - cx
+        dy = ry - cy
+        distance = math.hypot(dx, dy)
+        if distance >= best_distance:
+            continue
+
+        segment_heading = math.atan2(vy, vx)
+        cross = vx * (ry - sy) - vy * (rx - sx)
+        signed_distance = math.copysign(distance, cross) if abs(cross) > 1e-9 else 0.0
+        best_distance = distance
+        best = RouteTrackingError(
+            xte_cm=distance,
+            signed_xte_cm=signed_distance,
+            heading_error_rad=_normalize_angle(segment_heading - robot_pose.heading_rad),
+            closest_point_cm=(cx, cy),
+            segment_heading_rad=segment_heading,
+            segment_index=index,
+        )
+
+    return best
 
 
 def classify_segments_from_geometry(
@@ -333,11 +392,9 @@ class DriveSafetyGuard:
     def __init__(
         self,
         drive_config: DriveConfig | None = None,
-        route_facade: RoutePlanningFacade | None = None,
         wheel_controller: WheelCommandController | None = None,
     ) -> None:
         self.config = drive_config or DriveConfig()
-        self.route_facade = route_facade or RoutePlanningFacade()
         self.wheel_controller = wheel_controller or WheelCommandController(self.config)
 
     def reset_route_progress_if_needed(self, route: list[HybridPose], drive_runtime: DriveRuntime) -> None:
@@ -372,7 +429,7 @@ class DriveSafetyGuard:
                 if idx < len(segment_types) and segment_types[idx] == RouteSegmentType.PIVOT:
                     end_segment = max(start_segment, idx - 1)
                     break
-        tracking_error = self.route_facade.compute_route_tracking_error(
+        tracking_error = compute_route_tracking_error(
             robot_pose,
             route,
             start_segment_index=start_segment,

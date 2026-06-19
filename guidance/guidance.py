@@ -18,7 +18,7 @@ from control.commander import RobotCommander
 from control.telemetry import log_event
 from localization.localization import normalize_angle
 from localization.models import RobotPose
-from path.pathfinding.models import HybridPose
+from path.models import HybridPose
 from config import DriveConfig
 
 
@@ -153,6 +153,15 @@ class GuidanceController:
             self._cursor += 1
             target = self._waypoints[self._cursor]
             distance, heading_error = self._compute_geometry(pose, target)
+
+        # 5b. Target behind and close — reverse instead of turning.
+        if abs(heading_error) > math.radians(150) and distance < 25.0:
+            ok = self._commander.drive_adjusted(-distance, dt_s, 0.0)
+            self._log(
+                "REVERSING", dist=distance,
+                heading_err=math.degrees(heading_error), ok=ok,
+            )
+            return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
         max_heading_error = math.radians(4) if (is_last and distance < self._waypoint_arrival_cm) else self._config.max_heading_for_forward_rad
         # 6. Large heading error — rotate in place.

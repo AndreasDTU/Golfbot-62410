@@ -25,15 +25,13 @@ from control.spin_calibration import SpinController, SpinStatus
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
 from localization.models import RobotCalibrationRuntime, RobotMarkerObservation, RobotPose
-from path.pathfinding.models import HybridPose, PlannedBallTarget
-from path.pathfinding.planner import RoutePlanningFacade
+from path.models import HybridPose, PlannedBallTarget
+from path.planner import plan_route
 from path.pickup_geometry import compute_pickup_geometry
-from path.route_strategy import ObstacleGeometry, RoutePlannerInput
 from path.tools.pickup_visualizer import (
     STRATEGY_OPTIONS,
     draw_pickup_geometry,
     draw_route_plan,
-    draw_strategy_label,
 )
 from config import AppConfig, RouteStrategyName
 from perception.vision.debug import DebugRenderer
@@ -337,11 +335,7 @@ class MainGui:
         self._load_field_corners()
         self._load_cross()
         self._route_view_strategy_index = self._route_view_strategy_index_from_config()
-        self._route_planner = RoutePlanningFacade(
-            field_config=self.config.field,
-            robot_config=self.config.robot,
-            planner_config=self.config.planner,
-        )
+        # Route planning uses the standalone plan_route() facade from path.pathfinding.
 
     def _load_field_corners(self) -> None:
         """Restore the saved manual top-down warp, if a corners file exists."""
@@ -901,15 +895,18 @@ class MainGui:
                 ]
                 geometry = self.pose_estimator.robot_geometry_from_params(self.params)
 
-                plan = self._route_planner.plan_route(
+                unload_reach = geometry.rear_cm + geometry.unload_extension_cm
+                unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
+                plan = plan_route(
                     captured_grid,
                     targets,
                     start_pose,
                     geometry,
-                    cross_spec=self._cross_spec,
+                    self.config.field,
+                    unload_position=unload_pos,
                 )
 
-                if not plan.points:
+                if not plan.waypoints:
                     self.message = "Planner returned empty route"
                     commander.close()
                     return
@@ -919,7 +916,9 @@ class MainGui:
                 self._commander = commander
                 self._guidance = guidance
                 self._brain = brain
-                self._brain_route_points = plan.points
+                self._brain_route_points = [
+                    HybridPose(w.x_cm, w.y_cm, w.theta_rad) for w in plan.waypoints
+                ]
                 self._last_brain_time = None
                 self._brain_state = None
                 self._tracked_balls = list(captured_balls)
@@ -1041,20 +1040,25 @@ class MainGui:
             theta_rad=self.robot_pose.heading_rad,
         )
         geometry = self.pose_estimator.robot_geometry_from_params(self.params)
-        plan = self._route_planner.plan_route(
+        unload_reach = geometry.rear_cm + geometry.unload_extension_cm
+        unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
+        plan = plan_route(
             result.occupancy_grid,
             targets,
             start_pose,
             geometry,
-            cross_spec=self._cross_spec,
+            self.config.field,
+            unload_position=unload_pos,
         )
 
-        if not plan.points:
+        if not plan.waypoints:
             self.message = "Rescan: no route found — stopping"
             return
 
         self._brain.load_route(plan)
-        self._brain_route_points = plan.points
+        self._brain_route_points = [
+            HybridPose(w.x_cm, w.y_cm, w.theta_rad) for w in plan.waypoints
+        ]
         self._tracked_balls = list(result.smoothed_ball_coordinates)
         self._crop_missing_counts = {}
         self._crop_hsv_ranges = (
@@ -1352,13 +1356,8 @@ class MainGui:
         return 0
 
     def _sync_route_view_strategy_to_planner(self) -> None:
-        """Apply the selected route-view strategy to the shared planner facade."""
-        if not (0 <= self._route_view_strategy_index < len(STRATEGY_OPTIONS)):
-            return
-        option = STRATEGY_OPTIONS[self._route_view_strategy_index]
-        strategy_name = CONFIG_STRATEGY_BY_ROUTE_VIEW_KEY.get(option.key)
-        if strategy_name is not None:
-            self._route_planner.set_strategy(strategy_name)
+        """No-op: fit-based pathing uses a single strategy (NearestNeighborStrategy)."""
+        pass
 
     def _close_route_view(self) -> None:
         self._route_view_open = False
@@ -1451,7 +1450,6 @@ class MainGui:
         ]
 
         if not targets:
-            draw_strategy_label(image, STRATEGY_OPTIONS[self._route_view_strategy_index])
             self._route_view_cached_image = image
             cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
             return
@@ -1461,24 +1459,6 @@ class MainGui:
         )
         mapper = self.renderer.mapper
         draw_pickup_geometry(image, geometry_result, mapper, self.config.field)
-
-        # Build obstacle from cross spec
-        if self._cross_spec is not None:
-            cs = self._cross_spec
-            obstacle = ObstacleGeometry(
-                center_x_cm=cs.center_cm[0],
-                center_y_cm=cs.center_cm[1],
-                half_size_cm=cs.length_cm / 2.0,
-                half_arm_width_cm=cs.arm_width_cm / 2.0,
-                angle_rad=cs.angle_rad,
-            )
-        else:
-            obstacle = ObstacleGeometry(
-                center_x_cm=-1000.0,
-                center_y_cm=-1000.0,
-                half_size_cm=0.0,
-                half_arm_width_cm=0.0,
-            )
 
         # Build start pose and route
         if self.robot_pose is not None:
@@ -1490,26 +1470,20 @@ class MainGui:
         else:
             start_pose = HybridPose(x_cm=20.0, y_cm=20.0, theta_rad=0.0)
 
-        margin = self._route_planner.hybrid_config.unload_staging_margin_cm
-        unload_pose = self._route_planner.hybrid_planner.small_goal_unload_pose(geometry, margin)
-        unload_goal_cm = self._route_planner.hybrid_planner.small_goal_center_cm()
+        unload_reach = geometry.rear_cm + geometry.unload_extension_cm
+        unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
 
+        from path.route_strategy import NearestNeighborStrategy, RoutePlannerInput
         route_input = RoutePlannerInput(
             geometry_result=geometry_result,
-            obstacle=obstacle,
             start_pose=start_pose,
-            robot_radius_cm=geometry_result.ring_radius_cm,
             field_width_cm=field_w,
             field_height_cm=field_h,
-            unload_pose=unload_pose,
-            unload_goal_cm=unload_goal_cm,
+            unload_position=unload_pos,
         )
-
-        strategy_option = STRATEGY_OPTIONS[self._route_view_strategy_index]
-        strategy = strategy_option.create()
+        strategy = NearestNeighborStrategy()
         strategy_result = strategy.plan(route_input)
         draw_route_plan(image, strategy_result, geometry_result, mapper, self.config.field)
-        draw_strategy_label(image, strategy_option)
 
         self._route_view_cached_image = image
         cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)

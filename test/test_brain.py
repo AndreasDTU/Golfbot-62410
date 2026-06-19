@@ -8,7 +8,7 @@ from unittest.mock import patch
 from control.commander import RobotCommander
 from guidance.guidance import GuidanceController
 from localization.models import RobotPose
-from path.pathfinding.models import HybridPose, RoutePlan
+from path.models import HybridPose, RoutePlan, RouteWaypoint, WaypointKind
 from config import DriveConfig
 
 from brain.models import BrainState, IntentAction
@@ -89,11 +89,34 @@ def make_plan(
     pickup_poses: list[HybridPose] | None = None,
     unload_pose: HybridPose | None = None,
 ) -> RoutePlan:
-    return RoutePlan(
-        points=points,
-        pickup_poses=pickup_poses or [],
-        unload_pose=unload_pose,
-    )
+    """Build a RoutePlan from old-style args (adapter for existing tests)."""
+    pickup_ids = {id(p) for p in (pickup_poses or [])}
+    waypoints: list[RouteWaypoint] = []
+    for point in points:
+        kind = WaypointKind.PICKUP if id(point) in pickup_ids else WaypointKind.NAVIGATE
+        waypoints.append(RouteWaypoint(
+            x_cm=point.x_cm, y_cm=point.y_cm, theta_rad=point.theta_rad,
+            kind=kind,
+        ))
+    if unload_pose is not None:
+        # Deduplicate: if the last waypoint is a NAVIGATE at the same position,
+        # replace it with UNLOAD instead of appending a duplicate.
+        if (waypoints
+                and waypoints[-1].kind == WaypointKind.NAVIGATE
+                and waypoints[-1].x_cm == unload_pose.x_cm
+                and waypoints[-1].y_cm == unload_pose.y_cm):
+            waypoints[-1] = RouteWaypoint(
+                x_cm=unload_pose.x_cm, y_cm=unload_pose.y_cm,
+                theta_rad=unload_pose.theta_rad,
+                kind=WaypointKind.UNLOAD,
+            )
+        else:
+            waypoints.append(RouteWaypoint(
+                x_cm=unload_pose.x_cm, y_cm=unload_pose.y_cm,
+                theta_rad=unload_pose.theta_rad,
+                kind=WaypointKind.UNLOAD,
+            ))
+    return RoutePlan(waypoints=tuple(waypoints))
 
 
 DT = 0.033  # ~30 FPS
@@ -185,7 +208,7 @@ class TestDriveOnly:
         brain.load_route(make_plan([p1, p2]))
 
         brain.tick(pose(0, 0, 0), DT)
-        assert brain.intent.target_pose is p2
+        assert brain.intent.target_pose == p2
 
     def test_multi_waypoint_drive(self):
         """Guidance walks through all waypoints in a DRIVE step."""

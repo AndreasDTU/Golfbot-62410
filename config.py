@@ -104,17 +104,30 @@ class WindowConfig:
 
 @dataclass(frozen=True)
 class RobotGeometryConfig:
-    """Physical and tuned robot geometry in centimeters."""
+    """Fallback robot geometry in centimeters.
+
+    These are UI-trackbar defaults only.  The actual robot dimensions are
+    loaded from data/robot_calibration.json at startup and mapped into the
+    RobotGeometry dataclass (see localization/models.py for the canonical
+    field documentation and ASCII diagram).
+
+    Mapping from calibration file → RobotGeometry:
+        geometry.width_cm          → RobotGeometry.width_cm
+        geometry.front_cm          → RobotGeometry.front_cm
+        geometry.rear_cm           → RobotGeometry.rear_cm
+        geometry.tube_forward_cm   → RobotGeometry.tube_forward_cm
+        geometry.tube_right_cm     → RobotGeometry.tube_right_cm
+    """
 
     radius_cm: int = 15
     marker_ids: tuple[int, ...] = (4, 5)
     marker_height_cm: float = 9.0
     forward_heading_offset_rad: float = math.pi
-    tuned_footprint_width_cm: float = 20.0
-    tuned_footprint_front_from_origin_cm: float = 8.3
-    tuned_footprint_rear_from_origin_cm: float = 10.1
-    tuned_tube_offset_cm: float = 17.1
-    tuned_tube_right_offset_cm: float = 0.0
+    tuned_footprint_width_cm: float = 20.0  # fallback for width_cm
+    tuned_footprint_front_from_origin_cm: float = 8.3  # fallback for front_cm
+    tuned_footprint_rear_from_origin_cm: float = 10.1  # fallback for rear_cm
+    tuned_tube_offset_cm: float = 17.1  # fallback for tube_forward_cm
+    tuned_tube_right_offset_cm: float = 0.0  # fallback for tube_right_cm
 
 
 @dataclass(frozen=True)

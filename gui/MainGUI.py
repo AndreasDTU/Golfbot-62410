@@ -299,6 +299,11 @@ class MainGui:
     _needs_verification_snapshot: bool = False                  # triggers YOLO on next _process_frame
     _verification_snapshot_done: bool = False                   # set by _process_frame, consumed by verifier
 
+    # Timer state
+    _timer_start_time: float | None = None
+    _timer_elapsed: float = 0.0
+    _timer_running: bool = False
+
     # Robot self-calibration state
     _calib_collector: RobotCalibrationCollector | None = None
     _calib_runtime: RobotCalibrationRuntime | None = None
@@ -789,6 +794,8 @@ class MainGui:
 
     def _disconnect_guidance(self) -> None:
         """Clear route, stop robot, close socket, reset guidance and brain state."""
+        self._timer_running = False
+
         if self._brain is not None:
             self._brain.reset()
         self._brain = None
@@ -929,6 +936,10 @@ class MainGui:
                 )
                 self.mode = AppMode.AUTO
                 self.message = f"Brain running — {brain.step_count} steps"
+
+                self._timer_start_time = time.perf_counter()
+                self._timer_elapsed = 0.0
+                self._timer_running = True
             except Exception as exc:
                 self.message = f"Brain start failed: {exc}"
                 self._commander = None
@@ -1128,6 +1139,11 @@ class MainGui:
         ):
             self._replan_after_displacement()
 
+        if self._timer_running and self._timer_start_time is not None:
+            self._timer_elapsed = time.perf_counter() - self._timer_start_time
+
+            if self._brain_state and self._brain_state.name == "DONE":
+                self._timer_running = False
     # ------------------------------------------------------------------
     # Robot self-calibration (spin -> fit center -> align body -> save)
     # ------------------------------------------------------------------
@@ -1728,7 +1744,8 @@ class MainGui:
             connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
             if self._connecting:
                 connected = "Connecting..."
-            brain_line = f"Brain: {bs} | Step: {step_cur}/{step_tot} | {connected}"
+            timer_str = f"Time: {self._timer_elapsed:.1f}s"
+            brain_line = f"Brain: {bs} | Step: {step_cur}/{step_tot} | {connected} | {timer_str}"
             cv2.putText(canvas, brain_line, (20, y0 + 42),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 220), 1, cv2.LINE_AA)
             cv2.putText(canvas, self.message, (20, y0 + 62),

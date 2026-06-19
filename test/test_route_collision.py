@@ -23,6 +23,7 @@ from path.pickup_geometry import (
     compute_pickup_geometry,
 )
 from path.planner import (
+    CompileStrategy,
     _bresenham_clear,
     _field_to_grid,
     _grid_astar,
@@ -558,3 +559,85 @@ class TestEdgeCases:
         start = HybridPose(x_cm=30.0, y_cm=30.0, theta_rad=0.0)
         plan = plan_route(grid, [], start, geometry, fc)
         assert len(plan.waypoints) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: CompileStrategy.MINIMAL vs FULL
+# ---------------------------------------------------------------------------
+
+class TestCompileStrategyMinimal:
+    """Verify MINIMAL produces fewer waypoints while staying collision-free."""
+
+    @pytest.fixture
+    def setup(self):
+        grid = make_cross_obstacle_grid()
+        df = make_distance_field(grid)
+        blocked = make_blocked_grid(df)
+        fc = FieldConfig()
+        return df, blocked, fc
+
+    def _make_strategy_result(self, x_cm, y_cm, theta=0.0):
+        cand = PickupCandidate(
+            x_cm=x_cm, y_cm=y_cm, theta_rad=theta,
+            category=PickupCategory.SAFE,
+            obstacle_distance_cm=30.0,
+            ball_index=0,
+        )
+        stop = RouteStop(candidate=cand, intermediate_node=None, ball_index=0)
+        return RouteStrategyResult(
+            stops=(stop,), unreachable_balls=(), unload_position=None,
+        )
+
+    def test_minimal_is_collision_free(self, setup):
+        df, blocked, fc = setup
+        start = HybridPose(x_cm=30.0, y_cm=60.75, theta_rad=0.0)
+        strategy = self._make_strategy_result(130.0, 60.75)
+        plan = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            strategy=CompileStrategy.MINIMAL,
+        )
+        assert_route_avoids_cross(plan, blocked, fc.height_cm)
+
+    def test_minimal_fewer_waypoints_than_full(self, setup):
+        df, blocked, fc = setup
+        start = HybridPose(x_cm=30.0, y_cm=60.75, theta_rad=0.0)
+        strategy = self._make_strategy_result(130.0, 60.75)
+        plan_full = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            strategy=CompileStrategy.FULL,
+        )
+        plan_minimal = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            strategy=CompileStrategy.MINIMAL,
+        )
+        nav_full = [w for w in plan_full.waypoints if w.kind == WaypointKind.NAVIGATE]
+        nav_minimal = [w for w in plan_minimal.waypoints if w.kind == WaypointKind.NAVIGATE]
+        assert len(nav_minimal) <= len(nav_full)
+
+    def test_minimal_has_detour_across_cross(self, setup):
+        df, blocked, fc = setup
+        start = HybridPose(x_cm=30.0, y_cm=60.75, theta_rad=0.0)
+        strategy = self._make_strategy_result(130.0, 60.75)
+        plan = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            strategy=CompileStrategy.MINIMAL,
+        )
+        nav_wps = [w for w in plan.waypoints if w.kind == WaypointKind.NAVIGATE]
+        assert len(nav_wps) >= 1, "MINIMAL should still detour around cross"
+
+    def test_both_strategies_same_for_clear_path(self, setup):
+        df, blocked, fc = setup
+        start = HybridPose(x_cm=30.0, y_cm=30.0, theta_rad=0.0)
+        strategy = self._make_strategy_result(60.0, 30.0)
+        plan_full = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            strategy=CompileStrategy.FULL,
+        )
+        plan_minimal = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            strategy=CompileStrategy.MINIMAL,
+        )
+        nav_full = [w for w in plan_full.waypoints if w.kind == WaypointKind.NAVIGATE]
+        nav_minimal = [w for w in plan_minimal.waypoints if w.kind == WaypointKind.NAVIGATE]
+        assert len(nav_full) == 0
+        assert len(nav_minimal) == 0

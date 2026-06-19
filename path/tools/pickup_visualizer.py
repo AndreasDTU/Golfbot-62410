@@ -26,14 +26,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from config import AppConfig, FieldConfig
-from path.models import HybridPose, PlannedBallTarget, RoutePlan
+from path.models import HybridPose, PlannedBallTarget, RoutePlan, WaypointKind
 from path.pickup_geometry import (
     PickupCategory,
     PickupGeometryResult,
     compute_pickup_geometry,
     pickup_reach_cm,
 )
-from path.planner import compile_route
+from path.planner import CompileStrategy, compile_route
 from path.route_strategy import (
     NearestNeighborStrategy,
     RoutePlannerInput,
@@ -413,6 +413,7 @@ def _compute_and_render(
     geometry,
     seed: int,
     strategy_option: StrategyOption,
+    compile_strategy: CompileStrategy = CompileStrategy.MINIMAL,
 ) -> np.ndarray:
     """Generate a scenario, compute geometry + route, render, and print summary."""
     config = state.config
@@ -461,6 +462,7 @@ def _compute_and_render(
         start_pose=start,
         half_width_cm=geometry.width_cm * 0.5,
         field_height_cm=config.field.height_cm,
+        strategy=compile_strategy,
     )
 
     # Render
@@ -477,7 +479,7 @@ def _compute_and_render(
 
     # Print summary
     R = pickup_reach_cm(geometry)
-    print(f"\n--- seed={seed} strategy={strategy_option.key} ---")
+    print(f"\n--- seed={seed} strategy={strategy_option.key} compile={compile_strategy.value} ---")
     print(f"R = {R:.1f} cm  tank = {result.tank_turn_radius_cm:.1f} cm  "
           f"sweep = {result.tube_sweep_radius_cm:.1f} cm")
     print(f"Field: {config.field.width_cm} x {config.field.height_cm} cm")
@@ -507,6 +509,10 @@ def _compute_and_render(
         print(f"  Stop {i + 1}: #{ball.track_id} at ({stop.candidate.x_cm:.1f}, "
               f"{stop.candidate.y_cm:.1f}) [{cat}]{inter_str}")
 
+    # Compiled route summary
+    nav_count = sum(1 for w in route_plan.waypoints if w.kind == WaypointKind.NAVIGATE)
+    print(f"Compiled: {len(route_plan.waypoints)} waypoints ({nav_count} navigate)")
+
     return image
 
 
@@ -526,6 +532,12 @@ def main() -> int:
         default=STRATEGY_OPTIONS[0].key,
         help="Initial route strategy shown in the visualizer",
     )
+    parser.add_argument(
+        "--compile",
+        choices=["full", "minimal"],
+        default="minimal",
+        help="Initial compile strategy: 'full' (Douglas-Peucker) or 'minimal' (greedy visibility)",
+    )
     args = parser.parse_args()
 
     if args.mode == "camera":
@@ -542,10 +554,13 @@ def main() -> int:
         index for index, option in enumerate(STRATEGY_OPTIONS)
         if option.key == args.strategy
     )
+    compile_strategy = CompileStrategy(args.compile)
     image: np.ndarray | None = None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, config.windows.schematic_width_px, config.windows.schematic_height_px)
+
+    HELP_TEXT = "Press 'r' to randomize, 'c' to toggle compile strategy, Esc/q to quit."
 
     def render_current() -> None:
         nonlocal image
@@ -555,11 +570,12 @@ def main() -> int:
             geometry,
             seed,
             STRATEGY_OPTIONS[strategy_index],
+            compile_strategy=compile_strategy,
         )
         cv2.imshow(WINDOW_NAME, image)
 
     render_current()
-    print("\nPress 'r' to randomize, Esc/q to quit.")
+    print(f"\n{HELP_TEXT}")
 
     while True:
         key = cv2.waitKey(50) & 0xFF
@@ -568,7 +584,14 @@ def main() -> int:
         if key == ord("r"):
             seed += 1
             render_current()
-            print("\nPress 'r' to randomize, Esc/q to quit.")
+            print(f"\n{HELP_TEXT}")
+        if key == ord("c"):
+            if compile_strategy == CompileStrategy.MINIMAL:
+                compile_strategy = CompileStrategy.FULL
+            else:
+                compile_strategy = CompileStrategy.MINIMAL
+            render_current()
+            print(f"\n{HELP_TEXT}")
 
     cv2.destroyAllWindows()
     return 0

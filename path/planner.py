@@ -12,8 +12,22 @@ from __future__ import annotations
 
 import heapq
 import math
+from enum import Enum
 
 import numpy as np
+
+
+class CompileStrategy(str, Enum):
+    """Path simplification strategy for the route compiler.
+
+    FULL    -- A* + Douglas-Peucker with collision-safe recursive splitting.
+               Preserves path shape; more intermediate waypoints.
+    MINIMAL -- A* + greedy farthest-visible-point simplification.
+               Fewest possible waypoints; better for stop-pivot-go guidance.
+    """
+
+    FULL = "full"
+    MINIMAL = "minimal"
 
 from config import FieldConfig
 from localization.models import RobotGeometry
@@ -249,6 +263,33 @@ def _safe_simplify(
     return left + right[1:]
 
 
+def _greedy_visibility_simplify(
+    blocked: np.ndarray,
+    path: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Simplify a grid path by greedily jumping to the farthest visible point.
+
+    From the current point, scan backward from the end of the remaining path
+    to find the farthest point with a clear Bresenham line-of-sight.  Jump
+    there and repeat.  Produces the minimum number of waypoints where every
+    segment is guaranteed collision-free.
+    """
+    if len(path) <= 2:
+        return list(path)
+
+    result = [path[0]]
+    current = 0
+    while current < len(path) - 1:
+        farthest = current + 1
+        for j in range(len(path) - 1, current, -1):
+            if _bresenham_clear(blocked, *path[current], *path[j]):
+                farthest = j
+                break
+        result.append(path[farthest])
+        current = farthest
+    return result
+
+
 def _emit_astar_waypoints(
     blocked: np.ndarray,
     start_col: int,
@@ -257,6 +298,7 @@ def _emit_astar_waypoints(
     goal_row: int,
     field_height_cm: float,
     target_theta: float,
+    strategy: CompileStrategy = CompileStrategy.MINIMAL,
 ) -> list[RouteWaypoint]:
     """Run A*, simplify, and emit NAVIGATE waypoints between two grid cells.
 
@@ -267,8 +309,10 @@ def _emit_astar_waypoints(
     if grid_path is None or len(grid_path) <= 1:
         return []
 
-    # Simplify with collision-safe recursive splitting.
-    simplified = _safe_simplify(blocked, grid_path, epsilon=2.0)
+    if strategy == CompileStrategy.MINIMAL:
+        simplified = _greedy_visibility_simplify(blocked, grid_path)
+    else:
+        simplified = _safe_simplify(blocked, grid_path, epsilon=2.0)
 
     # Emit intermediate waypoints (skip first = current position, skip last
     # = the target itself which the caller emits with its own kind).
@@ -294,6 +338,7 @@ def compile_route(
     start_pose: HybridPose,
     half_width_cm: float,
     field_height_cm: float,
+    strategy: CompileStrategy = CompileStrategy.MINIMAL,
 ) -> RoutePlan:
     """Compile ordered route stops into a flat annotated waypoint sequence.
 
@@ -313,6 +358,9 @@ def compile_route(
         Robot half-width for body clearance (~9.75 cm).
     field_height_cm : float
         Field height for coordinate conversion.
+    strategy : CompileStrategy
+        Path simplification strategy.  MINIMAL (default) produces fewer
+        waypoints; FULL preserves more of the A* path shape.
 
     Returns
     -------
@@ -365,7 +413,7 @@ def compile_route(
             # Line blocked — insert A* detour waypoints.
             detour = _emit_astar_waypoints(
                 blocked, start_col, start_row, goal_col, goal_row,
-                field_height_cm, theta,
+                field_height_cm, theta, strategy=strategy,
             )
             waypoints.extend(detour)
 
@@ -394,6 +442,7 @@ def plan_route(
     geometry: RobotGeometry,
     field_config: FieldConfig,
     unload_position: tuple[float, float] | None = None,
+    compile_strategy: CompileStrategy = CompileStrategy.MINIMAL,
 ) -> RoutePlan:
     """Chain all three path layers to produce a ``RoutePlan``.
 
@@ -413,6 +462,8 @@ def plan_route(
         Field dimensions.
     unload_position : tuple[float, float] | None
         Staging position for unloading, or None to skip unload.
+    compile_strategy : CompileStrategy
+        Path simplification strategy passed to ``compile_route()``.
 
     Returns
     -------
@@ -446,6 +497,7 @@ def plan_route(
         start_pose=start_pose,
         half_width_cm=geometry.width_cm * 0.5,
         field_height_cm=field_config.height_cm,
+        strategy=compile_strategy,
     )
 
     return plan

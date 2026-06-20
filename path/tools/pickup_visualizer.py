@@ -34,10 +34,14 @@ from path.pickup_geometry import (
     pickup_reach_cm,
 )
 from path.planner import CompileStrategy, compile_route
+from path.route_stats import RouteStats, compute_route_stats
 from path.route_strategy import (
+    IntersectionPriorityStrategy,
     NearestNeighborStrategy,
     RoutePlannerInput,
     RouteStrategyResult,
+    SweepStrategy,
+    TwoOptStrategy,
 )
 from path.tools.pathfinding_sandbox import (
     RANDOM_BALL_COUNT,
@@ -46,7 +50,7 @@ from path.tools.pathfinding_sandbox import (
     balls_as_smoothed_coordinates,
     build_red_zones,
     centered_cross_obstacle_contours,
-    random_ball_positions,
+    is_inside_center_cross_clearance,
 )
 from perception.vision.debug import SchematicRenderer
 from perception.vision.geometry import CoordinateMapper
@@ -79,6 +83,9 @@ class StrategyOption:
 
 STRATEGY_OPTIONS = (
     StrategyOption("nearest-neighbor", "Nearest-neighbor (fit-based)", NearestNeighborStrategy),
+    StrategyOption("2-opt", "2-opt (distance)", TwoOptStrategy),
+    StrategyOption("sweep", "Sweep (turns)", SweepStrategy),
+    StrategyOption("intersection", "Intersection priority", IntersectionPriorityStrategy),
 )
 
 
@@ -86,18 +93,95 @@ STRATEGY_OPTIONS = (
 # Test scenario generator
 # ---------------------------------------------------------------------------
 
+def _mixed_ball_point(
+    rng: np.random.Generator,
+    width: float,
+    height: float,
+) -> tuple[float, float]:
+    """Sample a ball position from a mixed distribution.
+
+    Distribution mix (approximate):
+      ~30 % near field edges  (10-25 cm from wall)
+      ~30 % near the cross    (within ~20 cm of the cross perimeter)
+      ~40 % uniform interior  (margin-padded)
+
+    This gives more realistic test coverage than pure edge-biased
+    placement: balls cluster near the cross (where routing is hard)
+    while still appearing throughout the field.
+    """
+    margin = 10.0
+    r = float(rng.uniform())
+
+    if r < 0.30:
+        # --- Edge-biased: 10-25 cm from a random wall ---
+        perimeter = 2 * (width + height)
+        p = float(rng.uniform(0, perimeter))
+        offset = float(rng.uniform(10.0, 25.0))
+        if p < width:
+            return float(rng.uniform(margin, width - margin)), offset
+        p -= width
+        if p < height:
+            return width - offset, float(rng.uniform(margin, height - margin))
+        p -= height
+        if p < width:
+            return float(rng.uniform(margin, width - margin)), height - offset
+        return offset, float(rng.uniform(margin, height - margin))
+
+    if r < 0.60:
+        # --- Cross-biased: near the cross perimeter ---
+        cx, cy = width * 0.5, height * 0.5
+        # Random angle, distance 12-25 cm from cross center.
+        angle = float(rng.uniform(0, 2 * math.pi))
+        dist = float(rng.uniform(12.0, 25.0))
+        x = cx + dist * math.cos(angle)
+        y = cy + dist * math.sin(angle)
+        # Clamp inside field margins.
+        x = max(margin, min(width - margin, x))
+        y = max(margin, min(height - margin, y))
+        return x, y
+
+    # --- Uniform interior ---
+    return (
+        float(rng.uniform(margin, width - margin)),
+        float(rng.uniform(margin, height - margin)),
+    )
+
+
+# Minimum distance (cm) between any two balls in the test scenario.
+_MIN_BALL_SPACING_CM = 13.0
+
+
 def generate_test_scenario(
     state: SandboxState,
     seed: int = 42,
 ) -> None:
-    """Populate the sandbox with randomly placed balls and a center cross."""
+    """Populate the sandbox with randomly placed balls and a center cross.
+
+    Uses a mixed placement distribution: balls appear near the field
+    edges, near the cross obstacle, and uniformly across the interior.
+    """
     state.rng = np.random.default_rng(seed)
     state.balls.clear()
     state.obstacle_contours = centered_cross_obstacle_contours(state)
     state.next_track_id = 1
 
-    positions = random_ball_positions(state, RANDOM_BALL_COUNT)
-    orange_index = int(state.rng.integers(0, RANDOM_BALL_COUNT))
+    field = state.config.field
+    positions: list[tuple[float, float]] = []
+    max_attempts = 2000
+    for _ in range(max_attempts):
+        if len(positions) >= RANDOM_BALL_COUNT:
+            break
+        point = _mixed_ball_point(state.rng, field.width_cm, field.height_cm)
+        if is_inside_center_cross_clearance(state, point, 0.0):
+            continue
+        if any(
+            math.hypot(point[0] - ex[0], point[1] - ex[1]) < _MIN_BALL_SPACING_CM
+            for ex in positions
+        ):
+            continue
+        positions.append(point)
+
+    orange_index = int(state.rng.integers(0, len(positions)))
 
     for index, (x_cm, y_cm) in enumerate(positions):
         label = "orange" if index == orange_index else "white"
@@ -313,6 +397,7 @@ def draw_legend(
     image: np.ndarray,
     geometry_result: PickupGeometryResult,
     strategy_result: RouteStrategyResult,
+    strategy_label: str = "",
 ) -> None:
     """Draw a compact legend at the bottom of the image."""
     h, w = image.shape[:2]
@@ -335,6 +420,13 @@ def draw_legend(
                 (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(image, legend, (10, y_px), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (220, 220, 220), 1, cv2.LINE_AA)
+
+    # Strategy name (top-left corner)
+    if strategy_label:
+        cv2.putText(image, strategy_label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(image, strategy_label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 220, 255), 1, cv2.LINE_AA)
 
 
 def draw_start_marker(
@@ -414,8 +506,13 @@ def _compute_and_render(
     seed: int,
     strategy_option: StrategyOption,
     compile_strategy: CompileStrategy = CompileStrategy.MINIMAL,
-) -> np.ndarray:
-    """Generate a scenario, compute geometry + route, render, and print summary."""
+    quiet: bool = False,
+) -> tuple[np.ndarray, RoutePlan]:
+    """Generate a scenario, compute geometry + route, render, and print summary.
+
+    Returns ``(image, route_plan)``.  When *quiet* is True, suppresses
+    per-ball detail output (used in benchmark mode).
+    """
     config = state.config
 
     generate_test_scenario(state, seed=seed)
@@ -463,6 +560,7 @@ def _compute_and_render(
         half_width_cm=geometry.width_cm * 0.5,
         field_height_cm=config.field.height_cm,
         strategy=compile_strategy,
+        balls=targets,
     )
 
     # Render
@@ -471,49 +569,100 @@ def _compute_and_render(
     draw_route_plan(image, strategy_result, result, state.renderer.mapper, config.field, start,
                     route_plan=route_plan)
     draw_start_marker(image, start, state.renderer.mapper)
-    draw_legend(image, result, strategy_result)
+    draw_legend(image, result, strategy_result, strategy_label=strategy_option.label)
 
     # Save output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(OUTPUT_FILE), image)
 
+    # Route stats
+    stats = compute_route_stats(route_plan)
+
     # Print summary
-    R = pickup_reach_cm(geometry)
-    print(f"\n--- seed={seed} strategy={strategy_option.key} compile={compile_strategy.value} ---")
-    print(f"R = {R:.1f} cm  tank = {result.tank_turn_radius_cm:.1f} cm  "
-          f"sweep = {result.tube_sweep_radius_cm:.1f} cm")
-    print(f"Field: {config.field.width_cm} x {config.field.height_cm} cm")
-    print(f"Balls: {len(result.balls)}")
-    for i, bc in enumerate(result.balls):
-        ball = bc.ball
-        if bc.reachable:
-            safe = sum(1 for c in bc.candidates if c.category == PickupCategory.SAFE)
-            between = sum(1 for c in bc.candidates if c.category == PickupCategory.IN_BETWEEN)
-            constrained = sum(1 for c in bc.candidates if c.category == PickupCategory.CONSTRAINED)
-            status = f"{len(bc.candidates)} candidates ({safe}S/{between}B/{constrained}C)"
-        else:
-            status = "UNREACHABLE"
-        print(f"  #{ball.track_id} ({ball.label}) at ({ball.x_cm:.1f}, {ball.y_cm:.1f}): {status}")
+    if not quiet:
+        R = pickup_reach_cm(geometry)
+        print(f"\n--- seed={seed} strategy={strategy_option.key} compile={compile_strategy.value} ---")
+        print(f"R = {R:.1f} cm  tank = {result.tank_turn_radius_cm:.1f} cm  "
+              f"sweep = {result.tube_sweep_radius_cm:.1f} cm")
+        print(f"Field: {config.field.width_cm} x {config.field.height_cm} cm")
+        print(f"Balls: {len(result.balls)}")
+        for i, bc in enumerate(result.balls):
+            ball = bc.ball
+            if bc.reachable:
+                safe = sum(1 for c in bc.candidates if c.category == PickupCategory.SAFE)
+                between = sum(1 for c in bc.candidates if c.category == PickupCategory.IN_BETWEEN)
+                constrained = sum(1 for c in bc.candidates if c.category == PickupCategory.CONSTRAINED)
+                status = f"{len(bc.candidates)} candidates ({safe}S/{between}B/{constrained}C)"
+            else:
+                status = "UNREACHABLE"
+            print(f"  #{ball.track_id} ({ball.label}) at ({ball.x_cm:.1f}, {ball.y_cm:.1f}): {status}")
 
-    # Route summary
-    intermediates = sum(1 for s in strategy_result.stops if s.intermediate_node is not None)
-    print(f"Route: {len(strategy_result.stops)} stops, {intermediates} intermediates, "
-          f"{len(strategy_result.unreachable_balls)} unreachable")
-    for i, stop in enumerate(strategy_result.stops):
-        ball = result.balls[stop.ball_index].ball
-        cat = stop.candidate.category.value
-        inter_str = ""
-        if stop.intermediate_node is not None:
-            inter = stop.intermediate_node
-            inter_str = f" via ({inter.x_cm:.1f}, {inter.y_cm:.1f})"
-        print(f"  Stop {i + 1}: #{ball.track_id} at ({stop.candidate.x_cm:.1f}, "
-              f"{stop.candidate.y_cm:.1f}) [{cat}]{inter_str}")
+        # Route summary
+        intermediates = sum(1 for s in strategy_result.stops if s.intermediate_node is not None)
+        print(f"Route: {len(strategy_result.stops)} stops, {intermediates} intermediates, "
+              f"{len(strategy_result.unreachable_balls)} unreachable")
+        for i, stop in enumerate(strategy_result.stops):
+            ball = result.balls[stop.ball_index].ball
+            cat = stop.candidate.category.value
+            inter_str = ""
+            if stop.intermediate_node is not None:
+                inter = stop.intermediate_node
+                inter_str = f" via ({inter.x_cm:.1f}, {inter.y_cm:.1f})"
+            print(f"  Stop {i + 1}: #{ball.track_id} at ({stop.candidate.x_cm:.1f}, "
+                  f"{stop.candidate.y_cm:.1f}) [{cat}]{inter_str}")
 
-    # Compiled route summary
-    nav_count = sum(1 for w in route_plan.waypoints if w.kind == WaypointKind.NAVIGATE)
-    print(f"Compiled: {len(route_plan.waypoints)} waypoints ({nav_count} navigate)")
+        # Compiled route summary
+        nav_count = sum(1 for w in route_plan.waypoints if w.kind == WaypointKind.NAVIGATE)
+        print(f"Compiled: {len(route_plan.waypoints)} waypoints ({nav_count} navigate)")
 
-    return image
+    print(f"Stats: distance={stats.total_distance_cm}cm  turns={stats.turn_count}  "
+          f"max_turn={stats.max_turn_deg}deg  waypoints={stats.waypoint_count} "
+          f"({stats.navigate_count} nav)")
+
+    return image, route_plan
+
+
+def _run_benchmark(
+    n_seeds: int,
+    state: SandboxState,
+    occupancy_builder: OccupancyGridBuilder,
+    geometry,
+    compile_strategy: CompileStrategy,
+    start_seed: int = 42,
+) -> None:
+    """Run *n_seeds* scenarios across all strategies and print a comparison table."""
+    # {strategy_key: [RouteStats, ...]}
+    all_stats: dict[str, list[RouteStats]] = {opt.key: [] for opt in STRATEGY_OPTIONS}
+
+    for seed in range(start_seed, start_seed + n_seeds):
+        for option in STRATEGY_OPTIONS:
+            _, route_plan = _compute_and_render(
+                state, occupancy_builder, geometry, seed, option,
+                compile_strategy=compile_strategy, quiet=True,
+            )
+            stats = compute_route_stats(route_plan)
+            all_stats[option.key].append(stats)
+
+    # Print comparison table.
+    print("\n" + "=" * 80)
+    print(f"BENCHMARK: {n_seeds} seeds (seed {start_seed}..{start_seed + n_seeds - 1})")
+    print("=" * 80)
+    header = f"{'Strategy':<20} {'Dist(cm)':>10} {'Turns':>8} {'MaxTurn':>10} {'WPs':>6} {'Nav':>6}"
+    print(header)
+    print("-" * len(header))
+
+    for option in STRATEGY_OPTIONS:
+        stats_list = all_stats[option.key]
+        n = len(stats_list)
+        avg_dist = sum(s.total_distance_cm for s in stats_list) / n
+        avg_turns = sum(s.turn_count for s in stats_list) / n
+        avg_max_turn = sum(s.max_turn_deg for s in stats_list) / n
+        avg_wps = sum(s.waypoint_count for s in stats_list) / n
+        avg_nav = sum(s.navigate_count for s in stats_list) / n
+        print(f"{option.key:<20} {avg_dist:>10.1f} {avg_turns:>8.1f} "
+              f"{avg_max_turn:>10.1f} {avg_wps:>6.1f} {avg_nav:>6.1f}")
+
+    print("=" * 80)
 
 
 def main() -> int:
@@ -538,6 +687,13 @@ def main() -> int:
         default="minimal",
         help="Initial compile strategy: 'full' (Douglas-Peucker) or 'minimal' (greedy visibility)",
     )
+    parser.add_argument(
+        "--benchmark",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Run N seeds across all strategies and print comparison table (no GUI)",
+    )
     args = parser.parse_args()
 
     if args.mode == "camera":
@@ -549,22 +705,34 @@ def main() -> int:
     geometry = renderer.robot_geometry_from_params(None)
     state = SandboxState(config=config, renderer=renderer)
 
+    compile_strategy = CompileStrategy(args.compile)
+
+    # --- Benchmark mode (no GUI) ---
+    if args.benchmark > 0:
+        _run_benchmark(
+            args.benchmark, state, occupancy_builder, geometry,
+            compile_strategy, start_seed=args.seed,
+        )
+        return 0
+
     seed = args.seed
     strategy_index = next(
         index for index, option in enumerate(STRATEGY_OPTIONS)
         if option.key == args.strategy
     )
-    compile_strategy = CompileStrategy(args.compile)
     image: np.ndarray | None = None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, config.windows.schematic_width_px, config.windows.schematic_height_px)
 
-    HELP_TEXT = "Press 'r' to randomize, 'c' to toggle compile strategy, Esc/q to quit."
+    HELP_TEXT = (
+        "Press 'r' to randomize, 's' to cycle strategy, "
+        "'c' to toggle compile strategy, Esc/q to quit."
+    )
 
     def render_current() -> None:
         nonlocal image
-        image = _compute_and_render(
+        image, _ = _compute_and_render(
             state,
             occupancy_builder,
             geometry,
@@ -583,6 +751,10 @@ def main() -> int:
             break
         if key == ord("r"):
             seed += 1
+            render_current()
+            print(f"\n{HELP_TEXT}")
+        if key == ord("s"):
+            strategy_index = (strategy_index + 1) % len(STRATEGY_OPTIONS)
             render_current()
             print(f"\n{HELP_TEXT}")
         if key == ord("c"):

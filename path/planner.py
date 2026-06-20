@@ -14,6 +14,7 @@ import heapq
 import math
 from enum import Enum
 
+import cv2
 import numpy as np
 
 
@@ -332,6 +333,29 @@ def _emit_astar_waypoints(
     return waypoints
 
 
+def _stamp_balls_on_blocked(
+    blocked: np.ndarray,
+    balls: list[PlannedBallTarget],
+    collected: set[int],
+    ball_radius_cm: float,
+    half_width_cm: float,
+    field_height_cm: float,
+) -> np.ndarray:
+    """Return a copy of *blocked* with uncollected balls stamped as obstacles.
+
+    Each ball is inflated by ``ball_radius_cm + half_width_cm`` so the
+    robot body clears it entirely.
+    """
+    result = blocked.copy()
+    inflate_px = max(1, round(ball_radius_cm + half_width_cm))
+    for idx, ball in enumerate(balls):
+        if idx in collected:
+            continue
+        col, row = _field_to_grid(ball.x_cm, ball.y_cm, field_height_cm)
+        cv2.circle(result, (col, row), inflate_px, 1, -1)
+    return result
+
+
 def compile_route(
     strategy_result: RouteStrategyResult,
     distance_field: np.ndarray,
@@ -339,12 +363,19 @@ def compile_route(
     half_width_cm: float,
     field_height_cm: float,
     strategy: CompileStrategy = CompileStrategy.MINIMAL,
+    balls: list[PlannedBallTarget] | None = None,
+    ball_radius_cm: float = 2.0,
 ) -> RoutePlan:
     """Compile ordered route stops into a flat annotated waypoint sequence.
 
     Uses the distance field as the single source of truth for collision
     avoidance: a grid cell is traversable if
     ``distance_field[row, col] >= half_width_cm``.
+
+    When *balls* is provided, uncollected balls are stamped into the
+    blocked grid as obstacles (inflated by ``ball_radius_cm +
+    half_width_cm``).  As each ball is picked up it is removed from the
+    blocked set for subsequent segments.
 
     Parameters
     ----------
@@ -361,6 +392,11 @@ def compile_route(
     strategy : CompileStrategy
         Path simplification strategy.  MINIMAL (default) produces fewer
         waypoints; FULL preserves more of the A* path shape.
+    balls : list[PlannedBallTarget] | None
+        All ball targets.  When provided, uncollected balls are treated
+        as collision objects.
+    ball_radius_cm : float
+        Physical ball radius for inflation (default 2.0 cm).
 
     Returns
     -------
@@ -369,7 +405,8 @@ def compile_route(
         annotations.  No movement semantics.
     """
     # Blocked grid: nonzero where robot body does not fit.
-    blocked = (distance_field < half_width_cm).astype(np.uint8)
+    blocked_base = (distance_field < half_width_cm).astype(np.uint8)
+    collected: set[int] = set()
 
     # ----- Build target sequence from stops -----
     # Each target: (x_cm, y_cm, theta_rad, WaypointKind, ball_index | None)
@@ -403,6 +440,19 @@ def compile_route(
     cx, cy = start_pose.x_cm, start_pose.y_cm
 
     for tx, ty, theta, kind, ball_idx in targets:
+        # Build blocked grid for this segment (with uncollected balls).
+        # Exclude the ball we're about to pick up — we're driving to it.
+        if balls:
+            skip = collected
+            if kind == WaypointKind.PICKUP and ball_idx is not None:
+                skip = collected | {ball_idx}
+            blocked = _stamp_balls_on_blocked(
+                blocked_base, balls, skip,
+                ball_radius_cm, half_width_cm, field_height_cm,
+            )
+        else:
+            blocked = blocked_base
+
         start_col, start_row = _field_to_grid(cx, cy, field_height_cm)
         goal_col, goal_row = _field_to_grid(tx, ty, field_height_cm)
 
@@ -415,6 +465,14 @@ def compile_route(
                 blocked, start_col, start_row, goal_col, goal_row,
                 field_height_cm, theta, strategy=strategy,
             )
+            if not detour and blocked is not blocked_base:
+                # A* failed with ball obstacles — retry with only
+                # cross/wall obstacles.  May clip a ball, but avoids
+                # driving straight through the cross.
+                detour = _emit_astar_waypoints(
+                    blocked_base, start_col, start_row, goal_col, goal_row,
+                    field_height_cm, theta, strategy=strategy,
+                )
             waypoints.extend(detour)
 
         # Emit the target itself.
@@ -422,6 +480,10 @@ def compile_route(
             x_cm=tx, y_cm=ty, theta_rad=theta,
             kind=kind, ball_index=ball_idx,
         ))
+
+        # Mark ball as collected after pickup.
+        if kind == WaypointKind.PICKUP and ball_idx is not None:
+            collected.add(ball_idx)
 
         cx, cy = tx, ty
 
@@ -498,6 +560,7 @@ def plan_route(
         half_width_cm=geometry.width_cm * 0.5,
         field_height_cm=field_config.height_cm,
         strategy=compile_strategy,
+        balls=balls,
     )
 
     return plan

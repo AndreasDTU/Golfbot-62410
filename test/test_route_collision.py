@@ -641,3 +641,153 @@ class TestCompileStrategyMinimal:
         nav_minimal = [w for w in plan_minimal.waypoints if w.kind == WaypointKind.NAVIGATE]
         assert len(nav_full) == 0
         assert len(nav_minimal) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: ball collision avoidance
+# ---------------------------------------------------------------------------
+
+def _make_empty_field_df() -> tuple[np.ndarray, FieldConfig]:
+    """Distance field for an empty field (no cross, walls only)."""
+    fc = FieldConfig()
+    grid = np.zeros((fc.grid_height_cm, fc.grid_width_cm), dtype=np.uint8)
+    return make_distance_field(grid), fc
+
+
+class TestBallCollisionAvoidance:
+    """Verify that uncollected balls are treated as collision objects."""
+
+    def _make_strategy_result(self, stops_data):
+        """Build a RouteStrategyResult from a list of (x, y, ball_index)."""
+        stops = []
+        for x, y, bidx in stops_data:
+            cand = PickupCandidate(
+                x_cm=x, y_cm=y, theta_rad=0.0,
+                category=PickupCategory.SAFE,
+                obstacle_distance_cm=30.0,
+                ball_index=bidx,
+            )
+            stops.append(RouteStop(
+                candidate=cand, intermediate_node=None, ball_index=bidx,
+            ))
+        return RouteStrategyResult(
+            stops=tuple(stops), unreachable_balls=(), unload_position=None,
+        )
+
+    def test_ball_in_direct_path_causes_detour(self):
+        """A ball sitting between start and goal should force a detour."""
+        df, fc = _make_empty_field_df()
+        # Start at left, goal at right, blocker ball in the middle.
+        start = HybridPose(x_cm=30.0, y_cm=60.0, theta_rad=0.0)
+        # balls[0] = goal ball (the one we pick up), balls[1] = blocker
+        goal_ball = make_ball(130.0, 60.0, track_id=1)
+        ball_blocker = make_ball(80.0, 60.0, track_id=99)
+        balls = [goal_ball, ball_blocker]
+        strategy = self._make_strategy_result([(130.0, 60.0, 0)])
+
+        # Without balls: direct path (no detour on empty field).
+        plan_no_balls = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+        )
+        nav_no_balls = [w for w in plan_no_balls.waypoints
+                        if w.kind == WaypointKind.NAVIGATE]
+        assert len(nav_no_balls) == 0
+
+        # With blocker ball: should detour around it.
+        plan_with_balls = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            balls=balls,
+        )
+        nav_with_balls = [w for w in plan_with_balls.waypoints
+                          if w.kind == WaypointKind.NAVIGATE]
+        assert len(nav_with_balls) >= 1, "Expected detour around blocker ball"
+
+    def test_collected_ball_no_longer_blocks(self):
+        """After picking up ball A, it should not block the path to ball B."""
+        df, fc = _make_empty_field_df()
+        # Three balls in a horizontal line. Visit order: 0, 1, 2.
+        # Ball 1 sits between ball 0 and ball 2.
+        balls = [
+            make_ball(40.0, 60.0, track_id=1),   # index 0 — visited first
+            make_ball(80.0, 60.0, track_id=2),    # index 1 — visited second
+            make_ball(130.0, 60.0, track_id=3),   # index 2 — visited last
+        ]
+        start = HybridPose(x_cm=20.0, y_cm=60.0, theta_rad=0.0)
+        strategy = self._make_strategy_result([
+            (40.0, 60.0, 0),
+            (80.0, 60.0, 1),
+            (130.0, 60.0, 2),
+        ])
+        plan = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            balls=balls,
+        )
+        # The path from ball 1 (index 1) to ball 2 (index 2) should be
+        # direct — ball 1 was collected, so it's no longer an obstacle.
+        # Count NAVIGATE waypoints between the 2nd and 3rd PICKUP.
+        pickups_seen = 0
+        nav_after_second_pickup = 0
+        for wp in plan.waypoints:
+            if wp.kind == WaypointKind.PICKUP:
+                pickups_seen += 1
+            elif wp.kind == WaypointKind.NAVIGATE and pickups_seen == 2:
+                nav_after_second_pickup += 1
+        assert nav_after_second_pickup == 0, (
+            "Ball 1 was collected — should not block path to ball 2"
+        )
+
+    def test_ball_avoidance_collision_free(self):
+        """All segments before the pickup should avoid the blocker ball."""
+        df, fc = _make_empty_field_df()
+        start = HybridPose(x_cm=30.0, y_cm=60.0, theta_rad=0.0)
+        goal_ball = make_ball(130.0, 60.0, track_id=1)
+        ball_blocker = make_ball(80.0, 60.0, track_id=99)
+        balls = [goal_ball, ball_blocker]
+        strategy = self._make_strategy_result([(130.0, 60.0, 0)])
+
+        plan = compile_route(
+            strategy, df, start, HALF_WIDTH_CM, fc.height_cm,
+            balls=balls,
+        )
+        # Verify on a blocked grid that includes the blocker ball.
+        # Goal ball (index 0) is excluded (we're driving to it).
+        from path.planner import _stamp_balls_on_blocked
+        blocked_base = make_blocked_grid(df)
+        blocked_with_blocker = _stamp_balls_on_blocked(
+            blocked_base, balls, collected={0},
+            ball_radius_cm=2.0, half_width_cm=HALF_WIDTH_CM,
+            field_height_cm=fc.height_cm,
+        )
+        # Every segment in the route should be clear of the blocker.
+        wps = plan.waypoints
+        for i in range(len(wps) - 1):
+            assert_segment_clear(
+                blocked_with_blocker,
+                wps[i].x_cm, wps[i].y_cm,
+                wps[i + 1].x_cm, wps[i + 1].y_cm,
+                fc.height_cm,
+            )
+
+    def test_no_balls_same_as_before(self):
+        """balls=None should produce the same result as the old behavior."""
+        df, fc = _make_empty_field_df()
+        start = HybridPose(x_cm=30.0, y_cm=60.0, theta_rad=0.0)
+        strategy_result = RouteStrategyResult(
+            stops=(RouteStop(
+                candidate=PickupCandidate(
+                    x_cm=130.0, y_cm=60.0, theta_rad=0.0,
+                    category=PickupCategory.SAFE,
+                    obstacle_distance_cm=30.0, ball_index=0,
+                ),
+                intermediate_node=None, ball_index=0,
+            ),),
+            unreachable_balls=(), unload_position=None,
+        )
+        plan_none = compile_route(
+            strategy_result, df, start, HALF_WIDTH_CM, fc.height_cm,
+        )
+        plan_empty = compile_route(
+            strategy_result, df, start, HALF_WIDTH_CM, fc.height_cm,
+            balls=[],
+        )
+        assert len(plan_none.waypoints) == len(plan_empty.waypoints)

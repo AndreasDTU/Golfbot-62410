@@ -135,13 +135,7 @@ class GuidanceController:
         target = self._waypoints[self._cursor]
         distance, heading_error = self._compute_geometry(pose, target)
 
-        # 2b Init driving
-        if not self._driving:
-            self._driving = self._commander.start_drive(distance)
-            self._log("DRIVING", dist=distance, ok=self._driving)
-            return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
-
-        # 5. Check arrival at current waypoint.
+        # 5. Check arrival at current waypoint (before driving init or turn check).
         is_last = self._cursor >= len(self._waypoints) - 1
         if distance < (self._ball_arrival_cm if is_last else self._waypoint_arrival_cm):
             if is_last:
@@ -157,7 +151,7 @@ class GuidanceController:
             self._log("DRIVING", dist=distance, ok=self._driving)
             return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
 
-        # 6. Large heading error — rotate in place.
+        # 6. Large heading error — rotate in place (check BEFORE driving init).
         if abs(heading_error) > self._config.max_heading_for_forward_rad:
             ok = self._commander.turn(math.degrees(heading_error))
             self._log(
@@ -166,7 +160,13 @@ class GuidanceController:
             )
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
-        # 7. Drive forward with arc correction (single combined LR command).
+        # 7. Initialize driving or continue with heading correction.
+        if not self._driving:
+            self._driving = self._commander.start_drive(distance, math.degrees(heading_error))
+            self._log("DRIVING", dist=distance, ok=self._driving)
+            return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
+
+        # 8. Drive forward with arc correction (single combined LR command).
         ok = self._commander.drive_adjusted(distance, math.degrees(heading_error))
         self._log(
             "DRIVING", dist=distance,

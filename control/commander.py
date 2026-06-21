@@ -265,14 +265,17 @@ class RobotCommander:
         self._current_speed = 0.0
         return self._send_wheel_speeds(-sign * speed, sign * speed)
 
-    def start_drive(self, cm: float) -> bool:
-        """Initialize drive.  *cm* = remaining distance (positive = forward)."""
+    def start_drive(self, cm: float, heading_error_deg: float = 0) -> bool:
+        """Initialize drive.  *cm* = remaining distance (positive = forward).
+        
+        Optional *heading_error_deg* allows applying heading correction from the start.
+        """
         if not math.isfinite(cm):
             self.last_error = "non-finite drive distance rejected"
             return False
 
         self._total_distance = abs(cm)
-        return self.drive_adjusted(cm, 0)
+        return self.drive_adjusted(cm, heading_error_deg)
 
     def drive_adjusted(self, cm: float, heading_error_deg: float) -> bool:
         """Forward drive with simultaneous arc correction.

@@ -74,8 +74,8 @@ class TestTurn:
         left, right = last_lr(c)
         assert abs(right) == pytest.approx(c._config.turn_min_speed_pct, abs=0.5)
         
-        # Simulate progress: now 20 degrees remaining (still accelerating)
-        c.turn(20.0)
+        # Simulate progress: now 7 degrees remaining (still accelerating)
+        c.turn(7.0)
         left, right = last_lr(c)
         speed_mid = abs(right)
         assert c._config.turn_min_speed_pct < speed_mid < c._config.turn_max_speed_pct

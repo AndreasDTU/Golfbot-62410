@@ -157,10 +157,15 @@ class TestDriveAdjust:
 
     def test_heading_correction_produces_differential(self):
         g, cmd = make_guidance()
-        # Waypoint is at (80, 55) — slightly above +X axis.
+        # Waypoint is at (150, 60) — far away, slightly above +X axis.
         # Robot faces +X (0°). Small positive heading error.
-        g.set_route([wp(80, 55)])
+        g.set_route([wp(150, 60)])
+        # First tick: start driving (uses creep speed for stability)
         g.tick(pose(50, 50, 0), DT)
+        # Second tick: robot has moved partway, higher speed, correction visible
+        # Simulate that robot has moved 50cm closer
+        status = g.tick(pose(100, 53, 3), DT)
+        assert status == GuidanceStatus.RUNNING
         left, right = last_lr(cmd)
         # Positive heading error (CCW correction needed):
         # adjust subtracts from left, adds to right → right > left
@@ -237,10 +242,10 @@ class TestFinalHeadingAlignment:
 
     def test_alignment_within_tolerance_is_arrived(self):
         g, cmd = make_guidance()
-        # Default tolerance is 5°
+        # Default tolerance is 2° (from config.final_heading_tolerance_rad)
         g.set_route([wp(50, 50, 90)])
-        # Robot heading is 87° — within 5° of 90° → ARRIVED
-        status = g.tick(pose(50, 50, 87), DT)
+        # Robot heading is 89° — within 2° of 90° → ARRIVED
+        status = g.tick(pose(50, 50, 89), DT)
         assert status == GuidanceStatus.ARRIVED
 
     def test_alignment_outside_tolerance_keeps_turning(self):

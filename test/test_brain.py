@@ -91,7 +91,6 @@ def make_plan(
 ) -> RoutePlan:
     return RoutePlan(
         points=points,
-        active_target=None,
         pickup_poses=pickup_poses or [],
         unload_pose=unload_pose,
     )

@@ -14,12 +14,12 @@ from __future__ import annotations
 import math
 from enum import Enum
 
+from config import DriveConfig
 from control.commander import RobotCommander
 from control.telemetry import log_event
 from localization.localization import normalize_angle
 from localization.models import RobotPose
 from path.pathfinding.models import HybridPose
-from config import DriveConfig
 
 
 class GuidanceStatus(str, Enum):
@@ -151,26 +151,37 @@ class GuidanceController:
             self._log("DRIVING", dist=distance, ok=self._driving)
             return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
 
-        # 6. Large heading error — rotate in place (check BEFORE driving init).
-        if abs(heading_error) > self._config.max_heading_for_forward_rad:
+        max_heading_error = (
+            math.radians(4)
+            if (is_last and distance < self._waypoint_arrival_cm)
+            else self._config.max_heading_for_forward_rad
+        )
+        # 6. Large heading error — rotate in place.
+        if abs(heading_error) > max_heading_error:
             ok = self._commander.turn(math.degrees(heading_error))
             self._log(
-                "TURNING", dist=distance,
-                heading_err=math.degrees(heading_error), ok=ok,
+                "TURNING",
+                dist=distance,
+                heading_err=math.degrees(heading_error),
+                ok=ok,
             )
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
         # 7. Initialize driving or continue with heading correction.
         if not self._driving:
-            self._driving = self._commander.start_drive(distance, math.degrees(heading_error))
+            self._driving = self._commander.start_drive(
+                distance, math.degrees(heading_error)
+            )
             self._log("DRIVING", dist=distance, ok=self._driving)
             return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
 
         # 8. Drive forward with arc correction (single combined LR command).
         ok = self._commander.drive_adjusted(distance, math.degrees(heading_error))
         self._log(
-            "DRIVING", dist=distance,
-            heading_err=math.degrees(heading_error), ok=ok,
+            "DRIVING ADJUSTED",
+            dist=distance,
+            heading_err=math.degrees(heading_error),
+            ok=ok,
         )
         return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
@@ -192,13 +203,15 @@ class GuidanceController:
         ok = self._commander.turn(math.degrees(heading_error))
         self._log(
             "ALIGN_TURN",
-            heading_err=math.degrees(heading_error), ok=ok,
+            heading_err=math.degrees(heading_error),
+            ok=ok,
         )
         return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
     @staticmethod
     def _compute_geometry(
-        pose: RobotPose, target: HybridPose,
+        pose: RobotPose,
+        target: HybridPose,
     ) -> tuple[float, float]:
         """Return (distance_cm, heading_error_rad) from *pose* to *target*."""
         dx = target.x_cm - pose.x_cm

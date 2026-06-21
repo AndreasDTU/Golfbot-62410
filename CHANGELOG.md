@@ -2,6 +2,92 @@
 
 All notable larger additions and behavioral changes to this repository should be recorded here.
 
+## 2026-06-18
+
+### Changed
+
+- Moved pickup tube width, mouth radius, and unload extension defaults out of
+  `RobotGeometryConfig` and into planner-owned geometry defaults.
+  - Vision default params, localization fallback geometry, hybrid planner
+    config construction, debug footprint rendering, and saved geometry tuning
+    now read those values from the live `RobotGeometry`/planner config path.
+
+- Made the Main GUI route-view strategy selector initialize from
+  `PlannerConfig.route_strategy` instead of always starting on the first
+  visualizer strategy.
+  - Changing the route-view strategy now also updates the shared route-planning
+    facade used for AUTO planning.
+
+- Made intersection-focused route strategies avoid cross-owned pickup stations
+  for the mandatory first orange pickup when a cross-clear orange station is
+  available.
+  - Shared-node strategies now retain orange fallback pickup points even when
+    orange also has shared intersections, so `intersection-nearest` and
+    `intersection-optimal` can choose a safer first orange approach.
+
+- Made AUTO route planning and displacement replanning use the same manually
+  placed cross obstacle as the Route View preview.
+
+- Disabled YOLO ball detection while the Main GUI is in guidance-test mode, so
+  movement isolation testing keeps ArUco pose updates but skips ball perception.
+
+## 2026-06-17
+
+### Added
+
+- Added selectable route strategies to `path/tools/pickup_visualizer.py`.
+  - The visualizer now has a `Strategy` OpenCV trackbar, a `t` hotkey, and a
+    `--strategy` CLI option for switching between the existing set-cover route
+    and an intersection-priority route.
+  - Added an intersection-priority strategy that treats overlapping pickup
+    rings as shared-origin stations and emits multiple same-origin pickup poses
+    so a route can pick up extra balls with an in-place turn.
+  - Multi-ball pickup stations are highlighted with a magenta ring in the
+    visualizer.
+
+- Extended route detours to support multi-waypoint paths around the inflated
+  center cross, including the final leg from the last pickup station to the
+  unload staging pose.
+  - Detour validation now permits only the first segment to escape an endpoint
+    already inside the inflated cross zone, or the final segment to enter one,
+    while keeping all middle segments obstacle-clear.
+
+- Made the `intersection-priority` visualizer strategy treat still-uncollected
+  balls as hard circular obstacles during route ordering.
+  - Candidate stations may ignore only the balls they collect at that station;
+    all other uncollected balls block direct travel and are routed around by a
+    small visibility-graph detour using cross corners and sampled ball danger
+    waypoints.
+  - Optimized candidate evaluation using direct-distance lower bounds so safe
+    edges are only built while they can still beat the current best score.
+  - Made intersection route ordering locality-aware: extra balls and true
+    shared-origin intersections are bonuses, but nearby safe pickups can beat
+    farther stations that collect more balls.
+  - Added `intersection-nearest` and `intersection-optimal` visualizer
+    strategies.
+    - Both use a shared-node candidate set made from true multi-ball pickup
+      ring intersections plus bounded fallback nodes for balls with no shared
+      intersection.
+    - `intersection-nearest` greedily chooses the nearest safe next shared node
+      with no collection-count priority.
+    - `intersection-optimal` runs an exact shortest-route search over a
+      deduplicated shared-node search space, including the unload leg when
+      present.
+  - Made all pickup visualizer route strategies enforce reachable orange balls
+    as the first pickup.
+    - Shared-origin stations now order their per-ball pickup actions with
+      orange first.
+    - The set-cover strategy now preserves per-ball pickup poses at shared
+      origins so action ordering is deterministic there too.
+  - Added a shared first-leg escape path for ball-aware route strategies.
+    - If the start pose is already inside an active ball danger zone, the first
+      route edge may move monotonically out of that zone instead of treating the
+      route as impossible.
+    - Initial edges can fall back to a coarse global A* detour when the local
+      visibility detour cannot find a path to the first orange pickup.
+  - Changed the pickup visualizer's route collision radius from tube reach to
+    the robot footprint half-width; pickup rings still use tube reach.
+
 ## 2026-06-15
 
 ### Added

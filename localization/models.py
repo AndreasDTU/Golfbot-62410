@@ -61,7 +61,9 @@ class RobotGeometry:
     rear_cm: float
     tube_forward_cm: float
     tube_right_cm: float
-    unload_extension_cm: float = 15.0
+    tube_width_cm: float = 6.0
+    mouth_radius_cm: float = 2.0
+    unload_extension_cm: float = 30.0
 
 
 @dataclass(frozen=True)

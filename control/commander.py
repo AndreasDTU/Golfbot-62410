@@ -10,9 +10,12 @@ from typing import Callable
 
 import numpy as np
 
-from control.telemetry import log_event
-from control.tools.drive_calibration import DriveCalibrationValues, parse_drive_calibration_response
 from config import ConnectionConfig, DriveConfig
+from control.telemetry import log_event
+from control.tools.drive_calibration import (
+    DriveCalibrationValues,
+    parse_drive_calibration_response,
+)
 
 
 class RobotCommander:
@@ -74,8 +77,12 @@ class RobotCommander:
         self._total_turn_angle: float = 0.0
         self._last_turn_angle: float = 0.0
         self.max_speed_pct: float = 100.0
-        self._drive_acceleration: float = (config.drive_max_speed_pct - config.drive_min_speed_pct) / (config.drive_acceleration_cm ** 2)
-        self._turn_acceleration: float = (config.turn_max_speed_pct - config.turn_min_speed_pct) / (config.turn_acceleration_deg ** 2)
+        self._drive_acceleration: float = (
+            config.drive_max_speed_pct - config.drive_min_speed_pct
+        ) / (config.drive_acceleration_cm**2)
+        self._turn_acceleration: float = (
+            config.turn_max_speed_pct - config.turn_min_speed_pct
+        ) / (config.turn_acceleration_deg**2)
 
         # TCP connection
         self.sock: socket.socket | None = None
@@ -141,7 +148,9 @@ class RobotCommander:
             self.sock.sendall(payload)
             return self.sock.recv(1024).decode("utf-8").strip()
         except OSError as exc:
-            raise RuntimeError(f"EV3 command failed after send attempt ({cmd!r}): {exc}") from exc
+            raise RuntimeError(
+                f"EV3 command failed after send attempt ({cmd!r}): {exc}"
+            ) from exc
 
     def _send_nowait(self, cmd: str) -> bool:
         """Send a command without waiting for the reply (fire-and-forget).
@@ -176,7 +185,9 @@ class RobotCommander:
     # Dispatch internals (from TcpWheelDispatcher)
     # ------------------------------------------------------------------
 
-    def _send_wheel_speeds(self, left_pct: float, right_pct: float, force: bool = False) -> bool:
+    def _send_wheel_speeds(
+        self, left_pct: float, right_pct: float, force: bool = False
+    ) -> bool:
         """Validate, clip, rate-limit, and send one LR wheel command."""
         if not (math.isfinite(left_pct) and math.isfinite(right_pct)):
             self.last_error = "non-finite wheel command rejected"
@@ -222,8 +233,10 @@ class RobotCommander:
         distance_left = max(0.0, abs(float(distance_cm)))
         distance_driven = self._total_distance - distance_left
         raw_speed = min(
-            cfg.drive_min_speed_pct + self._drive_acceleration * (distance_driven * distance_driven),
-            cfg.drive_min_speed_pct + self._drive_acceleration * (distance_left * distance_left),
+            cfg.drive_min_speed_pct
+            + self._drive_acceleration * (distance_driven * distance_driven),
+            cfg.drive_min_speed_pct
+            + self._drive_acceleration * (distance_left * distance_left),
         )
 
         return max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
@@ -237,8 +250,10 @@ class RobotCommander:
         angle_left = max(0.0, abs(float(degrees)))
         angle_turned = self._total_turn_angle - angle_left
         raw_speed = min(
-            cfg.turn_min_speed_pct + self._turn_acceleration * (angle_turned * angle_turned),
-            cfg.turn_min_speed_pct + self._turn_acceleration * (angle_left * angle_left),
+            cfg.turn_min_speed_pct
+            + self._turn_acceleration * (angle_turned * angle_turned),
+            cfg.turn_min_speed_pct
+            + self._turn_acceleration * (angle_left * angle_left),
         )
         return max(min(raw_speed, cfg.turn_max_speed_pct), cfg.turn_min_speed_pct)
 
@@ -254,8 +269,10 @@ class RobotCommander:
 
         # Detect start of a new turn: magnitude increased or sign changed
         abs_degrees = abs(degrees)
-        if self._last_turn_angle == 0 or abs_degrees > abs(self._last_turn_angle) or (
-            (degrees >= 0) != (self._last_turn_angle >= 0)
+        if (
+            self._last_turn_angle == 0
+            or abs_degrees > abs(self._last_turn_angle)
+            or ((degrees >= 0) != (self._last_turn_angle >= 0))
         ):
             self._total_turn_angle = abs_degrees
         self._last_turn_angle = degrees
@@ -267,7 +284,7 @@ class RobotCommander:
 
     def start_drive(self, cm: float, heading_error_deg: float = 0) -> bool:
         """Initialize drive.  *cm* = remaining distance (positive = forward).
-        
+
         Optional *heading_error_deg* allows applying heading correction from the start.
         """
         if not math.isfinite(cm):
@@ -290,20 +307,25 @@ class RobotCommander:
         if cm < 0:
             speed = -speed
         self._current_speed = speed
-        correction = heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
+        correction = (
+            heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
+        )
         return self._send_wheel_speeds(speed - correction, speed + correction)
 
     def stop(self, force: bool = True) -> bool:
         """Zero wheel speeds and reset base speed."""
         self._base_speed = 0.0
         self._driving = False
-        return self._send_wheel_speeds(0.0, 0.0, force=force)
+        self._send("stop")
+        return True
 
     # ------------------------------------------------------------------
     # Legacy steer() — bridge for guidance code until full migration
     # ------------------------------------------------------------------
 
-    def steer(self, base_speed_pct: float, turn_speed_pct: float, force: bool = False) -> bool:
+    def steer(
+        self, base_speed_pct: float, turn_speed_pct: float, force: bool = False
+    ) -> bool:
         """Differential steer compatible with the old MotorCommander API."""
         left = base_speed_pct - turn_speed_pct
         right = base_speed_pct + turn_speed_pct
@@ -317,9 +339,12 @@ class RobotCommander:
         return self._send("collector_travel_position")
 
     def pickup_assist(self) -> str:
+        self._send("stop")
         return self._send("pickup_assist")
 
     def unload_full_cycle(self) -> str:
+        self._send("stop")
+        self._send("unload_full_cycle")
         return self._send("unload_full_cycle")
 
     def pipe_up(self, units, speed=None) -> str:
@@ -348,5 +373,7 @@ class RobotCommander:
 
     def set_drive_calibration(self, axle_track_mm: float, mm_per_unit: float):
         values = DriveCalibrationValues(float(axle_track_mm), float(mm_per_unit))
-        response = self._send(f"drivecal set {values.axle_track_mm:.6f} {values.mm_per_unit:.6f}")
+        response = self._send(
+            f"drivecal set {values.axle_track_mm:.6f} {values.mm_per_unit:.6f}"
+        )
         return parse_drive_calibration_response(response)

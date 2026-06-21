@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ROI Crop Monitor — Algorithm & Implementation</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1f2937;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --accent2: #f78166;
+    --accent3: #3fb950;
+    --accent4: #d2a8ff;
+    --accent5: #ffa657;
+    --accent6: #79c0ff;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 24px;
+  }
+
+  .header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+  }
+  .header h1 {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: -0.5px;
+  }
+  .header .sub {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+  .col2 { grid-column: span 2; }
+  .col3 { grid-column: span 3; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    position: relative;
+  }
+  .card h2 {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .card h2.blue   { color: var(--accent); }
+  .card h2.red    { color: var(--accent2); }
+  .card h2.green  { color: var(--accent3); }
+  .card h2.purple { color: var(--accent4); }
+  .card h2.orange { color: var(--accent5); }
+  .card h2.cyan   { color: var(--accent6); }
+
+  .tag {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+  .tag-blue   { background: #1f3a5f; color: var(--accent); }
+  .tag-green  { background: #1a3a1a; color: var(--accent3); }
+  .tag-purple { background: #2d1f5f; color: var(--accent4); }
+  .tag-orange { background: #3a2000; color: var(--accent5); }
+  .tag-red    { background: #3a1f1f; color: var(--accent2); }
+  .tag-cyan   { background: #0a2a3a; color: var(--accent6); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-align: left;
+    color: var(--muted);
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 4px 6px;
+    vertical-align: top;
+    border-bottom: 1px solid #21262d;
+  }
+  tr:last-child td { border-bottom: none; }
+  td:first-child { font-family: var(--mono); font-size: 11px; color: var(--accent); white-space: nowrap; }
+
+  ul { list-style: none; }
+  ul li { padding: 2px 0; padding-left: 12px; position: relative; font-size: 12px; }
+  ul li::before { content: '›'; position: absolute; left: 0; color: var(--muted); }
+
+  .formula {
+    background: var(--surface2);
+    border-left: 3px solid var(--accent);
+    padding: 6px 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+    margin: 6px 0;
+    border-radius: 0 4px 4px 0;
+    color: var(--accent3);
+  }
+  .formula span { color: var(--muted); font-size: 10px; }
+  .formula.warn { border-left-color: var(--accent2); color: var(--accent2); }
+  .formula.orange { border-left-color: var(--accent5); color: var(--accent5); }
+
+  .flow {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 11px;
+    margin: 4px 0;
+  }
+  .flow-box {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .flow-box.highlight { border-color: var(--accent);  color: var(--accent); }
+  .flow-box.warn      { border-color: var(--accent2); color: var(--accent2); }
+  .flow-box.green     { border-color: var(--accent3); color: var(--accent3); }
+  .flow-box.orange    { border-color: var(--accent5); color: var(--accent5); }
+  .flow-box.purple    { border-color: var(--accent4); color: var(--accent4); }
+  .flow-arrow { color: var(--muted); font-size: 14px; }
+
+  .label {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+    margin-top: 8px;
+  }
+  .label:first-child { margin-top: 0; }
+
+  .compare-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .compare-cell {
+    background: var(--surface2);
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 12px;
+  }
+  .compare-cell h3 {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+
+  .hs-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 0;
+    border-bottom: 1px solid #21262d;
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+  .hs-row:last-child { border-bottom: none; }
+  .hs-row .msg  { color: var(--accent3); flex-shrink: 0; margin-right: 10px; }
+  .hs-row .warn { color: var(--accent2); flex-shrink: 0; margin-right: 10px; }
+  .hs-row .note { color: var(--muted); font-size: 10px; }
+
+  .hl      { color: var(--accent5); font-weight: 600; }
+  .hl-red  { color: var(--accent2); font-weight: 600; }
+  .hl-green{ color: var(--accent3); font-weight: 600; }
+  .mono    { font-family: var(--mono); font-size: 11px; }
+  .dimmed  { color: var(--muted); font-size: 11px; }
+
+  .state-box {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 10px;
+    border-radius: 12px;
+    margin: 2px 0;
+  }
+  .state-idle   { background: #1a3a1a; color: var(--accent3); border: 1px solid var(--accent3); }
+  .state-drive  { background: #1f3a5f; color: var(--accent);  border: 1px solid var(--accent); }
+  .state-error  { background: #3a1f1f; color: var(--accent2); border: 1px solid var(--accent2); }
+  .state-done   { background: #2d1f5f; color: var(--accent4); border: 1px solid var(--accent4); }
+
+  .phase-header {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent5);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    background: #3a2000;
+    padding: 2px 8px;
+    border-radius: 3px;
+    display: inline-block;
+    margin-bottom: 6px;
+  }
+
+  .footer {
+    margin-top: 16px;
+    text-align: center;
+    font-size: 10px;
+    color: var(--muted);
+    font-family: var(--mono);
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+  }
+
+  @media print {
+    body { background: #fff; color: #111; font-size: 11px; padding: 12px; }
+    .card { border: 1px solid #ccc; background: #f9f9f9; break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>ROI CROP MONITOR</h1>
+  <span class="sub">Ball tracking · Perception layer · Golfbot-62410</span>
+</div>
+
+<div class="grid">
+
+<!-- ══════════════════════════════════════════════
+     CARD 1: Full Algorithm Flow (col3)
+═══════════════════════════════════════════════ -->
+<div class="card col3">
+  <h2 class="blue">Full Algorithm Flow</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+
+    <div>
+      <div class="phase-header">Phase 1 — Discovery</div>
+      <div class="flow">
+        <div class="flow-box green">Raw frame</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box green">Full YOLO scan</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box green">BallCoordinateSmoother</div>
+      </div>
+      <div class="flow" style="margin-top:4px">
+        <div class="flow-box green">SmoothedBallCoordinate[]</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box green">Route planner</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box highlight">_tracked_balls locked</div>
+      </div>
+      <p class="dimmed" style="margin-top:6px">YOLO runs <span class="hl-green">once</span>. Ball positions (field cm) stored as fixed crop centres. Route loaded into Brain FSM.</p>
+
+      <div class="phase-header" style="margin-top:12px">Phase 2 — Tracking (every frame)</div>
+      <div class="flow">
+        <div class="flow-box highlight">topdown frame</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box highlight">HSV crop × N balls</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box green">pixel fraction ≥ threshold?</div>
+      </div>
+      <div class="flow" style="margin-top:4px">
+        <div class="flow-box green">YES → ball present</div>
+        <div class="flow-arrow" style="color:#3fb950">✓</div>
+        <div class="flow-box warn">NO → missing_count[id]++</div>
+      </div>
+      <div class="flow" style="margin-top:4px">
+        <div class="flow-box warn">missing_count ≥ threshold</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box warn">brain.signal_ball_displaced()</div>
+      </div>
+      <p class="dimmed" style="margin-top:6px">YOLO is <span class="hl-red">skipped</span> every frame. Crop centres are <span class="hl">fixed</span> — no position updates. Robot-overlapping crops are skipped entirely.</p>
+    </div>
+
+    <div>
+      <div class="phase-header">Phase 3 — Error &amp; Replan</div>
+      <div class="hs-row">
+        <span class="warn">signal_ball_displaced()</span>
+        <span class="note">sets _ball_displaced flag on Brain</span>
+      </div>
+      <div class="hs-row">
+        <span class="warn">Brain.tick()</span>
+        <span class="note">flag detected → clears route, state = ERROR("ball_displaced")</span>
+      </div>
+      <div class="hs-row">
+        <span class="warn">_tracked_balls = None</span>
+        <span class="note">next _process_frame skips skip_ball_detection=False → full YOLO runs</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">fresh SmoothedBallCoordinate[]</span>
+        <span class="note">_last_result updated with new ball positions</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">_replan_after_displacement()</span>
+        <span class="note">detected in _tick_brain when ERROR + "ball_displaced" + fresh balls</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">brain.load_route(new_plan)</span>
+        <span class="note">Brain resets to IDLE, new route starts executing</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">_tracked_balls = new positions</span>
+        <span class="note">crop monitor resumes Phase 2 with updated centres</span>
+      </div>
+
+      <div class="label" style="margin-top:10px">Key invariant</div>
+      <ul>
+        <li><span class="hl-green">_tracked_balls is not None</span> → Phase 2 active, YOLO skipped</li>
+        <li><span class="hl-red">_tracked_balls is None</span> → rescan frame, YOLO runs</li>
+        <li>The rescan always happens exactly <span class="hl">one frame</span> after displacement is signalled</li>
+        <li>Robot footprint crops are skipped — never counted as missing</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 2: HSV Crop Check Logic
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="green">HSV Crop Check — check_ball_crops()</h2>
+  <div class="label">Location</div>
+  <p class="dimmed"><span class="mono">perception/vision/pipeline.py · VisionPipeline</span></p>
+
+  <div class="label" style="margin-top:8px">Per-ball steps</div>
+  <ul>
+    <li>Convert <span class="mono">ball.cm_x, ball.cm_y</span> → topdown pixel via <span class="mono">mapper.field_cm_to_topdown_pixel()</span></li>
+    <li>Check robot exclusion: if distance to robot center &lt; <span class="mono">robot_radius_px</span> → <span class="hl">skip</span> (not counted as missing)</li>
+    <li>Clip crop to frame bounds: <span class="mono">[cy−half : cy+half, cx−half : cx+half]</span></li>
+    <li>Convert crop BGR → HSV via <span class="mono">cv2.cvtColor</span></li>
+    <li>Threshold with <span class="mono">cv2.inRange(hsv, lower, upper)</span></li>
+    <li>Compute <span class="mono">pixel_fraction = nonzero(mask) / mask.size</span></li>
+    <li>If <span class="mono">pixel_fraction &lt; crop_min_pixel_fraction</span> → add to <span class="hl-red">missing</span> set</li>
+  </ul>
+
+  <div class="label">Robot exclusion math</div>
+  <div class="formula">robot_radius_px = robot_radius_cm × (w_frame / field.width_cm)</div>
+  <div class="formula">dist = √((cx − robot_px[0])² + (cy − robot_px[1])²)</div>
+  <div class="formula warn">dist &lt; robot_radius_px → skip crop</div>
+
+  <div class="label">Returns</div>
+  <p class="dimmed"><span class="mono">set[int]</span> of track_ids where ball was not found. Skipped crops are <em>not</em> included.</p>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 3: Crop Monitor Tick
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="cyan">_tick_crop_monitor() — MainGUI</h2>
+  <div class="label">Location</div>
+  <p class="dimmed"><span class="mono">gui/MainGUI.py · MainGui</span></p>
+  <p class="dimmed" style="margin-top:4px">Called every frame from <span class="mono">tick()</span> — runs <span class="hl">before</span> <span class="mono">_tick_brain()</span> so Brain sees the signal immediately.</p>
+
+  <div class="label" style="margin-top:8px">Guards (early return if any fail)</div>
+  <ul>
+    <li><span class="mono">mode == AppMode.AUTO</span></li>
+    <li><span class="mono">_tracked_balls is not None</span></li>
+    <li><span class="mono">_last_result.frame_for_detection is not None</span></li>
+  </ul>
+
+  <div class="label">Missing count tracking</div>
+  <ul>
+    <li>Calls <span class="mono">pipeline.check_ball_crops()</span> with current topdown frame, tracked balls, params, robot pose</li>
+    <li>For each tracked ball: increment <span class="mono">_crop_missing_counts[tid]</span> if in missing set, else reset to 0</li>
+    <li>If <span class="hl-red">any count ≥ crop_missing_threshold</span>:</li>
+    <li style="padding-left:20px">Set <span class="mono">_tracked_balls = None</span></li>
+    <li style="padding-left:20px">Clear <span class="mono">_crop_missing_counts</span></li>
+    <li style="padding-left:20px">Call <span class="mono">brain.signal_ball_displaced()</span></li>
+  </ul>
+
+  <div class="label">Tick order in MainGUI.tick()</div>
+  <div class="flow" style="flex-direction:column;align-items:flex-start;gap:4px;font-size:11px">
+    <div class="flow-box">_process_frame() — YOLO skipped if _tracked_balls set</div>
+    <div class="flow-box">_estimate_pose()</div>
+    <div class="flow-box">_tick_guidance()</div>
+    <div class="flow-box highlight">_tick_crop_monitor() ← here</div>
+    <div class="flow-box">_tick_brain() ← sees signal immediately</div>
+    <div class="flow-box">_tick_calibration()</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 4: Brain FSM — ball_displaced path
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="red">Brain FSM — signal_ball_displaced()</h2>
+  <div class="label">Location</div>
+  <p class="dimmed"><span class="mono">brain/brain.py · BrainController</span></p>
+
+  <div class="label" style="margin-top:8px">New internal flag</div>
+  <div class="formula orange">_ball_displaced: bool = False</div>
+  <p class="dimmed">Set externally via <span class="mono">signal_ball_displaced()</span>. Checked at the <em>top</em> of <span class="mono">tick()</span> — before any state handler — so it fires regardless of current FSM state.</p>
+
+  <div class="label" style="margin-top:8px">Tick() priority check</div>
+  <ul>
+    <li>If <span class="mono">_ball_displaced</span>: clear flag, clear steps, reset cursor</li>
+    <li>Set <span class="mono">_error_message = "ball_displaced"</span></li>
+    <li>Set <span class="mono">_state = BrainState.ERROR</span></li>
+    <li>Call <span class="mono">guidance.clear_route()</span></li>
+    <li>Log event and return immediately</li>
+  </ul>
+
+  <div class="label">State transitions</div>
+  <div style="display:flex;flex-direction:column;gap:4px;margin-top:4px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span class="state-drive">DRIVE</span>
+      <span class="flow-arrow">→</span>
+      <span class="state-error">ERROR("ball_displaced")</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span class="state-idle">IDLE</span>
+      <span class="flow-arrow">→</span>
+      <span class="state-error">ERROR("ball_displaced")</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span class="state-error">ERROR("ball_displaced")</span>
+      <span class="flow-arrow">→</span>
+      <span class="state-idle">IDLE</span>
+      <span class="dimmed" style="margin-left:4px">via load_route()</span>
+    </div>
+  </div>
+
+  <div class="label" style="margin-top:8px">Flag cleared in</div>
+  <ul>
+    <li><span class="mono">tick()</span> — immediately on detection</li>
+    <li><span class="mono">load_route()</span> — safety clear on new route</li>
+    <li><span class="mono">reset()</span> — full state wipe</li>
+  </ul>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 5: Replan After Displacement
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="orange">_replan_after_displacement() — MainGUI</h2>
+  <div class="label">Trigger condition (in _tick_brain)</div>
+  <ul>
+    <li><span class="mono">_brain_state == BrainState.ERROR</span></li>
+    <li><span class="mono">brain.error_message == "ball_displaced"</span></li>
+    <li><span class="mono">_last_result.smoothed_ball_coordinates</span> non-empty</li>
+    <li><span class="mono">_last_result.occupancy_grid</span> is not None</li>
+    <li><span class="mono">robot_pose</span> is not None</li>
+  </ul>
+  <p class="dimmed" style="margin-top:4px">All conditions are met on the frame <em>after</em> displacement fires — that frame runs full YOLO because <span class="mono">_tracked_balls</span> was cleared.</p>
+
+  <div class="label" style="margin-top:8px">Steps</div>
+  <ul>
+    <li>Build <span class="mono">PlannedBallTarget[]</span> from fresh <span class="mono">smoothed_ball_coordinates</span></li>
+    <li>Build <span class="mono">HybridPose</span> from current <span class="mono">robot_pose</span></li>
+    <li>Get robot geometry from <span class="mono">pose_estimator.robot_geometry_from_params()</span></li>
+    <li>Call <span class="mono">_route_planner.plan_route(grid, targets, start, geometry)</span></li>
+    <li>If no route points → log + return (Brain stays in ERROR, operator must intervene)</li>
+    <li>Call <span class="mono">brain.load_route(plan)</span> — resets Brain to IDLE, clears error</li>
+    <li>Set <span class="mono">_tracked_balls = new positions</span>, clear <span class="mono">_crop_missing_counts</span></li>
+    <li>Update <span class="mono">_brain_route_points</span> for schematic rendering</li>
+  </ul>
+
+  <div class="label">No reconnect needed</div>
+  <p class="dimmed">Commander and GuidanceController remain live. Only route changes. The robot does not stop — Guidance re-receives a new route and resumes.</p>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 6: Pipeline skip_ball_detection
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="purple">pipeline.process() — skip_ball_detection</h2>
+  <div class="label">Location</div>
+  <p class="dimmed"><span class="mono">perception/vision/pipeline.py · VisionPipeline.process()</span></p>
+
+  <div class="label" style="margin-top:8px">New parameter</div>
+  <div class="formula">skip_ball_detection: bool = False</div>
+
+  <div class="label">When True</div>
+  <ul>
+    <li>YOLO inference is <span class="hl-red">not called</span></li>
+    <li><span class="mono">white_balls = []</span>, <span class="mono">orange_balls = []</span></li>
+    <li>Ball masks are zeroed (<span class="mono">np.zeros(...)</span>)</li>
+    <li><span class="mono">BallCoordinateSmoother.update([])</span> called — existing tracks age out normally</li>
+    <li>All other stages run unchanged: preprocessing, red-zone detection, occupancy grid</li>
+  </ul>
+
+  <div class="label">When False (default)</div>
+  <ul>
+    <li>Full YOLO inference runs as before</li>
+    <li>All outputs populated normally</li>
+  </ul>
+
+  <div class="label">Decision logic in _process_frame()</div>
+  <div class="formula">skip = mode == AUTO <span style="color:var(--muted)">and</span> _tracked_balls is not None</div>
+
+  <div class="compare-row" style="margin-top:8px">
+    <div class="compare-cell">
+      <h3 style="color:var(--accent3)">Phase 2 (tracking)</h3>
+      <ul>
+        <li>skip = <span class="hl-green">True</span></li>
+        <li>YOLO cost: <span class="hl-green">0 ms</span></li>
+        <li>HSV crops: ~<span class="hl-green">&lt;1 ms</span> for 10 balls</li>
+      </ul>
+    </div>
+    <div class="compare-cell">
+      <h3 style="color:var(--accent2)">Discovery / rescan</h3>
+      <ul>
+        <li>skip = <span class="hl-red">False</span></li>
+        <li>YOLO cost: ~<span class="hl-red">30–100 ms</span></li>
+        <li>Runs exactly <span class="hl">once</span> per rescan</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 7: Configuration Parameters
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="orange">Configuration Parameters</h2>
+  <div class="label">Location — seeded in _seed_geometry_params()</div>
+  <p class="dimmed"><span class="mono">gui/MainGUI.py</span> · all live in the shared <span class="mono">self.params</span> dict</p>
+
+  <table style="margin-top:8px">
+    <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+    <tr><td>crop_size</td><td>60 px</td><td>Side length of the square crop (topdown pixels); ≈ 12.5 cm at 800 px / 167 cm</td></tr>
+    <tr><td>crop_white_h_min/max</td><td>0 / 180</td><td>Hue range for white ball detection (any hue — white is achromatic)</td></tr>
+    <tr><td>crop_white_s_min/max</td><td>0 / 40</td><td>Saturation range — low S is the white ball signature</td></tr>
+    <tr><td>crop_white_v_min/max</td><td>200 / 255</td><td>Value range — high V required; rejects dark floor regions</td></tr>
+    <tr><td>crop_min_pixel_fraction</td><td>0.03</td><td>Fraction of crop pixels that must match HSV range for ball to be "present" (3%)</td></tr>
+    <tr><td>crop_missing_threshold</td><td>5</td><td>Consecutive frames a ball must be missing before displacement is signalled</td></tr>
+  </table>
+
+  <div class="label" style="margin-top:8px">Robot exclusion</div>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Source</th></tr>
+    <tr><td>robot_radius_cm</td><td>15.0 cm</td><td>Read from <span class="mono">self.params</span> at runtime</td></tr>
+  </table>
+
+  <div class="label" style="margin-top:8px">Extending to other colors</div>
+  <ul>
+    <li>Add <span class="mono">crop_orange_h/s/v_min/max</span> keys to params</li>
+    <li>In <span class="mono">check_ball_crops()</span>: select HSV range by <span class="mono">ball.label</span></li>
+    <li>No structural change needed — the architecture is already color-keyed</li>
+  </ul>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 8: Layer Architecture Placement (col2)
+═══════════════════════════════════════════════ -->
+<div class="card col2">
+  <h2 class="blue">6-Layer Architecture Placement</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div>
+      <div class="label">Layer stack (bottom-up)</div>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;gap:6px;font-size:11px">
+        <div class="flow-box" style="width:100%">1 · Control — motor execution (EV3)</div>
+        <div class="flow-box" style="width:100%">2 · Localization — ArUco → RobotPose</div>
+        <div class="flow-box" style="width:100%">3 · Guidance — intent + pose → motor cmds</div>
+        <div class="flow-box orange" style="width:100%">4 · Brain FSM — route execution + ball_displaced</div>
+        <div class="flow-box" style="width:100%">5 · Path — A* route planning</div>
+        <div class="flow-box highlight" style="width:100%">6 · Perception — YOLO + crop monitor + HSV</div>
+      </div>
+
+      <div class="label" style="margin-top:10px">Responsibility split</div>
+      <table>
+        <tr><th>Layer</th><th>Does</th></tr>
+        <tr><td>Perception</td><td>check_ball_crops() — the sensing work</td></tr>
+        <tr><td>Brain</td><td>signal_ball_displaced(), mode switch, error state</td></tr>
+        <tr><td>MainGUI</td><td>orchestrates tick order, owns _tracked_balls, triggers replan</td></tr>
+      </table>
+    </div>
+
+    <div>
+      <div class="label">Data flow during tracking phase</div>
+      <div class="hs-row">
+        <span class="msg">Camera frame</span>
+        <span class="note">raw BGR captured each tick</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">Preprocessing</span>
+        <span class="note">undistort → warp → CLAHE → topdown frame</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">Red zone detect</span>
+        <span class="note">HSV full frame — still runs every tick</span>
+      </div>
+      <div class="hs-row">
+        <span class="warn">YOLO → SKIPPED</span>
+        <span class="note">skip_ball_detection=True while _tracked_balls set</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">Occupancy grid</span>
+        <span class="note">built from red zones — still runs every tick</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">Localization</span>
+        <span class="note">ArUco markers → robot pose (unaffected)</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">check_ball_crops()</span>
+        <span class="note">N × HSV crop checks on fixed positions</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">Guidance.tick()</span>
+        <span class="note">drives robot along current route</span>
+      </div>
+      <div class="hs-row">
+        <span class="msg">Brain.tick()</span>
+        <span class="note">advances FSM; checks _ball_displaced first</span>
+      </div>
+
+      <div class="label" style="margin-top:8px">What is NOT affected</div>
+      <ul>
+        <li>Red-zone detection — always runs, occupancy grid stays live</li>
+        <li>Robot localization — ArUco-based, fully independent of YOLO</li>
+        <li>Guidance geometry — consumes pose only, not ball positions</li>
+        <li>Existing Brain FSM states — no new states added</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 9: Files & Symbols
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="purple">Files &amp; Symbols Changed</h2>
+  <table>
+    <tr><th>File</th><th>Symbol</th><th>Change</th></tr>
+    <tr><td>perception/vision/pipeline.py</td><td>VisionPipeline.check_ball_crops()</td><td>New method — HSV crop monitor</td></tr>
+    <tr><td>perception/vision/pipeline.py</td><td>VisionPipeline.process()</td><td>Added skip_ball_detection param</td></tr>
+    <tr><td>brain/brain.py</td><td>BrainController._ball_displaced</td><td>New internal flag</td></tr>
+    <tr><td>brain/brain.py</td><td>BrainController.signal_ball_displaced()</td><td>New public method</td></tr>
+    <tr><td>brain/brain.py</td><td>BrainController.tick()</td><td>Priority check at top for flag</td></tr>
+    <tr><td>brain/brain.py</td><td>load_route() / reset()</td><td>Clear _ball_displaced flag</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>MainGui._tracked_balls</td><td>New field — None = rescan mode</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>MainGui._crop_missing_counts</td><td>New field — per track_id counter</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>_tick_crop_monitor()</td><td>New method — called every frame</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>_replan_after_displacement()</td><td>New method — triggered from _tick_brain</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>_process_frame()</td><td>skip logic based on _tracked_balls</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>_start_brain()</td><td>Sets _tracked_balls after route planned</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>_disconnect_guidance()</td><td>Clears crop monitor state on stop</td></tr>
+    <tr><td>gui/MainGUI.py</td><td>_seed_geometry_params()</td><td>Seeds crop_* keys into params dict</td></tr>
+  </table>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 10: Design Decisions
+═══════════════════════════════════════════════ -->
+<div class="card">
+  <h2 class="cyan">Design Decisions &amp; Rationale</h2>
+
+  <div class="label">Fixed crop centres — no position update</div>
+  <ul>
+    <li>Balls that move enough to matter will leave the crop entirely — that's the signal</li>
+    <li>Small jitter stays within the crop and is ignored naturally</li>
+    <li>Avoids drift — no feedback loop that can lock on to the wrong pixel cluster</li>
+  </ul>
+
+  <div class="label" style="margin-top:6px">Error propagation through Brain FSM</div>
+  <ul>
+    <li>No new states added — existing ERROR state reused with a specific message</li>
+    <li>Brain clears route and stops guidance atomically on the same tick as signal</li>
+    <li>MainGUI detects the specific error and auto-recovers; other errors still surface to operator</li>
+  </ul>
+
+  <div class="label" style="margin-top:6px">One-frame rescan delay</div>
+  <ul>
+    <li>Displacement detected on frame N → _tracked_balls cleared → frame N+1 runs YOLO → replan on frame N+1</li>
+    <li>The robot is still executing guidance during this one frame — Guidance holds its last intent safely</li>
+  </ul>
+
+  <div class="label" style="margin-top:6px">Robot occlusion — skip not mask</div>
+  <ul>
+    <li>If robot is over a crop → skip entirely, not counted as missing</li>
+    <li>Avoids false displacement trigger when robot picks up a ball (ball genuinely gone, but robot caused it)</li>
+    <li>Collection confirmation is a separate concern (patch tracking system)</li>
+  </ul>
+
+  <div class="label" style="margin-top:6px">HSV vs YOLO for crops</div>
+  <ul>
+    <li>In a 60×60 px region the background is mostly green floor — white ball is distinctive</li>
+    <li>HSV threshold is ~0.001 ms per crop vs ~50 ms for full YOLO</li>
+    <li>Sliders (crop_white_h/s/v_min/max) allow per-session tuning for lighting conditions</li>
+  </ul>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     CARD 11: State / Mode Summary (col3)
+═══════════════════════════════════════════════ -->
+<div class="card col3">
+  <h2 class="orange">State Summary — what runs in each combination</h2>
+  <table>
+    <tr>
+      <th>AppMode</th>
+      <th>_tracked_balls</th>
+      <th>Brain state</th>
+      <th>YOLO runs?</th>
+      <th>check_ball_crops runs?</th>
+      <th>Description</th>
+    </tr>
+    <tr>
+      <td>IDLE / GUIDANCE_TEST</td>
+      <td style="color:var(--muted)">None</td>
+      <td style="color:var(--muted)">—</td>
+      <td><span class="tag tag-green">YES</span></td>
+      <td><span class="tag tag-red">NO</span></td>
+      <td>Normal operation, full pipeline every frame</td>
+    </tr>
+    <tr>
+      <td>AUTO</td>
+      <td style="color:var(--muted)">None</td>
+      <td style="color:var(--muted)">any</td>
+      <td><span class="tag tag-green">YES</span></td>
+      <td><span class="tag tag-red">NO</span></td>
+      <td>Rescan frame — _start_brain just called, or after displacement</td>
+    </tr>
+    <tr>
+      <td>AUTO</td>
+      <td style="color:var(--accent3)">set</td>
+      <td style="color:var(--accent)">DRIVE / IDLE</td>
+      <td><span class="tag tag-red">NO</span></td>
+      <td><span class="tag tag-green">YES</span></td>
+      <td>Normal tracking phase — HSV crops only, full FPS</td>
+    </tr>
+    <tr>
+      <td>AUTO</td>
+      <td style="color:var(--accent3)">set → None</td>
+      <td style="color:var(--accent2)">ERROR("ball_displaced")</td>
+      <td><span class="tag tag-green">YES (next frame)</span></td>
+      <td><span class="tag tag-red">NO (cleared)</span></td>
+      <td>Displacement frame — YOLO runs, replan on same tick</td>
+    </tr>
+    <tr>
+      <td>AUTO</td>
+      <td style="color:var(--accent3)">set (new)</td>
+      <td style="color:var(--accent3)">IDLE → DRIVE</td>
+      <td><span class="tag tag-red">NO</span></td>
+      <td><span class="tag tag-green">YES</span></td>
+      <td>Post-replan — tracking resumes with new centres</td>
+    </tr>
+  </table>
+</div>
+
+</div><!-- end grid -->
+
+<div class="footer">
+  ROI Crop Monitor · Ball Tracking Architecture · Golfbot-62410 &nbsp;|&nbsp;
+  perception/vision/pipeline.py · brain/brain.py · gui/MainGUI.py
+</div>
+
+</body>
+</html>

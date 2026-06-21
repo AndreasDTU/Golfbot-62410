@@ -20,13 +20,22 @@ import numpy as np
 from brain.brain import BrainController
 from brain.models import BrainState
 from control.commander import RobotCommander
+from control.telemetry import log_event
 from control.spin_calibration import SpinController, SpinStatus
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
 from localization.models import RobotCalibrationRuntime, RobotMarkerObservation, RobotPose
 from path.pathfinding.models import HybridPose, PlannedBallTarget
 from path.pathfinding.planner import RoutePlanningFacade
-from config import AppConfig
+from path.pickup_geometry import compute_pickup_geometry
+from path.route_strategy import ObstacleGeometry, RoutePlannerInput
+from path.tools.pickup_visualizer import (
+    STRATEGY_OPTIONS,
+    draw_pickup_geometry,
+    draw_route_plan,
+    draw_strategy_label,
+)
+from config import AppConfig, RouteStrategyName
 from perception.vision.debug import DebugRenderer
 from perception.vision.models import CalibrationState, RedCrossSpec, RedZoneDetection
 from perception.vision.pipeline import VisionPipeline, VisionFrameResult
@@ -54,6 +63,7 @@ HEADING_STEP_RAD = math.radians(1.0)
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
 CROSS_WINDOW_NAME = "Place Red Cross"
+ROUTE_VIEW_WINDOW_NAME = "Route View"
 STATUS_BAR_HEIGHT = 170
 
 
@@ -86,6 +96,17 @@ TEST_ROUTES: dict[str, list[HybridPose]] = {
 }
 
 TEST_ROUTE_NAMES: list[str] = list(TEST_ROUTES.keys())
+
+ROUTE_VIEW_KEY_BY_CONFIG_STRATEGY: dict[RouteStrategyName, str] = {
+    RouteStrategyName.SET_COVER_NEAREST: "set-cover",
+    RouteStrategyName.INTERSECTION_PRIORITY: "intersections",
+    RouteStrategyName.INTERSECTION_NEAREST: "intersection-nearest",
+    RouteStrategyName.INTERSECTION_OPTIMAL: "intersection-optimal",
+}
+
+CONFIG_STRATEGY_BY_ROUTE_VIEW_KEY: dict[str, RouteStrategyName] = {
+    value: key for key, value in ROUTE_VIEW_KEY_BY_CONFIG_STRATEGY.items()
+}
 
 
 @dataclass(frozen=True)
@@ -268,6 +289,18 @@ class MainGui:
     _brain_route_points: list[HybridPose] | None = None
     _last_result: VisionFrameResult | None = None
 
+    # Crop monitor state (ROI-based ball tracking during AUTO mode)
+    _tracked_balls: list | None = None        # fixed positions from last full scan
+    _crop_missing_counts: dict = field(default_factory=dict)  # track_id → consecutive missing frames
+    _last_crop_missing: set = field(default_factory=set)      # track_ids missing on last check
+    _crop_hsv_ranges: dict = field(default_factory=dict)      # track_id → (lower, upper) per-ball HSV
+
+    # Pickup verification state (deferred YOLO snapshot after cluster exit)
+    _pending_verification: list = field(default_factory=list)  # balls awaiting post-pickup YOLO check
+    _attempted_pickups: int = 0                                 # count of attempts in current pending batch
+    _needs_verification_snapshot: bool = False                  # triggers YOLO on next _process_frame
+    _verification_snapshot_done: bool = False                   # set by _process_frame, consumed by verifier
+
     # Robot self-calibration state
     _calib_collector: RobotCalibrationCollector | None = None
     _calib_runtime: RobotCalibrationRuntime | None = None
@@ -281,6 +314,12 @@ class MainGui:
     _cross_spec: RedCrossSpec | None = None
     _cross_window_open: bool = False
     _cross_state: CornerSelectionState = field(default_factory=CornerSelectionState)
+
+    # Route View window state
+    _route_view_open: bool = False
+    _route_view_strategy_index: int = 0
+    _route_view_cache_id: int = 0
+    _route_view_cached_image: np.ndarray | None = None
 
     # Dimensions derived from config
     _left_w: int = 0
@@ -297,6 +336,7 @@ class MainGui:
         self._load_robot_calibration()
         self._load_field_corners()
         self._load_cross()
+        self._route_view_strategy_index = self._route_view_strategy_index_from_config()
         self._route_planner = RoutePlanningFacade(
             field_config=self.config.field,
             robot_config=self.config.robot,
@@ -471,12 +511,26 @@ class MainGui:
     def _seed_geometry_params(self) -> None:
         """Ensure live geometry keys exist in params, defaulting from config."""
         robot = self.config.robot
+        planner = self.config.planner
         self.params.setdefault("robot_width_cm", robot.tuned_footprint_width_cm)
         self.params.setdefault("robot_front_cm", robot.tuned_footprint_front_from_origin_cm)
         self.params.setdefault("robot_rear_cm", robot.tuned_footprint_rear_from_origin_cm)
         self.params.setdefault("tube_forward_cm", robot.tuned_tube_offset_cm)
         self.params.setdefault("tube_right_cm", robot.tuned_tube_right_offset_cm)
+        self.params.setdefault("tube_width_cm", planner.tube_width_cm)
+        self.params.setdefault("mouth_radius_cm", planner.mouth_radius_cm)
+        self.params.setdefault("unload_extension_cm", planner.unload_extension_cm)
         self.params.setdefault("heading_tuning_rad", 0.0)
+        # Crop monitor HSV params (white ball detection in fixed crops)
+        self.params.setdefault("crop_size", 60)
+        self.params.setdefault("crop_white_h_min", 0)
+        self.params.setdefault("crop_white_h_max", 180)
+        self.params.setdefault("crop_white_s_min", 0)
+        self.params.setdefault("crop_white_s_max", 40)
+        self.params.setdefault("crop_white_v_min", 200)
+        self.params.setdefault("crop_white_v_max", 255)
+        self.params.setdefault("crop_min_pixel_fraction", 0.03)
+        self.params.setdefault("crop_missing_threshold", 5)
 
     def _load_robot_calibration(self) -> None:
         cal_path = self.config.paths.robot_calibration_file
@@ -515,10 +569,11 @@ class MainGui:
             GuiButton("Set Cross", "set_cross", (x0 + (bw + gap), y, bw, bh)),
             GuiButton("Calib Robot", "calib_robot", (x0 + 2 * (bw + gap), y, bw, bh)),
             GuiButton("Guide Test", "guidance_test", (x0 + 3 * (bw + gap), y, bw, bh)),
-            GuiButton("Manual", "manual", (x0 + 4 * (bw + gap), y, bw, bh)),
-            GuiButton("Auto", "auto", (x0 + 5 * (bw + gap), y, bw, bh)),
-            GuiButton("Stop", "stop", (x0 + 6 * (bw + gap), y, bw, bh)),
-            GuiButton("Quit", "quit", (x0 + 7 * (bw + gap), y, bw, bh)),
+            GuiButton("Route View", "route_view", (x0 + 4 * (bw + gap), y, bw, bh)),
+            GuiButton("Manual", "manual", (x0 + 5 * (bw + gap), y, bw, bh)),
+            GuiButton("Auto", "auto", (x0 + 6 * (bw + gap), y, bw, bh)),
+            GuiButton("Stop", "stop", (x0 + 7 * (bw + gap), y, bw, bh)),
+            GuiButton("Quit", "quit", (x0 + 8 * (bw + gap), y, bw, bh)),
         ]
         # Second row: calibration controls (depends on sub-phase)
         if self.mode == AppMode.CALIBRATE:
@@ -588,6 +643,8 @@ class MainGui:
             self._save_calibration()
         elif action == "calib_cancel":
             self._cancel_calibration()
+        elif action == "route_view":
+            self._open_route_view()
         elif action == "guidance_test":
             if self._block_during_calibration():
                 return
@@ -744,6 +801,14 @@ class MainGui:
         self._brain_state = None
         self._brain_route_points = None
         self._last_brain_time = None
+        self._tracked_balls = None
+        self._crop_missing_counts = {}
+        self._last_crop_missing = set()
+        self._crop_hsv_ranges = {}
+        self._pending_verification = []
+        self._attempted_pickups = 0
+        self._needs_verification_snapshot = False
+        self._verification_snapshot_done = False
         if self._guidance is not None:
             self._guidance.clear_route()
         if self._commander is not None:
@@ -802,6 +867,7 @@ class MainGui:
         captured_grid = result.occupancy_grid.copy()
         captured_balls = list(result.smoothed_ball_coordinates)
         captured_pose = self.robot_pose
+        captured_frame = result.frame_for_detection
 
         self._connecting = True
         self.message = "Connecting and planning route..."
@@ -836,7 +902,11 @@ class MainGui:
                 geometry = self.pose_estimator.robot_geometry_from_params(self.params)
 
                 plan = self._route_planner.plan_route(
-                    captured_grid, targets, start_pose, geometry,
+                    captured_grid,
+                    targets,
+                    start_pose,
+                    geometry,
+                    cross_spec=self._cross_spec,
                 )
 
                 if not plan.points:
@@ -852,6 +922,12 @@ class MainGui:
                 self._brain_route_points = plan.points
                 self._last_brain_time = None
                 self._brain_state = None
+                self._tracked_balls = list(captured_balls)
+                self._crop_missing_counts = {}
+                self._crop_hsv_ranges = (
+                    self.pipeline.calibrate_crop_hsv(captured_frame, captured_balls, self.params)
+                    if captured_frame is not None else {}
+                )
                 self.mode = AppMode.AUTO
                 self.message = f"Brain running — {brain.step_count} steps"
             except Exception as exc:
@@ -878,7 +954,175 @@ class MainGui:
             dt_s = max(0.001, min(0.5, now - self._last_brain_time))
         self._last_brain_time = now
 
+        prev_state = self._brain_state
         self._brain_state = self._brain.tick(self.robot_pose, dt_s)
+
+        if prev_state == BrainState.PICKUP and self._brain_state == BrainState.IDLE:
+            self._remove_collected_ball()
+
+        if (
+            self._brain_state == BrainState.ERROR
+            and self._brain.error_message == "ball_displaced"
+            and self._last_result is not None
+            and self._last_result.smoothed_ball_coordinates
+            and self._last_result.occupancy_grid is not None
+            and self.robot_pose is not None
+        ):
+            self._replan_after_displacement()
+
+    def _remove_collected_ball(self) -> None:
+        """Stage the nearest tracked ball for deferred YOLO pickup verification."""
+        if not self._tracked_balls or self.robot_pose is None:
+            return
+        nearest = min(
+            self._tracked_balls,
+            key=lambda b: (b.cm_x - self.robot_pose.x_cm) ** 2 + (b.cm_y - self.robot_pose.y_cm) ** 2,
+        )
+        self._tracked_balls = [b for b in self._tracked_balls if b.track_id != nearest.track_id]
+        self._crop_missing_counts.pop(nearest.track_id, None)
+        self._crop_hsv_ranges.pop(nearest.track_id, None)
+        self._pending_verification.append(nearest)
+        self._attempted_pickups += 1
+        log_event("BRAIN", "pickup staged for verification", track_id=nearest.track_id)
+
+    def _tick_crop_monitor(self) -> None:
+        """Check fixed HSV crops for each tracked ball; trigger rescan if any are missing."""
+        if self.mode != AppMode.AUTO or self._tracked_balls is None:
+            return
+        result = self._last_result
+        if result is None or result.frame_for_detection is None:
+            return
+
+        robot_xy = (
+            (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose is not None else None
+        )
+        robot_radius = float(self.params.get("robot_radius_cm", 30.0))
+        threshold = int(self.params.get("crop_missing_threshold", 5))
+
+        missing_now = self.pipeline.check_ball_crops(
+            result.frame_for_detection,
+            self._tracked_balls,
+            self.params,
+            robot_pose_cm=robot_xy,
+            robot_radius_cm=robot_radius,
+            per_ball_hsv=self._crop_hsv_ranges,
+        )
+        self._last_crop_missing = missing_now
+
+        for ball in self._tracked_balls:
+            tid = ball.track_id
+            if tid in missing_now:
+                self._crop_missing_counts[tid] = self._crop_missing_counts.get(tid, 0) + 1
+            else:
+                self._crop_missing_counts[tid] = 0
+
+        if any(c >= threshold for c in self._crop_missing_counts.values()):
+            self._tracked_balls = None
+            self._crop_missing_counts = {}
+            if self._brain is not None:
+                self._brain.signal_ball_displaced()
+
+    def _replan_after_displacement(self) -> None:
+        """Replan route from the current snapshot after a ball-displaced error."""
+        result = self._last_result
+        targets = [
+            PlannedBallTarget(
+                track_id=b.track_id,
+                label=b.label,
+                x_cm=b.cm_x,
+                y_cm=b.cm_y,
+                node_cm=self.pipeline.mapper.field_metric_cm_to_grid_node((b.cm_x, b.cm_y)),
+            )
+            for b in result.smoothed_ball_coordinates
+        ]
+        start_pose = HybridPose(
+            x_cm=self.robot_pose.x_cm,
+            y_cm=self.robot_pose.y_cm,
+            theta_rad=self.robot_pose.heading_rad,
+        )
+        geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+        plan = self._route_planner.plan_route(
+            result.occupancy_grid,
+            targets,
+            start_pose,
+            geometry,
+            cross_spec=self._cross_spec,
+        )
+
+        if not plan.points:
+            self.message = "Rescan: no route found — stopping"
+            return
+
+        self._brain.load_route(plan)
+        self._brain_route_points = plan.points
+        self._tracked_balls = list(result.smoothed_ball_coordinates)
+        self._crop_missing_counts = {}
+        self._crop_hsv_ranges = (
+            self.pipeline.calibrate_crop_hsv(result.frame_for_detection, result.smoothed_ball_coordinates, self.params)
+            if result.frame_for_detection is not None else {}
+        )
+        self.message = f"Replanned — {self._brain.step_count} steps"
+        log_event("BRAIN", "replanned after rescan", steps=self._brain.step_count)
+
+    def _tick_pickup_verifier(self) -> None:
+        """Trigger a YOLO snapshot when the robot has moved away from all pending pickups."""
+        if self.mode != AppMode.AUTO or self._brain is None:
+            return
+
+        # If a snapshot was just taken this frame, run verification now.
+        if self._verification_snapshot_done:
+            self._verification_snapshot_done = False
+            self._verify_pickups()
+            return
+
+        if not self._pending_verification or self.robot_pose is None:
+            return
+
+        robot_radius = float(self.params.get("robot_radius_cm", 30.0))
+        for ball in self._pending_verification:
+            dist = (
+                (ball.cm_x - self.robot_pose.x_cm) ** 2
+                + (ball.cm_y - self.robot_pose.y_cm) ** 2
+            ) ** 0.5
+            if dist < robot_radius:
+                return  # still near at least one pending ball — wait
+
+        # Robot is clear of all pending balls — schedule verification snapshot.
+        self._needs_verification_snapshot = True
+
+    def _verify_pickups(self) -> None:
+        """Compare fresh YOLO detections against pending pickups; replan if any failed."""
+        result = self._last_result
+        pending = list(self._pending_verification)
+        self._pending_verification = []
+        self._attempted_pickups = 0
+
+        if not pending or result is None:
+            return
+
+        match_radius_sq = 15.0 ** 2
+        fresh = result.smoothed_ball_coordinates
+        failed = [
+            p for p in pending
+            if any(
+                (b.cm_x - p.cm_x) ** 2 + (b.cm_y - p.cm_y) ** 2 < match_radius_sq
+                for b in fresh
+            )
+        ]
+
+        log_event("BRAIN", "pickup verification", attempted=len(pending), failed=len(failed))
+
+        if not failed:
+            return  # all pickups confirmed
+
+        self.message = f"Pickup failed for {len(failed)} ball(s) — replanning"
+        if (
+            result.smoothed_ball_coordinates
+            and result.occupancy_grid is not None
+            and self.robot_pose is not None
+            and self._brain is not None
+        ):
+            self._replan_after_displacement()
 
     # ------------------------------------------------------------------
     # Robot self-calibration (spin -> fit center -> align body -> save)
@@ -1077,6 +1321,200 @@ class MainGui:
         self.mode = AppMode.IDLE
 
     # ------------------------------------------------------------------
+    # Route View window (pickup geometry + route visualization)
+    # ------------------------------------------------------------------
+
+    def _open_route_view(self) -> None:
+        """Open or re-focus the Route View secondary window."""
+        if self._route_view_open:
+            return
+        self._route_view_open = True
+        self._route_view_cache_id = 0
+        self._route_view_cached_image = None
+        cv2.namedWindow(ROUTE_VIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.createTrackbar(
+            "Strategy", ROUTE_VIEW_WINDOW_NAME,
+            self._route_view_strategy_index, len(STRATEGY_OPTIONS) - 1,
+            lambda _v: None,
+        )
+        cv2.resizeWindow(
+            ROUTE_VIEW_WINDOW_NAME,
+            self._right_w, self._right_h,
+        )
+        self.message = "Route View opened — use Strategy trackbar to switch"
+
+    def _route_view_strategy_index_from_config(self) -> int:
+        """Return the route-view option matching the configured route strategy."""
+        configured_key = ROUTE_VIEW_KEY_BY_CONFIG_STRATEGY.get(self.config.planner.route_strategy)
+        for index, option in enumerate(STRATEGY_OPTIONS):
+            if option.key == configured_key:
+                return index
+        return 0
+
+    def _sync_route_view_strategy_to_planner(self) -> None:
+        """Apply the selected route-view strategy to the shared planner facade."""
+        if not (0 <= self._route_view_strategy_index < len(STRATEGY_OPTIONS)):
+            return
+        option = STRATEGY_OPTIONS[self._route_view_strategy_index]
+        strategy_name = CONFIG_STRATEGY_BY_ROUTE_VIEW_KEY.get(option.key)
+        if strategy_name is not None:
+            self._route_planner.set_strategy(strategy_name)
+
+    def _close_route_view(self) -> None:
+        self._route_view_open = False
+        self._route_view_cached_image = None
+        try:
+            cv2.destroyWindow(ROUTE_VIEW_WINDOW_NAME)
+        except cv2.error:
+            pass
+
+    def _tick_route_view(self) -> None:
+        """Render one frame of the Route View window."""
+        if not self._route_view_open:
+            return
+
+        # Check if window was closed by user
+        try:
+            if cv2.getWindowProperty(ROUTE_VIEW_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                self._close_route_view()
+                return
+        except cv2.error:
+            self._close_route_view()
+            return
+
+        # Read trackbar
+        tb = cv2.getTrackbarPos("Strategy", ROUTE_VIEW_WINDOW_NAME)
+        if 0 <= tb < len(STRATEGY_OPTIONS):
+            strategy_changed = tb != self._route_view_strategy_index
+            self._route_view_strategy_index = tb
+            if strategy_changed:
+                self._sync_route_view_strategy_to_planner()
+        else:
+            strategy_changed = False
+
+        result = self._last_result
+        if result is None or result.occupancy_grid is None:
+            placeholder = np.full(
+                (self._right_h, self._right_w, 3), (40, 40, 40), dtype=np.uint8,
+            )
+            cv2.putText(
+                placeholder, "Waiting for perception data...",
+                (20, self._right_h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA,
+            )
+            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, placeholder)
+            return
+
+        # Cache check: skip recompute if data unchanged and strategy unchanged
+        cache_id = id(result)
+        pose_id = id(self.robot_pose)
+        combined_id = hash((cache_id, pose_id, self._route_view_strategy_index))
+        if combined_id == self._route_view_cache_id and self._route_view_cached_image is not None:
+            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, self._route_view_cached_image)
+            return
+        self._route_view_cache_id = combined_id
+
+        # Build base schematic
+        frame_shape = (
+            result.preprocessed.topdown.shape
+            if result.preprocessed.topdown is not None
+            else (self._left_h, self._left_w, 3)
+        )
+        camera_center = (
+            float(self.params.get("camera_center_x", self._left_w / 2)),
+            float(self.params.get("camera_center_y", self._left_h / 2)),
+        )
+        image = self.renderer.draw_schematic(
+            frame_shape=frame_shape,
+            red_zones=result.red_zones,
+            smoothed_ball_coordinates=result.smoothed_ball_coordinates,
+            camera_center_pixels=camera_center,
+            robot_pose=self.robot_pose,
+            params=self.params,
+        )
+
+        # Compute pickup geometry
+        geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+        field_w = self.config.field.width_cm
+        field_h = self.config.field.height_cm
+        targets = [
+            PlannedBallTarget(
+                track_id=b.track_id,
+                label=b.label,
+                x_cm=b.cm_x,
+                y_cm=b.cm_y,
+                node_cm=self.pipeline.mapper.field_metric_cm_to_grid_node(
+                    (b.cm_x, b.cm_y),
+                ),
+            )
+            for b in result.smoothed_ball_coordinates
+        ]
+
+        if not targets:
+            draw_strategy_label(image, STRATEGY_OPTIONS[self._route_view_strategy_index])
+            self._route_view_cached_image = image
+            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
+            return
+
+        geometry_result = compute_pickup_geometry(
+            field_w, field_h, result.occupancy_grid, targets, geometry,
+        )
+        mapper = self.renderer.mapper
+        draw_pickup_geometry(image, geometry_result, mapper, self.config.field)
+
+        # Build obstacle from cross spec
+        if self._cross_spec is not None:
+            cs = self._cross_spec
+            obstacle = ObstacleGeometry(
+                center_x_cm=cs.center_cm[0],
+                center_y_cm=cs.center_cm[1],
+                half_size_cm=cs.length_cm / 2.0,
+                half_arm_width_cm=cs.arm_width_cm / 2.0,
+                angle_rad=cs.angle_rad,
+            )
+        else:
+            obstacle = ObstacleGeometry(
+                center_x_cm=-1000.0,
+                center_y_cm=-1000.0,
+                half_size_cm=0.0,
+                half_arm_width_cm=0.0,
+            )
+
+        # Build start pose and route
+        if self.robot_pose is not None:
+            start_pose = HybridPose(
+                x_cm=self.robot_pose.x_cm,
+                y_cm=self.robot_pose.y_cm,
+                theta_rad=self.robot_pose.heading_rad,
+            )
+        else:
+            start_pose = HybridPose(x_cm=20.0, y_cm=20.0, theta_rad=0.0)
+
+        margin = self._route_planner.hybrid_config.unload_staging_margin_cm
+        unload_pose = self._route_planner.hybrid_planner.small_goal_unload_pose(geometry, margin)
+        unload_goal_cm = self._route_planner.hybrid_planner.small_goal_center_cm()
+
+        route_input = RoutePlannerInput(
+            geometry_result=geometry_result,
+            obstacle=obstacle,
+            start_pose=start_pose,
+            robot_radius_cm=geometry_result.ring_radius_cm,
+            field_width_cm=field_w,
+            field_height_cm=field_h,
+            unload_pose=unload_pose,
+            unload_goal_cm=unload_goal_cm,
+        )
+
+        strategy_option = STRATEGY_OPTIONS[self._route_view_strategy_index]
+        strategy = strategy_option.create()
+        strategy_result = strategy.plan(route_input)
+        draw_route_plan(image, strategy_result, geometry_result, mapper, self.config.field)
+        draw_strategy_label(image, strategy_option)
+
+        self._route_view_cached_image = image
+        cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
+
+    # ------------------------------------------------------------------
     # Per-frame processing
     # ------------------------------------------------------------------
 
@@ -1084,12 +1522,20 @@ class MainGui:
         # HSV cross detection is disabled; the central cross is the manually
         # placed one, fed in as a red zone so it flows into the occupancy grid
         # and both panel overlays.
+        skip = (
+            self.mode == AppMode.GUIDANCE_TEST
+            or (self.mode == AppMode.AUTO and self._tracked_balls is not None and not self._needs_verification_snapshot)
+        )
+        if self._needs_verification_snapshot:
+            self._needs_verification_snapshot = False
+            self._verification_snapshot_done = True
         cross = self.cross_red_zone()
         extra_red_zones = [cross] if cross is not None else []
         return self.pipeline.process(
             raw_frame,
             params=self.params,
             use_aruco=True,
+            skip_ball_detection=skip,
             detect_red_zones=False,
             extra_red_zones=extra_red_zones,
         )
@@ -1121,11 +1567,88 @@ class MainGui:
         else:
             left = self.renderer.make_topdown_placeholder("No top-down warp — click Set Corners")
 
+        if self._tracked_balls is not None:
+            self._draw_crop_overlay(left)
         if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
             left = cv2.resize(left, (self._left_w, self._left_h), interpolation=cv2.INTER_LINEAR)
         if self.mode == AppMode.CALIBRATE:
             self._draw_calibration_overlay(left)
         return left
+
+    def _draw_crop_overlay(self, image: np.ndarray) -> None:
+        """Draw crop monitor boxes on the topdown frame.
+
+        Green = ball present, Red = missing, Grey = skipped (robot over crop).
+        """
+        if not self._tracked_balls:
+            return
+        crop_size = int(self.params.get("crop_size", 60))
+        robot_radius_cm = float(self.params.get("robot_radius_cm", 30.0))
+        half = crop_size // 2
+        h, w = image.shape[:2]
+        px_per_cm = w / self.pipeline.config.field.width_cm
+
+        robot_px = None
+        if self.robot_pose is not None:
+            robot_px = self.pipeline.mapper.field_cm_to_topdown_pixel(
+                (self.robot_pose.x_cm, self.robot_pose.y_cm)
+            )
+        robot_radius_px = robot_radius_cm * px_per_cm
+
+        # Draw robot exclusion circle so operator can see which crops are protected
+        if robot_px is not None:
+            cv2.circle(
+                image,
+                (int(round(robot_px[0])), int(round(robot_px[1]))),
+                int(round(robot_radius_px)),
+                (80, 80, 80),
+                1,
+                cv2.LINE_AA,
+            )
+
+        for ball in self._tracked_balls:
+            if ball.label != "white":
+                continue  # orange balls not monitored via HSV
+            cx, cy = self.pipeline.mapper.field_cm_to_topdown_pixel((ball.cm_x, ball.cm_y))
+            cx, cy = int(round(cx)), int(round(cy))
+
+            if robot_px is not None:
+                dist = ((cx - robot_px[0]) ** 2 + (cy - robot_px[1]) ** 2) ** 0.5
+                if dist < robot_radius_px:
+                    cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), (120, 120, 120), 1, cv2.LINE_AA)
+                    continue
+
+            color = (60, 60, 200) if ball.track_id in self._last_crop_missing else (60, 200, 60)
+            cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), color, 2, cv2.LINE_AA)
+
+        # Draw pending verification cluster overlay
+        if self._pending_verification:
+            pv_px = [
+                self.pipeline.mapper.field_cm_to_topdown_pixel((b.cm_x, b.cm_y))
+                for b in self._pending_verification
+            ]
+            # Dashed yellow box per pending ball
+            for px, py in pv_px:
+                px, py = int(round(px)), int(round(py))
+                cv2.rectangle(image, (px - half, py - half), (px + half, py + half), (0, 220, 220), 1, cv2.LINE_AA)
+                cv2.drawMarker(image, (px, py), (0, 220, 220), cv2.MARKER_CROSS, 10, 1, cv2.LINE_AA)
+
+            # Cluster center crosshair
+            cx_mean = sum(p[0] for p in pv_px) / len(pv_px)
+            cy_mean = sum(p[1] for p in pv_px) / len(pv_px)
+            center_px = (int(round(cx_mean)), int(round(cy_mean)))
+
+            # Cluster radius = max distance from center to any pending ball
+            cluster_r = max(
+                int(round(((p[0] - cx_mean) ** 2 + (p[1] - cy_mean) ** 2) ** 0.5))
+                for p in pv_px
+            ) + half
+            cv2.circle(image, center_px, cluster_r, (0, 220, 220), 1, cv2.LINE_AA)
+            cv2.drawMarker(image, center_px, (0, 220, 220), cv2.MARKER_TILTED_CROSS, 14, 2, cv2.LINE_AA)
+
+            label = f"Pending {self._attempted_pickups}x"
+            cv2.putText(image, label, (center_px[0] + cluster_r + 4, center_px[1] + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 220), 1, cv2.LINE_AA)
 
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.
@@ -1251,7 +1774,7 @@ class MainGui:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
 
         cv2.putText(canvas,
-                    "Keys: q/Esc quit | f set corners | x set cross | c calib robot | g guidance test | a auto | s stop",
+                    "Keys: q/Esc quit | f corners | x cross | c calib | g guide | v route | a auto | s stop",
                     (20, y0 + 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
 
@@ -1261,6 +1784,7 @@ class MainGui:
             is_active = (
                 (button.action == "set_corners" and self._corner_window_open)
                 or (button.action == "set_cross" and self._cross_window_open)
+                or (button.action == "route_view" and self._route_view_open)
                 or (button.action == "calib_robot" and self.mode == AppMode.CALIBRATE)
                 or (button.action == "guidance_test" and self.mode == AppMode.GUIDANCE_TEST)
                 or (button.action == "manual" and self.mode == AppMode.MANUAL)
@@ -1298,11 +1822,17 @@ class MainGui:
         if self._cross_window_open and raw_frame is not None:
             self._tick_cross_window(raw_frame)
 
+        # Drive the route view window if open
+        if self._route_view_open:
+            self._tick_route_view()
+
         if raw_frame is not None:
             result = self._process_frame(raw_frame)
             self._last_result = result
             self._estimate_pose(result)
             self._tick_guidance()
+            self._tick_crop_monitor()
+            self._tick_pickup_verifier()
             self._tick_brain()
             self._tick_calibration()
             left = self._build_left_panel(result)
@@ -1360,6 +1890,8 @@ class MainGui:
             self._handle_button("calib_robot")
         elif key == ord("x"):
             self._handle_button("set_cross")
+        elif key == ord("v"):
+            self._handle_button("route_view")
         elif key == ord("s"):
             self._handle_button("stop")
 
@@ -1384,6 +1916,8 @@ class MainGui:
             self._close_corner_window()
         if self._cross_window_open:
             self._close_cross_window()
+        if self._route_view_open:
+            self._close_route_view()
         if self.camera is not None:
             self.camera.release()
         cv2.destroyWindow(WINDOW_NAME)

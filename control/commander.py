@@ -287,14 +287,15 @@ class RobotCommander:
             desired = -desired
         speed = self._slew_limited_speed(desired, dt_s)
         self._base_speed = speed
-        correction = heading_error_deg * self._config.adjust_gain
+        correction = heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
         return self._send_wheel_speeds(speed - correction, speed + correction)
 
     def stop(self, force: bool = True) -> bool:
         """Zero wheel speeds and reset base speed."""
         self._base_speed = 0.0
         self._previous_speed = 0.0
-        return self._send_wheel_speeds(0.0, 0.0, force=force)
+        self._send("stop")
+        return True
 
     # ------------------------------------------------------------------
     # Legacy steer() — bridge for guidance code until full migration
@@ -314,9 +315,12 @@ class RobotCommander:
         return self._send("collector_travel_position")
 
     def pickup_assist(self) -> str:
+        self._send("stop")
         return self._send("pickup_assist")
 
     def unload_full_cycle(self) -> str:
+        self._send("stop")
+        self._send("unload_full_cycle")
         return self._send("unload_full_cycle")
 
     def pipe_up(self, units, speed=None) -> str:

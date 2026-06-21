@@ -83,6 +83,26 @@ class RedCrossSpec:
     length_cm: float = 20.0
     arm_width_cm: float = 3.0
 
+    @property
+    def center_x_cm(self) -> float:
+        """Center X coordinate, matching the planner obstacle interface."""
+        return self.center_cm[0]
+
+    @property
+    def center_y_cm(self) -> float:
+        """Center Y coordinate, matching the planner obstacle interface."""
+        return self.center_cm[1]
+
+    @property
+    def half_size_cm(self) -> float:
+        """Half of the full tip-to-tip cross length."""
+        return self.length_cm / 2.0
+
+    @property
+    def half_arm_width_cm(self) -> float:
+        """Half of the cross arm width."""
+        return self.arm_width_cm / 2.0
+
     def polygon_cm(self) -> list[tuple[float, float]]:
         """Return the 12 plus-shape vertices in field cm, counter-clockwise."""
         half_len = self.length_cm / 2.0

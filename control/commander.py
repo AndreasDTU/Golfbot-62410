@@ -71,8 +71,11 @@ class RobotCommander:
         # Speed state
         self._current_speed: float = 0.0
         self._total_distance: float = 0.0
+        self._total_turn_angle: float = 0.0
+        self._last_turn_angle: float = 0.0
         self.max_speed_pct: float = 100.0
-        self._acceleration: float = (config.drive_max_speed_pct - config.drive_min_speed_pct) / (config.drive_acceleration_cm ** 2)
+        self._drive_acceleration: float = (config.drive_max_speed_pct - config.drive_min_speed_pct) / (config.drive_acceleration_cm ** 2)
+        self._turn_acceleration: float = (config.turn_max_speed_pct - config.turn_min_speed_pct) / (config.turn_acceleration_deg ** 2)
 
         # TCP connection
         self.sock: socket.socket | None = None
@@ -212,30 +215,32 @@ class RobotCommander:
     def _target_speed_for_distance(self, distance_cm: float) -> float:
         """
         Profiled forward speed for a remaining distance.
-        Following this graph: https://www.desmos.com/calculator/kwkobx9vta
+        Following this graph (quadratic acceleration): https://www.desmos.com/calculator/kwkobx9vta
         """
 
         cfg = self._config
         distance_left = max(0.0, abs(float(distance_cm)))
         distance_driven = self._total_distance - distance_left
         raw_speed = min(
-            cfg.drive_min_speed_pct + self._acceleration * (distance_driven * distance_driven),
-            cfg.drive_min_speed_pct + self._acceleration * (distance_left * distance_left),
+            cfg.drive_min_speed_pct + self._drive_acceleration * (distance_driven * distance_driven),
+            cfg.drive_min_speed_pct + self._drive_acceleration * (distance_left * distance_left),
         )
 
         return max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
 
     def _target_speed_for_angle(self, degrees: float) -> float:
-        """Profiled rotation speed for a remaining angle."""
+        """
+        Profiled rotation speed for a remaining angle using quadratic acceleration.
+        Following this graph (same as distance graph): https://www.desmos.com/calculator/kwkobx9vta
+        """
         cfg = self._config
-        angle = abs(float(degrees))
-        if angle <= cfg.turn_creep_angle_deg:
-            return cfg.turn_creep_speed_pct
-        if angle >= cfg.turn_cruise_angle_deg:
-            return cfg.turn_speed_pct
-        span = max(1e-6, cfg.turn_cruise_angle_deg - cfg.turn_creep_angle_deg)
-        ratio = (angle - cfg.turn_creep_angle_deg) / span
-        return cfg.turn_creep_speed_pct + ratio * (cfg.turn_speed_pct - cfg.turn_creep_speed_pct)
+        angle_left = max(0.0, abs(float(degrees)))
+        angle_turned = self._total_turn_angle - angle_left
+        raw_speed = min(
+            cfg.turn_min_speed_pct + self._turn_acceleration * (angle_turned * angle_turned),
+            cfg.turn_min_speed_pct + self._turn_acceleration * (angle_left * angle_left),
+        )
+        return max(min(raw_speed, cfg.turn_max_speed_pct), cfg.turn_min_speed_pct)
 
     # ------------------------------------------------------------------
     # Movement API (non-blocking, per-frame, all produce LR commands)
@@ -246,6 +251,15 @@ class RobotCommander:
         if not math.isfinite(degrees):
             self.last_error = "non-finite turn angle rejected"
             return False
+
+        # Detect start of a new turn: magnitude increased or sign changed
+        abs_degrees = abs(degrees)
+        if self._last_turn_angle == 0 or abs_degrees > abs(self._last_turn_angle) or (
+            (degrees >= 0) != (self._last_turn_angle >= 0)
+        ):
+            self._total_turn_angle = abs_degrees
+        self._last_turn_angle = degrees
+
         speed = self._target_speed_for_angle(degrees)
         sign = 1.0 if degrees >= 0 else -1.0
         self._current_speed = 0.0

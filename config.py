@@ -278,10 +278,9 @@ class DriveConfig:
     drive_max_speed_pct: float = 95.0   # Maximum travel speed
     drive_acceleration_cm: float = 7.0  # Distance to go from min to max speed
     # Turn speed profiling
-    turn_speed_pct: float = 25.0
-    turn_creep_speed_pct: float = 8.0
-    turn_cruise_angle_deg: float = 30.0
-    turn_creep_angle_deg: float = 8.0
+    turn_min_speed_pct: float = 8.0
+    turn_max_speed_pct: float = 25.0
+    turn_acceleration_deg: float = 15.0
     # PID gains
     heading_kp: float = 38.0
     heading_kd: float = 6.0

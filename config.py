@@ -273,27 +273,22 @@ class ConnectionConfig:
 class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
-    drive_speed_pct: float = 100.0
-    max_speed_pct: float = 100.0
-    max_heading_for_forward_rad: float = math.radians(15.0)
+    # Drive speed profiling
+    drive_min_speed_pct: float = 10.0   # Minimum travel speed
+    drive_max_speed_pct: float = 95.0   # Maximum travel speed
+    drive_acceleration_cm: float = 7.0  # Distance to go from min to max speed
+    # Turn speed profiling
     turn_speed_pct: float = 25.0
-    creep_speed_pct: float = 25.0
+    turn_creep_speed_pct: float = 8.0
+    turn_cruise_angle_deg: float = 30.0
+    turn_creep_angle_deg: float = 8.0
     # PID gains
     heading_kp: float = 38.0
     heading_kd: float = 6.0
     xte_kp: float = 2.2
     xte_kd: float = 0.25
     # Distance-based speed profiling
-    cruise_distance_cm: float = 30.0
-    creep_distance_cm: float = 10.0
     max_cross_track_error_cm: float = 8.0
-    # Turn speed profiling
-    turn_creep_speed_pct: float = 8.0
-    turn_cruise_angle_deg: float = 30.0
-    turn_creep_angle_deg: float = 8.0
-    # Kinematic limits
-    acceleration_limit_pct_per_s: float = 45.0
-    deceleration_limit_pct_per_s: float = 90.0
     # Edge/wall proximity
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
@@ -301,7 +296,12 @@ class DriveConfig:
     near_zone_cm: float = 15.0
     near_zone_move_speed_pct: float = 7.0
     # Heading correction
+    max_heading_for_forward_rad: float = math.radians(15.0)
     adjust_gain: float = 0.5
+    # Waypoint arrival tolerance
+    waypoint_arrival_cm: float = 4.0
+    ball_arrival_cm: float = 1.0
+    final_heading_tolerance_rad: float = math.radians(2.0)
     # Route tracking
     route_tracking_lookahead_segments: int = 12
 

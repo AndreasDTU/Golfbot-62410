@@ -62,7 +62,6 @@ class RobotCommander:
         # Dispatch state
         self.command_format: str = conn.robot_command_format
         self.min_send_interval_s: float = conn.min_send_interval_s
-        self.max_speed_pct: float = config.max_speed_pct
         self.command_deadband_pct: float = conn.command_deadband_pct
         self.last_send_time: float = 0.0
         self.last_sent: tuple[float, float] | None = None
@@ -70,8 +69,10 @@ class RobotCommander:
         self.time_fn: Callable[[], float] = time_fn or time.perf_counter
 
         # Speed state
-        self._base_speed: float = 0.0
-        self._previous_speed: float = 0.0
+        self._current_speed: float = 0.0
+        self._total_distance: float = 0.0
+        self.max_speed_pct: float = 100.0
+        self._acceleration: float = (config.drive_max_speed_pct - config.drive_min_speed_pct) / (config.drive_acceleration_cm ** 2)
 
         # TCP connection
         self.sock: socket.socket | None = None
@@ -209,16 +210,20 @@ class RobotCommander:
     # ------------------------------------------------------------------
 
     def _target_speed_for_distance(self, distance_cm: float) -> float:
-        """Profiled forward speed for a remaining distance."""
+        """
+        Profiled forward speed for a remaining distance.
+        Following this graph: https://www.desmos.com/calculator/kwkobx9vta
+        """
+
         cfg = self._config
-        distance = max(0.0, abs(float(distance_cm)))
-        if distance <= cfg.creep_distance_cm:
-            return cfg.creep_speed_pct
-        if distance >= cfg.cruise_distance_cm:
-            return cfg.drive_speed_pct
-        span = max(1e-6, cfg.cruise_distance_cm - cfg.creep_distance_cm)
-        ratio = (distance - cfg.creep_distance_cm) / span
-        return cfg.creep_speed_pct + ratio * (cfg.drive_speed_pct - cfg.creep_speed_pct)
+        distance_left = max(0.0, abs(float(distance_cm)))
+        distance_driven = self._total_distance - distance_left
+        raw_speed = min(
+            cfg.drive_min_speed_pct + self._acceleration * (distance_driven * distance_driven),
+            cfg.drive_min_speed_pct + self._acceleration * (distance_left * distance_left),
+        )
+
+        return max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
 
     def _target_speed_for_angle(self, degrees: float) -> float:
         """Profiled rotation speed for a remaining angle."""
@@ -232,19 +237,6 @@ class RobotCommander:
         ratio = (angle - cfg.turn_creep_angle_deg) / span
         return cfg.turn_creep_speed_pct + ratio * (cfg.turn_speed_pct - cfg.turn_creep_speed_pct)
 
-    def _slew_limited_speed(self, desired_speed_pct: float, dt_s: float | None = None) -> float:
-        """Apply acceleration / deceleration limits to forward speed."""
-        desired = float(np.clip(desired_speed_pct, -self.max_speed_pct, self.max_speed_pct))
-        if dt_s is None or dt_s <= 1e-6:
-            self._previous_speed = desired
-            return desired
-        previous = self._previous_speed
-        accel_step = max(0.0, self._config.acceleration_limit_pct_per_s) * dt_s
-        decel_step = max(0.0, self._config.deceleration_limit_pct_per_s) * dt_s
-        limited = float(np.clip(desired, previous - decel_step, previous + accel_step))
-        self._previous_speed = limited
-        return limited
-
     # ------------------------------------------------------------------
     # Movement API (non-blocking, per-frame, all produce LR commands)
     # ------------------------------------------------------------------
@@ -256,44 +248,38 @@ class RobotCommander:
             return False
         speed = self._target_speed_for_angle(degrees)
         sign = 1.0 if degrees >= 0 else -1.0
-        self._base_speed = 0.0
+        self._current_speed = 0.0
         return self._send_wheel_speeds(-sign * speed, sign * speed)
 
-    def drive(self, cm: float, dt_s: float | None = None) -> bool:
-        """Straight-line drive.  *cm* = remaining distance (positive = forward)."""
+    def start_drive(self, cm: float) -> bool:
+        """Initialize drive.  *cm* = remaining distance (positive = forward)."""
         if not math.isfinite(cm):
             self.last_error = "non-finite drive distance rejected"
             return False
-        desired = self._target_speed_for_distance(cm)
-        if cm < 0:
-            desired = -desired
-        speed = self._slew_limited_speed(desired, dt_s)
-        self._base_speed = speed
-        return self._send_wheel_speeds(speed, speed)
 
-    def drive_adjusted(self, cm: float, dt_s: float | None, heading_error_deg: float) -> bool:
+        self._total_distance = abs(cm)
+        return self.drive_adjusted(cm, 0)
+
+    def drive_adjusted(self, cm: float, heading_error_deg: float) -> bool:
         """Forward drive with simultaneous arc correction.
 
         Computes a single wheel-speed command combining profiled forward speed
-        (from *cm*) with heading correction (from *heading_error_deg*).  This
-        replaces the two-call ``drive() + adjust()`` pattern, which sent an
-        intermediate straight-drive command before the arc correction.
+        (from *cm*) with heading correction (from *heading_error_deg*).
         """
         if not (math.isfinite(cm) and math.isfinite(heading_error_deg)):
             self.last_error = "non-finite drive_adjusted argument rejected"
             return False
-        desired = self._target_speed_for_distance(cm)
+        speed = self._target_speed_for_distance(abs(cm))
         if cm < 0:
-            desired = -desired
-        speed = self._slew_limited_speed(desired, dt_s)
-        self._base_speed = speed
-        correction = heading_error_deg * self._config.adjust_gain
+            speed = -speed
+        self._current_speed = speed
+        correction = heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
         return self._send_wheel_speeds(speed - correction, speed + correction)
 
     def stop(self, force: bool = True) -> bool:
         """Zero wheel speeds and reset base speed."""
         self._base_speed = 0.0
-        self._previous_speed = 0.0
+        self._driving = False
         return self._send_wheel_speeds(0.0, 0.0, force=force)
 
     # ------------------------------------------------------------------

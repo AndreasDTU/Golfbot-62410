@@ -32,12 +32,6 @@ class GuidanceStatus(str, Enum):
     ERROR = "ERROR"
 
 
-# Default waypoint arrival tolerance in cm (matches PlannerConfig.goal_tolerance_cm).
-DEFAULT_WAYPOINT_ARRIVAL_CM = 4.0
-DEFAULT_BALL_ARRIVAL_CM = 1.0
-DEFAULT_FINAL_HEADING_TOLERANCE_RAD = math.radians(2.0)
-
-
 class GuidanceController:
     """Per-frame waypoint follower.
 
@@ -56,20 +50,19 @@ class GuidanceController:
         self,
         commander: RobotCommander,
         config: DriveConfig | None = None,
-        waypoint_arrival_cm: float = DEFAULT_WAYPOINT_ARRIVAL_CM,
-        ball_arrival_cm: float = DEFAULT_BALL_ARRIVAL_CM,
-        final_heading_tolerance_rad: float = DEFAULT_FINAL_HEADING_TOLERANCE_RAD,
     ) -> None:
         self._commander = commander
         self._config = config or DriveConfig()
-        self._waypoint_arrival_cm = waypoint_arrival_cm
-        self._ball_arrival_cm = ball_arrival_cm
-        self._final_heading_tolerance_rad = final_heading_tolerance_rad
+        self._waypoint_arrival_cm = self._config.waypoint_arrival_cm
+        self._ball_arrival_cm = self._config.ball_arrival_cm
+        self._final_heading_tolerance_rad = self._config.final_heading_tolerance_rad
 
         self._waypoints: list[HybridPose] = []
         self._cursor: int = 0
         self._route_complete: bool = False
         self._aligning: bool = False
+
+        self._driving: bool = False
 
     # ------------------------------------------------------------------
     # Route management
@@ -89,6 +82,7 @@ class GuidanceController:
         self._cursor = 0
         self._route_complete = False
         self._aligning = False
+        self._driving = False
         self._commander.stop()
         log_event("GUIDANCE", "route cleared")
 
@@ -141,6 +135,12 @@ class GuidanceController:
         target = self._waypoints[self._cursor]
         distance, heading_error = self._compute_geometry(pose, target)
 
+        # 2b Init driving
+        if not self._driving:
+            self._driving = self._commander.start_drive(distance)
+            self._log("DRIVING", dist=distance, ok=self._driving)
+            return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
+
         # 5. Check arrival at current waypoint.
         is_last = self._cursor >= len(self._waypoints) - 1
         if distance < (self._ball_arrival_cm if is_last else self._waypoint_arrival_cm):
@@ -152,7 +152,10 @@ class GuidanceController:
             # Intermediate waypoint — advance cursor.
             self._cursor += 1
             target = self._waypoints[self._cursor]
-            distance, heading_error = self._compute_geometry(pose, target)
+            distance, _ = self._compute_geometry(pose, target)
+            self._driving = self._commander.start_drive(distance)
+            self._log("DRIVING", dist=distance, ok=self._driving)
+            return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
 
         # 6. Large heading error — rotate in place.
         if abs(heading_error) > self._config.max_heading_for_forward_rad:
@@ -164,7 +167,7 @@ class GuidanceController:
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
         # 7. Drive forward with arc correction (single combined LR command).
-        ok = self._commander.drive_adjusted(distance, dt_s, math.degrees(heading_error))
+        ok = self._commander.drive_adjusted(distance, math.degrees(heading_error))
         self._log(
             "DRIVING", dist=distance,
             heading_err=math.degrees(heading_error), ok=ok,

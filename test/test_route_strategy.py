@@ -24,6 +24,7 @@ from path.route_strategy import (
     RouteStrategyResult,
     SweepStrategy,
     TwoOptStrategy,
+    _best_stop_for_ball_from,
     _nearest_neighbor_order,
     _select_stops,
     _tour_distance,
@@ -313,4 +314,66 @@ class TestIntersectionPriorityDeferredSelection:
         assert stop_b.candidate.x_cm > ball_b.x_cm, (
             f"Ball B candidate at x={stop_b.candidate.x_cm:.1f} should be "
             f"to the right of ball center x={ball_b.x_cm:.1f}"
+        )
+
+
+class TestNonSafeApproachDirectionPreference:
+    """Verify that non-SAFE candidates prefer the near side relative to approach."""
+
+    def test_non_safe_prefers_closer_candidate(self):
+        """Place a ball near the cross so it has non-SAFE candidates, then
+        verify that _best_stop_for_ball_from picks the candidate closer to
+        the given approach position."""
+        fc = make_field_config()
+        geometry = make_geometry()
+
+        # Place ball near the cross center so candidates are non-SAFE.
+        cx_field = fc.width_cm * 0.5
+        cy_field = fc.height_cm * 0.5
+        # Offset ball slightly so it's reachable but near the cross.
+        ball_x = cx_field + 15.0
+        ball_y = cy_field
+
+        balls = [make_ball(ball_x, ball_y, label="white", track_id=1)]
+        geo_result = compute_pickup_geometry(
+            field_width_cm=fc.width_cm,
+            field_height_cm=fc.height_cm,
+            obstacle_grid=make_cross_obstacle_grid(fc),
+            balls=balls,
+            geometry=geometry,
+        )
+
+        ball_cands = geo_result.balls[0]
+        if not ball_cands.reachable:
+            pytest.skip("Ball not reachable in this geometry")
+
+        from path.pickup_geometry import PickupCategory
+        non_safe = [c for c in ball_cands.candidates
+                    if c.category != PickupCategory.SAFE]
+        if len(non_safe) < 2:
+            pytest.skip("Need at least 2 non-SAFE candidates to test ordering")
+
+        # Approach from the right side (robot is to the right of the ball).
+        robot_x = ball_x + 40.0
+        robot_y = ball_y
+
+        stop_right = _best_stop_for_ball_from(
+            0, geo_result, fc.height_cm, robot_x, robot_y,
+        )
+
+        # Approach from the left side.
+        robot_x_left = ball_x - 40.0
+        stop_left = _best_stop_for_ball_from(
+            0, geo_result, fc.height_cm, robot_x_left, robot_y,
+        )
+
+        if stop_right is None or stop_left is None:
+            pytest.skip("Could not find stops for both approach directions")
+
+        # The two approach directions should select different candidates
+        # (or at least the right-approach candidate should be further right
+        # than the left-approach candidate).
+        assert stop_right.candidate.x_cm >= stop_left.candidate.x_cm, (
+            f"Right-approach candidate x={stop_right.candidate.x_cm:.1f} should be >= "
+            f"left-approach candidate x={stop_left.candidate.x_cm:.1f}"
         )

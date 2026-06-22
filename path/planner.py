@@ -41,7 +41,7 @@ from path.models import (
 )
 from path.pickup_geometry import compute_pickup_geometry
 from path.route_strategy import (
-    NearestNeighborStrategy,
+    IntersectionPriorityStrategy,
     RoutePlannerInput,
     RouteStrategyResult,
 )
@@ -551,7 +551,7 @@ def plan_route(
     )
 
     # Layer 2: Route strategy.
-    strategy = NearestNeighborStrategy()
+    strategy = IntersectionPriorityStrategy()
     strategy_input = RoutePlannerInput(
         geometry_result=geo_result,
         start_pose=start_pose,

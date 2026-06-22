@@ -176,13 +176,12 @@ def _select_stops(
             unreachable.append(ball_idx)
             continue
 
-        # Sort candidates: category first, then among SAFE candidates
-        # prefer those closer to the approach hint (if given), otherwise
-        # fall back to obstacle clearance.
+        # Sort candidates: category first, then prefer those closer to
+        # the approach hint (if given), otherwise fall back to obstacle
+        # clearance.
         def _candidate_sort_key(c: PickupCandidate) -> tuple:
             pref = _CATEGORY_PREFERENCE[c.category]
-            if approach_hint is not None and c.category == PickupCategory.SAFE:
-                # Among SAFE candidates, prefer closer to approach hint.
+            if approach_hint is not None:
                 dist = math.hypot(c.x_cm - approach_hint[0], c.y_cm - approach_hint[1])
                 return (pref, dist)
             return (pref, -c.obstacle_distance_cm)
@@ -404,7 +403,10 @@ def _best_stop_for_ball_from(
         return RouteStop(candidate=best_safe, intermediate_node=None, ball_index=ball_idx)
 
     # Non-safe: try in preference order (IN_BETWEEN before CONSTRAINED).
-    non_safe.sort(key=lambda c: (_CATEGORY_PREFERENCE[c.category], -c.obstacle_distance_cm))
+    non_safe.sort(key=lambda c: (
+        _CATEGORY_PREFERENCE[c.category],
+        math.hypot(c.x_cm - cx, c.y_cm - cy),
+    ))
     for cand in non_safe:
         intermediate = _find_intermediate_node(cand, distance_field, safe_radius, field_height_cm)
         if intermediate is not None:

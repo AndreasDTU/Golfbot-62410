@@ -17,6 +17,7 @@ from config import FieldConfig
 from localization.models import RobotGeometry
 from path.models import HybridPose, PlannedBallTarget
 from path.pickup_geometry import compute_pickup_geometry
+from conftest import load_test_geometry
 from path.route_strategy import (
     IntersectionPriorityStrategy,
     NearestNeighborStrategy,
@@ -40,15 +41,7 @@ def make_field_config() -> FieldConfig:
 
 
 def make_geometry() -> RobotGeometry:
-    return RobotGeometry(
-        width_cm=19.5,
-        front_cm=3.8,
-        rear_cm=15.1,
-        tube_forward_cm=13.1,
-        tube_right_cm=0.0,
-        tube_width_cm=6.0,
-        mouth_radius_cm=2.0,
-    )
+    return load_test_geometry()
 
 
 CROSS_SIZE_CM = 20.0

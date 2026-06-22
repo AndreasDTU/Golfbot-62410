@@ -308,6 +308,7 @@ class PlannerConfig:
     tube_width_cm: float = 6.0
     mouth_radius_cm: float = 2.0
     unload_extension_cm: float = 30.0
+    pipe_diameter_cm: float = 4.5
 
     @property
     def route_target_reached_cm(self) -> float:

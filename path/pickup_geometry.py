@@ -29,9 +29,6 @@ from path.models import PlannedBallTarget
 
 DEFAULT_N_SAMPLES = 72
 
-# Physical pickup pipe diameter (cm).  Used for tube sweep radius calculation.
-PIPE_DIAMETER_CM = 4.5
-
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -223,7 +220,7 @@ def compute_pickup_geometry(
     R = pickup_reach_cm(geometry)
     half_width = geometry.width_cm * 0.5
     tank_turn_radius = math.hypot(geometry.rear_cm, half_width)
-    tube_sweep_radius = math.hypot(geometry.tube_forward_cm, PIPE_DIAMETER_CM * 0.5)
+    tube_sweep_radius = math.hypot(geometry.tube_forward_cm, geometry.pipe_diameter_cm * 0.5)
     # Classification thresholds: safe above the larger, constrained below the smaller.
     safe_radius = max(tank_turn_radius, tube_sweep_radius)
     constrained_radius = min(tank_turn_radius, tube_sweep_radius)

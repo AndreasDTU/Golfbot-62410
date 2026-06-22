@@ -528,6 +528,7 @@ class MainGui:
         self.params.setdefault("tube_width_cm", planner.tube_width_cm)
         self.params.setdefault("mouth_radius_cm", planner.mouth_radius_cm)
         self.params.setdefault("unload_extension_cm", planner.unload_extension_cm)
+        self.params.setdefault("pipe_diameter_cm", planner.pipe_diameter_cm)
         self.params.setdefault("heading_tuning_rad", 0.0)
         # Crop monitor HSV params (white ball detection in fixed crops)
         self.params.setdefault("crop_size", 60)

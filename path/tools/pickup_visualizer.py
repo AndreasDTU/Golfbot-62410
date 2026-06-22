@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from enum import Enum
 from pathlib import Path
 
 import cv2
@@ -59,6 +60,15 @@ from perception.vision.grid_mapping import OccupancyGridBuilder
 WINDOW_NAME = "Pickup Geometry Visualizer"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 OUTPUT_FILE = OUTPUT_DIR / "pickup_geometry.png"
+
+
+class OverlayMode(Enum):
+    """Which background overlay to render behind pickup candidates."""
+
+    HEATMAP = "heatmap"      # continuous distance field (JET colormap)
+    COLLISION = "collision"  # binary blocked grid (robot body clearance)
+    NONE = "none"            # no overlay
+
 
 # Category colors (BGR)
 CATEGORY_COLORS = {
@@ -228,25 +238,43 @@ def draw_pickup_geometry(
     result: PickupGeometryResult,
     mapper: CoordinateMapper,
     field_config: FieldConfig,
+    overlay_mode: OverlayMode = OverlayMode.HEATMAP,
+    half_width_cm: float = 0.0,
 ) -> np.ndarray:
     """Overlay pickup geometry onto an existing schematic image.
 
-    Draws distance-field heatmap, per-ball rings, and color-coded candidates
-    (green=SAFE, yellow=IN_BETWEEN, red=CONSTRAINED).
+    Draws distance-field heatmap or collision map, per-ball rings, and
+    color-coded candidates (green=SAFE, yellow=IN_BETWEEN, red=CONSTRAINED).
+
+    Parameters
+    ----------
+    overlay_mode:
+        HEATMAP  — continuous distance field (JET colormap).
+        COLLISION — binary blocked grid (red = robot body doesn't fit).
+        NONE     — no background overlay.
+    half_width_cm:
+        Robot half-width for the collision map threshold.  Only used when
+        *overlay_mode* is COLLISION.
     """
     h, w = image.shape[:2]
 
-    # --- Distance field heatmap overlay ---
     df = result.distance_field
-    if df.size > 0:
+    if df.size > 0 and overlay_mode == OverlayMode.HEATMAP:
+        # --- Distance field heatmap overlay ---
         max_d = max(result.tank_turn_radius_cm * 1.5, 1.0)
         normalized = np.clip(df / max_d, 0.0, 1.0)
-        # Resize to schematic size
         resized = cv2.resize(normalized.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
-        # Flip vertically (grid is top-left origin, schematic matches)
         heatmap_u8 = (resized * 255).astype(np.uint8)
         heatmap_bgr = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
         cv2.addWeighted(heatmap_bgr, 0.15, image, 0.85, 0, image)
+    elif df.size > 0 and overlay_mode == OverlayMode.COLLISION:
+        # --- Binary collision map overlay ---
+        blocked = (df < half_width_cm).astype(np.uint8)
+        resized = cv2.resize(blocked, (w, h), interpolation=cv2.INTER_NEAREST)
+        overlay = np.zeros_like(image)
+        overlay[resized > 0] = (0, 0, 200)   # red = blocked
+        overlay[resized == 0] = (80, 50, 0)   # dark blue-gray = free
+        cv2.addWeighted(overlay, 0.35, image, 0.65, 0, image)
 
     # --- Per-ball rings and candidates ---
     for ball_cands in result.balls:
@@ -506,6 +534,7 @@ def _compute_and_render(
     seed: int,
     strategy_option: StrategyOption,
     compile_strategy: CompileStrategy = CompileStrategy.MINIMAL,
+    overlay_mode: OverlayMode = OverlayMode.HEATMAP,
     quiet: bool = False,
 ) -> tuple[np.ndarray, RoutePlan]:
     """Generate a scenario, compute geometry + route, render, and print summary.
@@ -565,7 +594,11 @@ def _compute_and_render(
 
     # Render
     image = render_base_schematic(state)
-    draw_pickup_geometry(image, result, state.renderer.mapper, config.field)
+    draw_pickup_geometry(
+        image, result, state.renderer.mapper, config.field,
+        overlay_mode=overlay_mode,
+        half_width_cm=geometry.width_cm * 0.5,
+    )
     draw_route_plan(image, strategy_result, result, state.renderer.mapper, config.field, start,
                     route_plan=route_plan)
     draw_start_marker(image, start, state.renderer.mapper)
@@ -702,7 +735,20 @@ def main() -> int:
     config = AppConfig.from_repo_root(REPO_ROOT)
     renderer = SchematicRenderer(config.field, config.windows, config.robot)
     occupancy_builder = OccupancyGridBuilder(config.field, config.robot, renderer.mapper)
-    geometry = renderer.robot_geometry_from_params(None)
+
+    # Load geometry from the calibration file (single source of truth),
+    # falling back to config defaults if the file is absent or incomplete.
+    geo_params: dict[str, object] = {}
+    cal_path = config.paths.robot_calibration_file
+    if cal_path is not None and cal_path.exists():
+        import json as _json
+        with cal_path.open() as _f:
+            _cal = _json.load(_f)
+        from localization.localization import RobotCalibrationCollector
+        RobotCalibrationCollector.apply_geometry_to_params(
+            geo_params, _cal.get("geometry"),
+        )
+    geometry = renderer.robot_geometry_from_params(geo_params or None)
     state = SandboxState(config=config, renderer=renderer)
 
     compile_strategy = CompileStrategy(args.compile)
@@ -721,13 +767,16 @@ def main() -> int:
         if option.key == args.strategy
     )
     image: np.ndarray | None = None
+    overlay_mode = OverlayMode.HEATMAP
+    _OVERLAY_CYCLE = [OverlayMode.HEATMAP, OverlayMode.COLLISION, OverlayMode.NONE]
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, config.windows.schematic_width_px, config.windows.schematic_height_px)
 
     HELP_TEXT = (
         "Press 'r' to randomize, 's' to cycle strategy, "
-        "'c' to toggle compile strategy, Esc/q to quit."
+        "'c' to toggle compile strategy, 'v' to cycle overlay "
+        "(heatmap/collision/none), Esc/q to quit."
     )
 
     def render_current() -> None:
@@ -739,6 +788,7 @@ def main() -> int:
             seed,
             STRATEGY_OPTIONS[strategy_index],
             compile_strategy=compile_strategy,
+            overlay_mode=overlay_mode,
         )
         cv2.imshow(WINDOW_NAME, image)
 
@@ -763,6 +813,12 @@ def main() -> int:
             else:
                 compile_strategy = CompileStrategy.MINIMAL
             render_current()
+            print(f"\n{HELP_TEXT}")
+        if key == ord("v"):
+            idx = _OVERLAY_CYCLE.index(overlay_mode)
+            overlay_mode = _OVERLAY_CYCLE[(idx + 1) % len(_OVERLAY_CYCLE)]
+            render_current()
+            print(f"Overlay: {overlay_mode.value}")
             print(f"\n{HELP_TEXT}")
 
     cv2.destroyAllWindows()

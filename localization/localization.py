@@ -188,6 +188,7 @@ class RobotPoseEstimator:
             tube_width_cm=float(params.get("tube_width_cm", self.planner_config.tube_width_cm)),
             mouth_radius_cm=float(params.get("mouth_radius_cm", self.planner_config.mouth_radius_cm)),
             unload_extension_cm=float(params.get("unload_extension_cm", self.planner_config.unload_extension_cm)),
+            pipe_diameter_cm=float(params.get("pipe_diameter_cm", self.planner_config.pipe_diameter_cm)),
         )
 
     def parallax_config_from_live_params(
@@ -520,6 +521,7 @@ class RobotCalibrationCollector:
             "tube_width_cm": float(geometry.tube_width_cm),
             "mouth_radius_cm": float(geometry.mouth_radius_cm),
             "unload_extension_cm": float(geometry.unload_extension_cm),
+            "pipe_diameter_cm": float(geometry.pipe_diameter_cm),
             "heading_tuning_rad": float(heading_tuning_rad),
             "heading_tuning_deg": math.degrees(float(heading_tuning_rad)),
         }
@@ -557,6 +559,7 @@ class RobotCalibrationCollector:
             "tube_width_cm": "tube_width_cm",
             "mouth_radius_cm": "mouth_radius_cm",
             "unload_extension_cm": "unload_extension_cm",
+            "pipe_diameter_cm": "pipe_diameter_cm",
             "heading_tuning_rad": "heading_tuning_rad",
         }
         for source_key, param_key in mapping.items():

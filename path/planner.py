@@ -432,11 +432,20 @@ def compile_route(
     unload_goal_cm: tuple[float, float] | None = None
     if strategy_result.unload_position is not None:
         ux, uy = strategy_result.unload_position
-        targets.append((ux, uy, math.pi, WaypointKind.UNLOAD, None))
+        targets.append((ux, uy, 0.0, WaypointKind.UNLOAD, None))
         unload_goal_cm = (0.0, uy)
 
     # ----- Connect targets with collision-free paths -----
-    waypoints: list[RouteWaypoint] = []
+    # Start with the robot's current position so the plan explicitly
+    # contains the full path from robot to the first ball.
+    waypoints: list[RouteWaypoint] = [
+        RouteWaypoint(
+            x_cm=start_pose.x_cm,
+            y_cm=start_pose.y_cm,
+            theta_rad=start_pose.theta_rad,
+            kind=WaypointKind.NAVIGATE,
+        ),
+    ]
     cx, cy = start_pose.x_cm, start_pose.y_cm
 
     for tx, ty, theta, kind, ball_idx in targets:

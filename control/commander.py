@@ -80,9 +80,6 @@ class RobotCommander:
         self._drive_acceleration: float = (
             config.drive_max_speed_pct - config.drive_min_speed_pct
         ) / (config.drive_acceleration_cm**2)
-        self._turn_acceleration: float = (
-            config.turn_max_speed_pct - config.turn_min_speed_pct
-        ) / (config.turn_acceleration_deg**2)
 
         # TCP connection
         self.sock: socket.socket | None = None
@@ -243,23 +240,19 @@ class RobotCommander:
         print(f"DRIVING speed={speed} dist_left={distance_left} dist_driven={distance_driven}")
         return speed
 
-    def _target_speed_for_angle(self, degrees: float) -> float:
-        """
-        Profiled rotation speed for a remaining angle using quadratic acceleration.
-        Following this graph (same as distance graph): https://www.desmos.com/calculator/kwkobx9vta
+    def _target_speed_for_angle(self, total_angle: float) -> float:
+        """Flat turn speed proportional to the TOTAL commanded angle.
+
+            speed = clamp(total / turn_reference_angle_deg * turn_max_speed_pct,
+                          turn_min_speed_pct, turn_max_speed_pct)
+
+        Computed once per turn from the total angle and held flat for the whole
+        turn (no ramp). Larger turns spin faster; the coast compensation scales
+        with this speed so the robot lands on target.
         """
         cfg = self._config
-        angle_left = max(0.0, abs(float(degrees))) - cfg.final_heading_tolerance_rad
-        angle_turned = self._total_turn_angle - angle_left
-        raw_speed = min(
-            cfg.turn_min_speed_pct
-            + self._turn_acceleration * (angle_turned * angle_turned),
-            cfg.turn_min_speed_pct
-            + self._turn_acceleration * (angle_left * angle_left),
-        )
-        speed = max(min(raw_speed, cfg.turn_max_speed_pct), cfg.turn_min_speed_pct)
-        print(f"ALIGN speed={speed} angle_left={angle_left} angle_turned={angle_turned}")
-        return speed
+        raw = abs(float(total_angle)) / cfg.turn_reference_angle_deg * cfg.turn_max_speed_pct
+        return max(cfg.turn_min_speed_pct, min(cfg.turn_max_speed_pct, raw))
 
     # ------------------------------------------------------------------
     # Movement API (non-blocking, per-frame, all produce LR commands)
@@ -268,19 +261,14 @@ class RobotCommander:
     def turn(self, degrees: float) -> bool:
         """In-place rotation.  *degrees* = remaining angle (positive = CCW).
 
-        Stops early by turn_coast_deg to compensate for motor coast overshoot.
+        Speed is proportional to the total commanded angle (set once per new
+        turn). Stops early by an effective coast distance that scales linearly
+        with speed: turn_coast_deg is the coast at full speed and shrinks as the
+        turn speed drops.
         """
         if not math.isfinite(degrees):
             self.last_error = "non-finite turn angle rejected"
             return False
-        # Only apply coast prediction when the total turn is larger than the
-        # coast distance — small corrections turn normally with no early stop.
-        if (
-            self._config.turn_coast_deg > 0
-            and abs(degrees) <= self._config.turn_coast_deg
-            and self._total_turn_angle > self._config.turn_coast_deg
-        ):
-            return self.stop()
 
         # Detect start of a new turn: sign changed, or remaining angle jumped up by
         # more than the noise threshold (guards against ArUco jitter resetting the
@@ -294,11 +282,23 @@ class RobotCommander:
             self._total_turn_angle = abs_degrees
         self._last_turn_angle = degrees
 
+        # Flat speed proportional to the total turn magnitude.
+        speed = self._target_speed_for_angle(self._total_turn_angle)
 
-        speed = self._target_speed_for_angle(degrees)
+        # Coast scales linearly with speed (physics: coast ∝ momentum ∝ speed).
+        effective_coast = (speed / self._config.turn_max_speed_pct) * self._config.turn_coast_deg
+
+        # Fire the early stop only when the total turn is large enough that
+        # coasting matters — small corrections turn normally to the target.
+        if (
+            effective_coast > 0
+            and abs_degrees <= effective_coast
+            and self._total_turn_angle > effective_coast
+        ):
+            return self.stop()
+
         sign = 1.0 if degrees >= 0 else -1.0
         self._current_speed = 0.0
-
         return self._send_wheel_speeds(-sign * speed, sign * speed)
 
     def start_drive(self, cm: float, heading_error_deg: float = 0) -> bool:

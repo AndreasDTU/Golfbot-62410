@@ -58,55 +58,54 @@ def last_lr(cmd: FakeCommander) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Turn profiling (quadratic acceleration)
+# Turn profiling (flat speed proportional to total angle)
 # ---------------------------------------------------------------------------
 
+def _expected_turn_speed(cfg, total_deg):
+    raw = abs(total_deg) / cfg.turn_reference_angle_deg * cfg.turn_max_speed_pct
+    return max(cfg.turn_min_speed_pct, min(cfg.turn_max_speed_pct, raw))
+
+
 class TestTurn:
-    def test_large_angle_approaches_max_speed(self):
-        """Large angle should eventually reach turn_max_speed_pct as we progress through the turn.
-        
-        First frame of a 90-degree turn uses min speed, but as we continue the turn
-        and the remaining angle decreases to near the acceleration_deg range, speed ramps up.
-        """
+    def test_reference_angle_uses_max_speed(self):
+        """A turn at the reference angle should command turn_max_speed_pct."""
         c = make_commander()
-        # First frame: should be at min speed (just starting)
+        cfg = c._config
+        c.turn(cfg.turn_reference_angle_deg)
+        _, right = last_lr(c)
+        assert abs(right) == pytest.approx(cfg.turn_max_speed_pct, abs=0.5)
+
+    def test_speed_scales_with_total_angle(self):
+        """A larger total turn should command a higher flat speed than a smaller one."""
+        cfg = make_commander()._config
+        big = make_commander()
+        big.turn(180.0)
+        _, right_big = last_lr(big)
+        small = make_commander()
+        small.turn(45.0)
+        _, right_small = last_lr(small)
+        assert abs(right_big) > abs(right_small)
+        assert abs(right_big) == pytest.approx(_expected_turn_speed(cfg, 180.0), abs=0.5)
+        assert abs(right_small) == pytest.approx(_expected_turn_speed(cfg, 45.0), abs=0.5)
+
+    def test_speed_constant_during_turn(self):
+        """Speed is set from the total angle and stays flat as remaining shrinks."""
+        c = make_commander()
         c.turn(90.0)
-        left, right = last_lr(c)
-        assert abs(right) == pytest.approx(c._config.turn_min_speed_pct, abs=0.5)
-        
-        # Simulate progress: now 7 degrees remaining (still accelerating)
-        c.turn(7.0)
-        left, right = last_lr(c)
-        speed_mid = abs(right)
-        assert c._config.turn_min_speed_pct < speed_mid < c._config.turn_max_speed_pct
-        
-        # Near the end: should slow down (symmetric acceleration curve)
-        c.turn(5.0)
-        left, right = last_lr(c)
-        speed_near_end = abs(right)
-        assert speed_near_end < speed_mid  # Should be slower as we approach the target
+        _, right_start = last_lr(c)
+        c.turn(45.0)  # same turn continuing (total stays 90)
+        _, right_mid = last_lr(c)
+        c.turn(20.0)
+        _, right_end = last_lr(c)
+        assert abs(right_start) == pytest.approx(abs(right_mid), abs=0.5)
+        assert abs(right_mid) == pytest.approx(abs(right_end), abs=0.5)
 
     def test_small_angle_uses_min_speed(self):
-        """Very small angle (near 0) should use turn_min_speed_pct."""
+        """Very small angle (near 0) should clamp to turn_min_speed_pct."""
         c = make_commander()
         c.turn(1.0)
         left, right = last_lr(c)
         assert abs(right) == pytest.approx(c._config.turn_min_speed_pct, abs=0.5)
-
-    def test_mid_angle_ramps(self):
-        """A mid-range total turn should produce intermediate speed as it progresses."""
-        c = make_commander()
-        cfg = c._config
-        # Start a 30-degree turn (in the acceleration range)
-        c.turn(30.0)
-        _, right = last_lr(c)
-        speed_start = abs(right)
-        # Continue: 15 degrees remaining (further along the curve)
-        c.turn(15.0)
-        _, right = last_lr(c)
-        speed_mid = abs(right)
-        # Speed should increase as we progress
-        assert speed_mid > speed_start
 
     def test_negative_angle_reverses_wheels(self):
         """Negative angle (clockwise) should reverse wheel signs."""

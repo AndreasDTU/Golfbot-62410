@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-"""Turn coast calibration tool — camera-assisted guidance loop.
+"""Turn coast calibration tool — multi-angle sweep, camera-assisted.
 
-Runs a real guidance-like loop for each trial:
+Validates the proportional-coast model: coast distance scales linearly with
+turn speed, and turn speed scales with the total commanded angle. For each
+angle the robot runs a real guidance loop with turn_coast_deg forced to 0, so
+it coasts freely past the target; the overshoot is the raw coast at that
+angle's speed.
 
-  1. Reads the heading before the turn (averaged over several frames).
-  2. Computes target_heading = heading_before + angle_deg.
-  3. Streams camera frames, computes remaining angle each frame, and calls
-     commander.turn(remaining) — exactly as the guidance layer does.
-     turn_coast_deg is forced to 0 so the stop fires at the true target.
-  4. When the robot crosses the target heading, sends stop().
-  5. Waits for the robot to settle, then reads the final heading.
-  6. Overshoot = final - target.
+Per trial:
+  1. Read the heading before (averaged over several frames).
+  2. Stream camera frames, compute remaining angle, call commander.turn(remaining)
+     each frame — exactly as the guidance layer does.
+  3. When the robot crosses the target heading, send stop().
+  4. Settle, read the final heading. Overshoot = final - target = raw coast.
 
-This gives the coast distance under real speed-profile conditions (the robot
-decelerates toward turn_min_speed_pct before the stop fires), not at max speed.
+Across angles, the tool back-calculates what turn_coast_deg (the coast at full
+speed) would have to be for each, and only writes config.py if those agree
+(low std dev) — i.e. the linear coast∝speed model holds.
 
 Requirements:
   - Field corners must be calibrated (data/field_corners.json exists).
   - Robot calibration must exist (data/robot_calibration.json exists).
-  - Camera must be connected and the ArUco markers must be visible.
+  - Camera connected; ArUco markers visible through the whole turn.
 
 Usage:
     python -m localization.tools.turn_coast_calibration
-    python -m localization.tools.turn_coast_calibration --angle 90 --trials 10
+    python -m localization.tools.turn_coast_calibration --angles 180,90,45,30 --trials 3
     python -m localization.tools.turn_coast_calibration --dummy
 """
 
@@ -35,6 +38,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -43,10 +47,21 @@ if str(REPO_ROOT) not in sys.path:
 from config import AppConfig, ConnectionConfig, DriveConfig
 from control.commander import RobotCommander
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator, normalize_angle
+from perception.vision.detection import BallDetector
 from perception.vision.pipeline import VisionPipeline
 
-DEFAULT_ANGLE_DEG = 90.0
-DEFAULT_TRIALS = 10
+
+class _NullBallDetector(BallDetector):
+    """Stub detector — this tool only needs the warp + pose, not ball detection."""
+
+    def detect(self, frame_bgr, params, camera_center_pixels):
+        return [], [], {
+            "white": np.zeros(frame_bgr.shape[:2], dtype=np.uint8),
+            "orange": np.zeros(frame_bgr.shape[:2], dtype=np.uint8),
+        }
+
+DEFAULT_SWEEP_ANGLES = [360.0, 180.0, 90.0, 45.0, 30.0, 15.0, 10.0, 5.0]
+DEFAULT_TRIALS = 3   # trials per angle
 SETTLE_S = 1.0        # seconds to wait after stop before sampling final heading
 SAMPLE_FRAMES = 15    # frames to average for stable heading readings
 SAMPLE_INTERVAL_S = 0.05
@@ -189,12 +204,12 @@ def _run_trial(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Setup + speed law
 # ---------------------------------------------------------------------------
 
-def run(angle_deg: float, trials: int, commander: RobotCommander) -> None:
-    config = AppConfig.from_repo_root(REPO_ROOT)
-    pipeline = VisionPipeline(app_config=config)
+def _setup(config: AppConfig):
+    """Load pipeline, pose estimator, calibration, params, and open the camera."""
+    pipeline = VisionPipeline(app_config=config, ball_detector=_NullBallDetector())
     pose_estimator = RobotPoseEstimator(
         field_config=config.field,
         robot_config=config.robot,
@@ -225,49 +240,99 @@ def run(angle_deg: float, trials: int, commander: RobotCommander) -> None:
         print(f"ERROR: Could not open camera index {config.camera.camera_index}.")
         sys.exit(1)
 
-    overshoots: list[float] = []
+    return pipeline, pose_estimator, params, calibration, camera
 
-    current_coast = DriveConfig().turn_coast_deg
-    print(f"\nTurn coast calibration — {angle_deg:+.1f}° × {trials} trials")
-    print(f"Current turn_coast_deg: {current_coast:.1f}°  (active during this run)")
-    print("Residual overshoot will be added to refine the value.")
-    print("Make sure the ArUco markers are fully visible from the camera.\n")
 
+def _turn_speed_pct(cfg: DriveConfig, angle_deg: float) -> float:
+    """Mirror RobotCommander._target_speed_for_angle for the given total angle."""
+    raw = abs(angle_deg) / cfg.turn_reference_angle_deg * cfg.turn_max_speed_pct
+    return max(cfg.turn_min_speed_pct, min(cfg.turn_max_speed_pct, raw))
+
+
+# ---------------------------------------------------------------------------
+# Multi-angle sweep — validates the proportional-coast model
+# ---------------------------------------------------------------------------
+
+def run_sweep(angles: list[float], trials_per_angle: int, commander: RobotCommander) -> None:
+    """Sweep angles, measure raw coast at each, back-calculate the full-speed coast.
+
+    The robot runs with turn_coast_deg=0 so it coasts freely past the target;
+    the overshoot IS the raw coast at that angle's speed.  For each angle we
+    back-calculate what turn_coast_deg (the coast at full speed) would have to
+    be: coast_full = measured / (speed / max_speed).  If those agree across
+    angles (low std dev), the linear coast∝speed model holds and we write the
+    mean to config.py.
+    """
+    config = AppConfig.from_repo_root(REPO_ROOT)
+    pipeline, pose_estimator, params, calibration, camera = _setup(config)
+    cfg = commander._config
+
+    print(f"\nTurn coast sweep — {len(angles)} angles × {trials_per_angle} trials each")
+    print("turn_coast_deg forced to 0 (raw coast measurement).")
+    print(f"turn_reference_angle_deg: {cfg.turn_reference_angle_deg:.0f}°  "
+          f"turn_max_speed_pct: {cfg.turn_max_speed_pct:.0f}%  "
+          f"turn_min_speed_pct: {cfg.turn_min_speed_pct:.0f}%")
+    print("Make sure the ArUco markers stay visible through the whole turn.\n")
+
+    results: dict[float, list[float]] = {}
     try:
-        for i in range(1, trials + 1):
-            input(f"Trial {i}/{trials} — press Enter to start...")
-            overshoot = _run_trial(
-                angle_deg, commander, camera, pipeline, pose_estimator, params, calibration,
-            )
-            if overshoot is None:
-                print("  Trial skipped.\n")
-                continue
-            overshoots.append(overshoot)
-            print(f"  Overshoot: {overshoot:+.1f}°\n")
+        for angle in angles:
+            speed_pct = _turn_speed_pct(cfg, angle)
+            print(f"\n--- {angle:+.0f}°  (speed ≈ {speed_pct:.1f}%) ---")
+            measured: list[float] = []
+            for i in range(1, trials_per_angle + 1):
+                input(f"  Trial {i}/{trials_per_angle} — press Enter to start...")
+                overshoot = _run_trial(
+                    angle, commander, camera, pipeline, pose_estimator, params, calibration,
+                )
+                if overshoot is None:
+                    print("  Trial skipped.")
+                    continue
+                measured.append(overshoot)
+                print(f"  Overshoot: {overshoot:+.1f}°")
+            results[angle] = measured
     finally:
         commander.stop()
         commander.close()
         camera.release()
 
-    if not overshoots:
-        print("No valid trials recorded.")
+    # Validation table
+    print("\n" + "=" * 70)
+    print(f"{'Angle':>8}  {'Speed%':>7}  {'Measured coast':>15}  {'Coast@full speed':>17}")
+    print("-" * 70)
+    coast_at_full: list[float] = []
+    for angle in angles:
+        data = results.get(angle, [])
+        if not data:
+            print(f"{angle:>7.0f}°  {'—':>7}  {'no data':>15}  {'—':>17}")
+            continue
+        speed_pct = _turn_speed_pct(cfg, angle)
+        speed_ratio = speed_pct / cfg.turn_max_speed_pct
+        measured_coast = sum(data) / len(data)
+        coast_full = measured_coast / speed_ratio if speed_ratio > 0 else float("nan")
+        if math.isfinite(coast_full):
+            coast_at_full.append(coast_full)
+        print(f"{angle:>7.0f}°  {speed_pct:>6.1f}%  {measured_coast:>14.1f}°  {coast_full:>16.1f}°")
+    print("=" * 70)
+
+    if not coast_at_full:
+        print("No valid data collected.")
         return
 
-    current_coast = DriveConfig().turn_coast_deg
-    avg_residual = sum(overshoots) / len(overshoots)
-    new_coast = current_coast + avg_residual
+    mean_coast = sum(coast_at_full) / len(coast_at_full)
+    variance = sum((v - mean_coast) ** 2 for v in coast_at_full) / len(coast_at_full)
+    std_dev = math.sqrt(variance)
+    print(f"\nMean coast@full speed : {mean_coast:.2f}°")
+    print(f"Std dev               : {std_dev:.2f}°")
 
-    print("=" * 48)
-    print(f"Trials recorded  : {len(overshoots)}")
-    print(f"Individual       : {', '.join(f'{v:+.1f}' for v in overshoots)}")
-    print(f"Residual overshoot: {avg_residual:+.2f}°")
-    print(f"Current turn_coast_deg: {current_coast:.1f}°")
-    print(f"New    turn_coast_deg: {new_coast:.1f}°")
-    print()
-
-    _update_config(new_coast)
-
-    print("=" * 48)
+    CONSISTENCY_THRESHOLD_DEG = 5.0
+    if std_dev < CONSISTENCY_THRESHOLD_DEG:
+        print(f"Model CONSISTENT (std dev {std_dev:.2f}° < {CONSISTENCY_THRESHOLD_DEG:.1f}°) — "
+              f"coast scales linearly with speed.")
+        _update_config(mean_coast)
+    else:
+        print(f"Model INCONSISTENT (std dev {std_dev:.2f}° >= {CONSISTENCY_THRESHOLD_DEG:.1f}°). "
+              f"config.py NOT updated — the coast may not be linear in speed; review the table.")
 
 
 def _update_config(coast_deg: float) -> None:
@@ -290,30 +355,42 @@ def _update_config(coast_deg: float) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Measure turn coast under real guidance-loop conditions."
+        description="Sweep turn angles and validate the proportional-coast model."
     )
-    parser.add_argument("--angle", type=float, default=DEFAULT_ANGLE_DEG,
-                        help=f"Turn angle in degrees, positive=CCW (default: {DEFAULT_ANGLE_DEG})")
+    parser.add_argument("--angles", type=str, default=",".join(str(int(a)) for a in DEFAULT_SWEEP_ANGLES),
+                        help=f"Comma-separated turn angles, positive=CCW "
+                             f"(default: {','.join(str(int(a)) for a in DEFAULT_SWEEP_ANGLES)})")
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS,
-                        help=f"Number of trials (default: {DEFAULT_TRIALS})")
+                        help=f"Trials per angle (default: {DEFAULT_TRIALS})")
     parser.add_argument("--dummy", action="store_true",
                         help="Simulate robot commands (no real connection)")
     args = parser.parse_args()
+
+    try:
+        angles = [float(a) for a in args.angles.split(",") if a.strip()]
+    except ValueError:
+        print(f"Invalid --angles: {args.angles!r}")
+        sys.exit(1)
+    if not angles:
+        print("No angles given.")
+        sys.exit(1)
 
     if args.dummy:
         commander: RobotCommander = _DummyCommander()
     else:
         try:
+            # Force turn_coast_deg=0 so the robot coasts freely past the target —
+            # the measured overshoot is the raw coast at each angle's speed.
             commander = RobotCommander(
                 connection_config=ConnectionConfig(),
-                drive_config=DriveConfig(),
+                drive_config=DriveConfig(turn_coast_deg=0.0),
                 auto_connect=True,
             )
         except RuntimeError as exc:
             print(f"Connection failed: {exc}")
             sys.exit(1)
 
-    run(args.angle, args.trials, commander)
+    run_sweep(angles, args.trials, commander)
 
 
 if __name__ == "__main__":

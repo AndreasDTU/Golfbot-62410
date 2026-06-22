@@ -276,11 +276,13 @@ class RobotCommander:
         if abs(degrees) <= self._config.turn_coast_deg:
             return self.stop()
 
-        # Detect start of a new turn: magnitude increased or sign changed
+        # Detect start of a new turn: sign changed, or remaining angle jumped up by
+        # more than the noise threshold (guards against ArUco jitter resetting the
+        # profile on every noisy frame and pinning the robot at minimum speed).
         abs_degrees = abs(degrees)
         if (
             self._last_turn_angle == 0
-            or abs_degrees > abs(self._last_turn_angle)
+            or abs_degrees > abs(self._last_turn_angle) + self._config.turn_reset_noise_deg
             or ((degrees >= 0) != (self._last_turn_angle >= 0))
         ):
             self._total_turn_angle = abs_degrees

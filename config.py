@@ -352,6 +352,7 @@ class DriveConfig:
     near_zone_move_speed_pct: float = 7.0
     # Predictive stop: stop this many degrees before the target to compensate for motor coast
     turn_coast_deg: float = 0.0
+    turn_reset_noise_deg: float = 5.0
     # Heading correction
     max_heading_for_forward_rad: float = math.radians(15.0)
     adjust_gain: float = 7.0

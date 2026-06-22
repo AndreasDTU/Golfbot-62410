@@ -3,16 +3,14 @@
   "camera_center_x": 401.8922119140625,
   "camera_center_y": 298.2674865722656,
   "camera_height_cm": 184.0,
-  "created_unix": 1782119422.5136085,
+  "created_unix": 1781691257.8928242,
   "geometry": {
     "front_cm": 3.8000000000000007,
-    "heading_tuning_deg": -54.00000000000006,
-    "heading_tuning_rad": -0.9424777960769389,
-    "mouth_radius_cm": 2.0,
-    "rear_cm": 16.0,
+    "heading_tuning_deg": 80.00000000000009,
+    "heading_tuning_rad": 1.3962634015954651,
+    "rear_cm": 15.1,
     "tube_forward_cm": 13.100000000000001,
     "tube_right_cm": 0.0,
-    "tube_width_cm": 6.0,
     "unload_extension_cm": 25.0,
     "width_cm": 19.5
   },
@@ -23,13 +21,13 @@
   ],
   "markers": {
     "4": {
-      "alpha_deg": -9.582938343196862,
-      "alpha_rad": -0.16725382610439557,
-      "dx": 44.59257507324219,
-      "dy": 32.446563720703125,
-      "ellipse_ratio": 1.1081586393026315,
-      "origin_x": 209.34828186035156,
-      "origin_y": 306.3403625488281
+      "alpha_deg": 81.02736980028246,
+      "alpha_rad": 1.414194387245949,
+      "dx": 29.166748046875,
+      "dy": -47.186767578125,
+      "ellipse_ratio": 1.0453386011665828,
+      "origin_x": 147.40829467773438,
+      "origin_y": 241.376220703125
     },
     "5": {
       "alpha_deg": 80.03616886732794,

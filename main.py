@@ -66,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         static_image = img
     elif not args.no_camera:
         cam_index = args.camera if args.camera is not None else config.camera.camera_index
+        print("Camera " + str(cam_index))
         if platform.system() == "Windows":
             camera = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
         else:

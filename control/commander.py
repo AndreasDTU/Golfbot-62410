@@ -230,7 +230,7 @@ class RobotCommander:
         """
 
         cfg = self._config
-        distance_left = max(0.0, abs(float(distance_cm)))
+        distance_left = max(0.0, abs(float(distance_cm))) - cfg.waypoint_arrival_cm
         distance_driven = self._total_distance - distance_left
         raw_speed = min(
             cfg.drive_min_speed_pct
@@ -239,7 +239,9 @@ class RobotCommander:
             + self._drive_acceleration * (distance_left * distance_left),
         )
 
-        return max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
+        speed = max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
+        print(f"DRIVING speed={speed} dist_left={distance_left} dist_driven={distance_driven}")
+        return speed
 
     def _target_speed_for_angle(self, degrees: float) -> float:
         """
@@ -247,7 +249,7 @@ class RobotCommander:
         Following this graph (same as distance graph): https://www.desmos.com/calculator/kwkobx9vta
         """
         cfg = self._config
-        angle_left = max(0.0, abs(float(degrees)))
+        angle_left = max(0.0, abs(float(degrees))) - cfg.final_heading_tolerance_rad
         angle_turned = self._total_turn_angle - angle_left
         raw_speed = min(
             cfg.turn_min_speed_pct
@@ -255,7 +257,9 @@ class RobotCommander:
             cfg.turn_min_speed_pct
             + self._turn_acceleration * (angle_left * angle_left),
         )
-        return max(min(raw_speed, cfg.turn_max_speed_pct), cfg.turn_min_speed_pct)
+        speed = max(min(raw_speed, cfg.turn_max_speed_pct), cfg.turn_min_speed_pct)
+        print(f"ALIGN speed={speed} angle_left={angle_left} angle_turned={angle_turned}")
+        return speed
 
     # ------------------------------------------------------------------
     # Movement API (non-blocking, per-frame, all produce LR commands)
@@ -280,6 +284,7 @@ class RobotCommander:
         speed = self._target_speed_for_angle(degrees)
         sign = 1.0 if degrees >= 0 else -1.0
         self._current_speed = 0.0
+
         return self._send_wheel_speeds(-sign * speed, sign * speed)
 
     def start_drive(self, cm: float, heading_error_deg: float = 0) -> bool:

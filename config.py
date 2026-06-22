@@ -305,7 +305,7 @@ class PlannerConfig:
 class ConnectionConfig:
     """Robot TCP connection and command dispatch."""
 
-    robot_ip: str = "172.20.10.8"
+    robot_ip: str = "ev3dev"
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     min_send_interval_s: float = 0.02
@@ -318,11 +318,11 @@ class DriveConfig:
 
     # Drive speed profiling
     drive_min_speed_pct: float = 10.0  # Minimum travel speed
-    drive_max_speed_pct: float = 95.0  # Maximum travel speed
-    drive_acceleration_cm: float = 7.0  # Distance to go from min to max speed
+    drive_max_speed_pct: float = 90.0  # Maximum travel speed
+    drive_acceleration_cm: float = 15.0  # Distance to go from min to max speed
     # Turn speed profiling
-    turn_min_speed_pct: float = 8.0
-    turn_max_speed_pct: float = 25.0
+    turn_min_speed_pct: float = 7.0
+    turn_max_speed_pct: float = 30.0
     turn_acceleration_deg: float = 15.0
     # PID gains
     heading_kp: float = 38.0
@@ -339,7 +339,7 @@ class DriveConfig:
     near_zone_move_speed_pct: float = 7.0
     # Heading correction
     max_heading_for_forward_rad: float = math.radians(15.0)
-    adjust_gain: float = 10
+    adjust_gain: float = 7.0
     # Waypoint arrival tolerance
     waypoint_arrival_cm: float = 4.0
     ball_arrival_cm: float = 1.0

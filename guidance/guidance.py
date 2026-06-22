@@ -155,7 +155,10 @@ class GuidanceController:
 
         # 6. Target behind and close — reverse instead of turning.
         if abs(heading_error) > math.radians(150) and distance < 25.0:
-            ok = self._commander.drive_adjusted(-distance, 0.0)
+            reverse_error = normalize_angle(heading_error - math.pi)
+            ok = self._commander.drive_adjusted(
+                -distance, -math.degrees(reverse_error),
+            )
             self._log(
                 "REVERSING", dist=distance,
                 heading_err=math.degrees(heading_error), ok=ok,

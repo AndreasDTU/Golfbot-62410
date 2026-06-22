@@ -289,7 +289,8 @@ def run_sweep(angles: list[float], trials_per_angle: int, commander: RobotComman
             print(f"\n--- {angle:+.0f}°  (speed ≈ {speed_pct:.1f}%) ---")
             measured: list[float] = []
             for i in range(1, trials_per_angle + 1):
-                input(f"  Trial {i}/{trials_per_angle} — press Enter to start...")
+                print(f"  Trial {i}/{trials_per_angle}...")
+                #input(f"  Trial {i}/{trials_per_angle} — press Enter to start...")
                 overshoot = _run_trial(
                     angle, commander, camera, pipeline, pose_estimator, params, calibration,
                 )

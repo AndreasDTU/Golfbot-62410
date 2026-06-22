@@ -79,7 +79,7 @@ class PathConfig:
 class CameraConfig:
     """Camera source and top-down calibration defaults."""
 
-    camera_index: int = 0
+    camera_index: int = 1
     topdown_warp_size: tuple[int, int] = (800, 600)
     required_aruco_ids: tuple[int, ...] = (0, 1, 2, 3)
     wall_thickness_cm: float = 1.6
@@ -318,7 +318,7 @@ class PlannerConfig:
 class ConnectionConfig:
     """Robot TCP connection and command dispatch."""
 
-    robot_ip: str = "172.20.10.8"
+    robot_ip: str = "ev3dev"
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     min_send_interval_s: float = 0.02
@@ -332,7 +332,8 @@ class DriveConfig:
     # Drive speed profiling
     drive_min_speed_pct: float = 10.0  # Minimum travel speed
     drive_max_speed_pct: float = 90.0  # Maximum travel speed
-    drive_acceleration_cm: float = 15.0  # Distance to go from min to max speed
+    drive_acceleration_cm: float = 5.0  # Distance to go from min to max speed
+    drive_deacceleration_cm: float = 25.0  # Distance to go from min to max speed
     # Turn speed profiling — flat speed proportional to total turn angle.
     # speed = clamp(total_angle / turn_reference_angle_deg * turn_max_speed_pct, min, max)
     turn_min_speed_pct: float = 7.0
@@ -353,11 +354,11 @@ class DriveConfig:
     near_zone_move_speed_pct: float = 7.0
     # Predictive stop: coast distance AT FULL SPEED (turn_max_speed_pct).
     # The effective coast scales linearly with the actual turn speed.
-    turn_coast_deg: float = 0.0
+    turn_coast_deg: float = 98.2
     turn_reset_noise_deg: float = 5.0
     # Heading correction
     max_heading_for_forward_rad: float = math.radians(15.0)
-    adjust_gain: float = 7.0
+    adjust_gain: float = 8.0
     # Waypoint arrival tolerance
     waypoint_arrival_cm: float = 4.0
     ball_arrival_cm: float = 1.0

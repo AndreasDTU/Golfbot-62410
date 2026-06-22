@@ -77,9 +77,13 @@ class RobotCommander:
         self._total_turn_angle: float = 0.0
         self._last_turn_angle: float = 0.0
         self.max_speed_pct: float = 100.0
+
         self._drive_acceleration: float = (
             config.drive_max_speed_pct - config.drive_min_speed_pct
         ) / (config.drive_acceleration_cm**2)
+        self._drive_deacceleration: float = (
+            config.drive_max_speed_pct - config.drive_min_speed_pct
+        ) / (config.drive_deacceleration_cm**2)
 
         # TCP connection
         self.sock: socket.socket | None = None
@@ -233,7 +237,7 @@ class RobotCommander:
             cfg.drive_min_speed_pct
             + self._drive_acceleration * (distance_driven * distance_driven),
             cfg.drive_min_speed_pct
-            + self._drive_acceleration * (distance_left * distance_left),
+            + self._drive_deacceleration * (distance_left * distance_left),
         )
 
         speed = max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
@@ -295,6 +299,7 @@ class RobotCommander:
             and abs_degrees <= effective_coast
             and self._total_turn_angle > effective_coast
         ):
+            self._total_turn_angle = 0
             return self.stop()
 
         sign = 1.0 if degrees >= 0 else -1.0

@@ -1,0 +1,15 @@
+We have tried a bunch of different things for the routes now, but i think i have gotten a better idea. The idea is: We draw the circle around the balls and place discrete
+  pickup points, these are the points where from the robot can pick up the balls, with nothing taken in consideration.
+
+  Then based on proximity to the nearest obstacle, we rank all the pickups points and categorize them. Points with more than tank turn radius distance to the nearest point, get
+  marked as safe. These can be approached from all directions with no problem.
+
+  Pickup points with a distance to obstacles equal to the robots tube_forward_cm distance, must be approached from exactly that heading, and thus need an intermediate node, so
+  we can tank turn into the right heading from a safe distance. and after pickup the ball we must back up to that intermediate node.
+
+  All the points inbetween these two distances, we need to figure out how to solve. We could either allow for certain approach angles to these points, or also give them
+  intermediate nodes. Lets overfocus on this for now, since it is the most complex part of the system. We can always add more categories later if we need to.
+
+  The big win of this approach is that we never should do a tank turn, and possibly turn into an obstacle.
+
+  Lets keep this to discussion. We are not going to make any code changes now, since the entire pathing system has blown up. If we land on this a good solution, we are going to heavily delete and refactor the layer.

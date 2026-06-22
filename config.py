@@ -5,8 +5,18 @@ Typed configuration for everything.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from enum import Enum
 from pathlib import Path
+
+
+class RouteStrategyName(str, Enum):
+    SET_COVER_NEAREST = "set_cover_nearest"
+    INTERSECTION_PRIORITY = "intersection_priority"
+    INTERSECTION_NEAREST = "intersection_nearest"
+    INTERSECTION_OPTIMAL = "intersection_optimal"
+    LEGACY_HYBRID_ASTAR = "legacy_hybrid_astar"
 
 
 @dataclass(frozen=True)
@@ -40,11 +50,29 @@ class PathConfig:
 
     def __post_init__(self) -> None:
         root = self.repo_root
-        object.__setattr__(self, "calibration_file", self.calibration_file or root / "data" / "calibration_data.npz")
-        object.__setattr__(self, "robot_calibration_file", self.robot_calibration_file or root / "data" / "robot_calibration.json")
-        object.__setattr__(self, "field_corners_file", self.field_corners_file or root / "data" / "field_corners.json")
-        object.__setattr__(self, "red_cross_file", self.red_cross_file or root / "data" / "red_cross.json")
-        object.__setattr__(self, "yolo_model_path", self.yolo_model_path or Path("best.pt"))
+        object.__setattr__(
+            self,
+            "calibration_file",
+            self.calibration_file or root / "data" / "calibration_data.npz",
+        )
+        object.__setattr__(
+            self,
+            "robot_calibration_file",
+            self.robot_calibration_file or root / "data" / "robot_calibration.json",
+        )
+        object.__setattr__(
+            self,
+            "field_corners_file",
+            self.field_corners_file or root / "data" / "field_corners.json",
+        )
+        object.__setattr__(
+            self,
+            "red_cross_file",
+            self.red_cross_file or root / "data" / "red_cross.json",
+        )
+        object.__setattr__(
+            self, "yolo_model_path", self.yolo_model_path or Path("best.pt")
+        )
 
 
 @dataclass(frozen=True)
@@ -95,19 +123,30 @@ class WindowConfig:
 
 @dataclass(frozen=True)
 class RobotGeometryConfig:
-    """Physical and tuned robot geometry in centimeters."""
+    """Fallback robot geometry in centimeters.
+
+    These are UI-trackbar defaults only.  The actual robot dimensions are
+    loaded from data/robot_calibration.json at startup and mapped into the
+    RobotGeometry dataclass (see localization/models.py for the canonical
+    field documentation and ASCII diagram).
+
+    Mapping from calibration file → RobotGeometry:
+        geometry.width_cm          → RobotGeometry.width_cm
+        geometry.front_cm          → RobotGeometry.front_cm
+        geometry.rear_cm           → RobotGeometry.rear_cm
+        geometry.tube_forward_cm   → RobotGeometry.tube_forward_cm
+        geometry.tube_right_cm     → RobotGeometry.tube_right_cm
+    """
 
     radius_cm: int = 15
     marker_ids: tuple[int, ...] = (4, 5)
     marker_height_cm: float = 9.0
     forward_heading_offset_rad: float = math.pi
-    tuned_footprint_width_cm: float = 20.0
-    tuned_footprint_front_from_origin_cm: float = 8.3
-    tuned_footprint_rear_from_origin_cm: float = 10.1
-    tuned_tube_offset_cm: float = 17.1
-    tuned_tube_right_offset_cm: float = 0.0
-    tube_width_cm: float = 6.0
-    tuned_unload_extension_cm: float = 30.0
+    tuned_footprint_width_cm: float = 20.0  # fallback for width_cm
+    tuned_footprint_front_from_origin_cm: float = 8.3  # fallback for front_cm
+    tuned_footprint_rear_from_origin_cm: float = 10.1  # fallback for rear_cm
+    tuned_tube_offset_cm: float = 17.1  # fallback for tube_forward_cm
+    tuned_tube_right_offset_cm: float = 0.0  # fallback for tube_right_cm
 
 
 @dataclass(frozen=True)
@@ -130,7 +169,13 @@ class DetectionConfig:
     calib_z_cm: int = 7
     heading_tuning: int = 180
 
-    def trackbar_defaults(self, field: FieldConfig, robot: RobotGeometryConfig) -> dict[str, int]:
+    def trackbar_defaults(
+        self,
+        field: FieldConfig,
+        robot: RobotGeometryConfig,
+        planner: PlannerConfig | None = None,
+    ) -> dict[str, int]:
+        planner = planner or PlannerConfig()
         return {
             "red1_h_min": self.red1_h_min,
             "red1_h_max": self.red1_h_max,
@@ -150,11 +195,17 @@ class DetectionConfig:
             "cam_center_y": int(round(field.height_cm * 0.5)),
             "heading_tuning": self.heading_tuning,
             "robot_width_cmx10": int(round(robot.tuned_footprint_width_cm * 10.0)),
-            "robot_front_cmx10": int(round(robot.tuned_footprint_front_from_origin_cm * 10.0)),
-            "robot_rear_cmx10": int(round(robot.tuned_footprint_rear_from_origin_cm * 10.0)),
+            "robot_front_cmx10": int(
+                round(robot.tuned_footprint_front_from_origin_cm * 10.0)
+            ),
+            "robot_rear_cmx10": int(
+                round(robot.tuned_footprint_rear_from_origin_cm * 10.0)
+            ),
             "tube_forward_cmx10": int(round(robot.tuned_tube_offset_cm * 10.0)),
-            "tube_right_cmx10": int(round((robot.tuned_tube_right_offset_cm + 50.0) * 10.0)),
-            "unload_extension_cmx10": int(round(robot.tuned_unload_extension_cm * 10.0)),
+            "tube_right_cmx10": int(
+                round((robot.tuned_tube_right_offset_cm + 50.0) * 10.0)
+            ),
+            "unload_extension_cmx10": int(round(planner.unload_extension_cm * 10.0)),
         }
 
 
@@ -222,6 +273,7 @@ class TrackbarConfig:
 class PlannerConfig:
     """Route-planning tuning."""
 
+    route_strategy: RouteStrategyName = RouteStrategyName.INTERSECTION_PRIORITY
     theta_bins: int = 36
     step_cm: float = 4.0
     goal_tolerance_cm: float = 4.0
@@ -252,6 +304,10 @@ class PlannerConfig:
     ball_warning_cost: float = 50.0
     ball_close_clearance_cm: float = 5.0
     ball_warning_clearance_cm: float = 10.0
+    # Pickup tube geometry (moved from RobotGeometryConfig)
+    tube_width_cm: float = 6.0
+    mouth_radius_cm: float = 2.0
+    unload_extension_cm: float = 30.0
 
     @property
     def route_target_reached_cm(self) -> float:
@@ -262,7 +318,7 @@ class PlannerConfig:
 class ConnectionConfig:
     """Robot TCP connection and command dispatch."""
 
-    robot_ip: str = "172.20.10.8"
+    robot_ip: str = "ev3dev"
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     min_send_interval_s: float = 0.02
@@ -273,37 +329,36 @@ class ConnectionConfig:
 class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
-    drive_speed_pct: float = 100.0
-    max_speed_pct: float = 100.0
-    max_heading_for_forward_rad: float = math.radians(15.0)
-    turn_speed_pct: float = 25.0
-    creep_speed_pct: float = 25.0
+    # Drive speed profiling
+    drive_min_speed_pct: float = 10.0  # Minimum travel speed
+    drive_max_speed_pct: float = 90.0  # Maximum travel speed
+    drive_acceleration_cm: float = 15.0  # Distance to go from min to max speed
+    # Turn speed profiling
+    turn_min_speed_pct: float = 7.0
+    turn_max_speed_pct: float = 30.0
+    turn_acceleration_deg: float = 15.0
     # PID gains
     heading_kp: float = 38.0
     heading_kd: float = 6.0
     xte_kp: float = 2.2
     xte_kd: float = 0.25
     # Distance-based speed profiling
-    cruise_distance_cm: float = 30.0
-    creep_distance_cm: float = 10.0
     max_cross_track_error_cm: float = 8.0
-    # Turn speed profiling
-    turn_creep_speed_pct: float = 8.0
-    turn_cruise_angle_deg: float = 30.0
-    turn_creep_angle_deg: float = 8.0
-    # Kinematic limits
-    acceleration_limit_pct_per_s: float = 45.0
-    deceleration_limit_pct_per_s: float = 90.0
     # Edge/wall proximity
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
     edge_max_gain_scale: float = 1.6
-    near_zone_cm: float = 15.0
+    near_zone_cm: float = 10.0
     near_zone_move_speed_pct: float = 7.0
     # Predictive stop: stop this many degrees before the target to compensate for motor coast
     turn_coast_deg: float = 0.0
     # Heading correction
-    adjust_gain: float = 0.5
+    max_heading_for_forward_rad: float = math.radians(15.0)
+    adjust_gain: float = 7.0
+    # Waypoint arrival tolerance
+    waypoint_arrival_cm: float = 4.0
+    ball_arrival_cm: float = 1.0
+    final_heading_tolerance_rad: float = math.radians(2.0)
     # Route tracking
     route_tracking_lookahead_segments: int = 12
 

@@ -7,10 +7,106 @@ from typing import Callable
 
 import numpy as np
 
-from path.pathfinding.models import HybridPose, RouteSegmentType, RouteTrackingError
-from path.pathfinding.planner import RoutePlanningFacade
+from path.models import HybridPose, RouteSegmentType, RouteTrackingError
 from localization.models import DriveControlState, DriveRuntime, RobotGeometry, RobotPose, WheelCommand
 from config import DriveConfig, FieldConfig
+
+
+def _normalize_angle(theta_rad: float) -> float:
+    """Normalize to [-pi, pi)."""
+    return (theta_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def compute_route_tracking_error(
+    robot_pose: RobotPose,
+    route: list[HybridPose],
+    start_segment_index: int = 0,
+    end_segment_index: int | None = None,
+) -> RouteTrackingError | None:
+    """Project live robot pose onto the closest cached route segment."""
+    if len(route) < 2:
+        return None
+
+    rx = float(robot_pose.x_cm)
+    ry = float(robot_pose.y_cm)
+    best: RouteTrackingError | None = None
+    best_distance = float("inf")
+
+    first_segment = max(0, min(int(start_segment_index), len(route) - 2))
+    last_segment = len(route) - 2 if end_segment_index is None else int(end_segment_index)
+    last_segment = max(first_segment, min(last_segment, len(route) - 2))
+
+    for index in range(first_segment, last_segment + 1):
+        start = route[index]
+        end = route[index + 1]
+        sx, sy = float(start.x_cm), float(start.y_cm)
+        vx = float(end.x_cm - start.x_cm)
+        vy = float(end.y_cm - start.y_cm)
+        segment_len_sq = vx * vx + vy * vy
+        if segment_len_sq <= 1e-9:
+            continue
+
+        projection = ((rx - sx) * vx + (ry - sy) * vy) / segment_len_sq
+        clamped = float(np.clip(projection, 0.0, 1.0))
+        cx = sx + vx * clamped
+        cy = sy + vy * clamped
+        dx = rx - cx
+        dy = ry - cy
+        distance = math.hypot(dx, dy)
+        if distance >= best_distance:
+            continue
+
+        segment_heading = math.atan2(vy, vx)
+        cross = vx * (ry - sy) - vy * (rx - sx)
+        signed_distance = math.copysign(distance, cross) if abs(cross) > 1e-9 else 0.0
+        best_distance = distance
+        best = RouteTrackingError(
+            xte_cm=distance,
+            signed_xte_cm=signed_distance,
+            heading_error_rad=_normalize_angle(segment_heading - robot_pose.heading_rad),
+            closest_point_cm=(cx, cy),
+            segment_heading_rad=segment_heading,
+            segment_index=index,
+        )
+
+    return best
+
+
+def classify_segments_from_geometry(
+    route: list[HybridPose],
+    pickup_poses: list[HybridPose],
+) -> list[RouteSegmentType]:
+    """Derive segment types from route geometry and pickup identity.
+
+    Logic:
+    1. Default all segments to TRANSIT
+    2. Zero-length segments -> PIVOT
+    3. Segments ending at a pickup pose (matched by ``id()``) -> CREEP
+    4. Zero-length segment before a CREEP -> PIVOT
+    """
+    segment_count = max(0, len(route) - 1)
+    if segment_count == 0:
+        return []
+
+    segment_types = [RouteSegmentType.TRANSIT] * segment_count
+    pickup_ids = {id(pose) for pose in pickup_poses}
+
+    for index in range(segment_count):
+        start, end = route[index], route[index + 1]
+        if math.hypot(end.x_cm - start.x_cm, end.y_cm - start.y_cm) <= 1e-6:
+            segment_types[index] = RouteSegmentType.PIVOT
+
+    for index in range(segment_count):
+        if id(route[index + 1]) in pickup_ids:
+            segment_types[index] = RouteSegmentType.CREEP
+            if index >= 1 and segment_types[index - 1] == RouteSegmentType.PIVOT:
+                pass  # already PIVOT
+            elif index >= 1:
+                prev_start, prev_end = route[index - 1], route[index]
+                if math.hypot(prev_end.x_cm - prev_start.x_cm, prev_end.y_cm - prev_start.y_cm) <= 1e-6:
+                    segment_types[index - 1] = RouteSegmentType.PIVOT
+
+    return segment_types
 
 
 class WheelCommandController:
@@ -296,11 +392,9 @@ class DriveSafetyGuard:
     def __init__(
         self,
         drive_config: DriveConfig | None = None,
-        route_facade: RoutePlanningFacade | None = None,
         wheel_controller: WheelCommandController | None = None,
     ) -> None:
         self.config = drive_config or DriveConfig()
-        self.route_facade = route_facade or RoutePlanningFacade()
         self.wheel_controller = wheel_controller or WheelCommandController(self.config)
 
     def reset_route_progress_if_needed(self, route: list[HybridPose], drive_runtime: DriveRuntime) -> None:
@@ -320,7 +414,7 @@ class DriveSafetyGuard:
         robot_pose: RobotPose,
         route: list[HybridPose],
         drive_runtime: DriveRuntime,
-        segment_types: list[RouteSegmentType] | None = None,
+        pickup_poses: list[HybridPose] | None = None,
     ) -> RouteTrackingError | None:
         """Project only onto the current/future route window to avoid path-intersection jumps."""
         self.reset_route_progress_if_needed(route, drive_runtime)
@@ -329,12 +423,13 @@ class DriveSafetyGuard:
             len(route) - 2,
             start_segment + max(0, int(self.config.route_tracking_lookahead_segments)),
         )
-        if segment_types is not None:
+        segment_types = classify_segments_from_geometry(route, pickup_poses or [])
+        if segment_types:
             for idx in range(start_segment, end_segment + 1):
                 if idx < len(segment_types) and segment_types[idx] == RouteSegmentType.PIVOT:
                     end_segment = max(start_segment, idx - 1)
                     break
-        tracking_error = self.route_facade.compute_route_tracking_error(
+        tracking_error = compute_route_tracking_error(
             robot_pose,
             route,
             start_segment_index=start_segment,
@@ -353,7 +448,7 @@ class DriveSafetyGuard:
         route: list[HybridPose] | None,
         drive_runtime: DriveRuntime | None,
         clear_route_cache: Callable[[], None] | None = None,
-        segment_types: list[RouteSegmentType] | None = None,
+        pickup_poses: list[HybridPose] | None = None,
     ) -> None:
         """Stop on excessive XTE before route cache updates can hide the error."""
         if (
@@ -365,7 +460,7 @@ class DriveSafetyGuard:
             return
 
         tracking_error = self.compute_progressive_tracking_error(
-            robot_pose, route, drive_runtime, segment_types=segment_types,
+            robot_pose, route, drive_runtime, pickup_poses=pickup_poses,
         )
         if tracking_error is None or tracking_error.xte_cm <= self.config.max_cross_track_error_cm:
             return
@@ -389,7 +484,7 @@ class DriveSafetyGuard:
         local_goal_poses: list[HybridPose] | None = None,
         dt_s: float | None = None,
         robot_geometry: RobotGeometry | None = None,
-        segment_types: list[RouteSegmentType] | None = None,
+        pickup_poses: list[HybridPose] | None = None,
     ) -> None:
         """Run the master-controller step after perception and route-cache update."""
         if drive_runtime is None:
@@ -413,7 +508,7 @@ class DriveSafetyGuard:
             return
 
         tracking_error = self.compute_progressive_tracking_error(
-            robot_pose, route, drive_runtime, segment_types=segment_types,
+            robot_pose, route, drive_runtime, pickup_poses=pickup_poses,
         )
         drive_runtime.last_error = tracking_error
         if tracking_error is None:

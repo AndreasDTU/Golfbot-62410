@@ -54,14 +54,50 @@ class RobotPose:
 
 @dataclass(frozen=True)
 class RobotGeometry:
-    """Live-tunable robot drawing and pickup geometry in centimeters."""
+    """Live-tunable robot drawing and pickup geometry in centimeters.
 
-    width_cm: float
-    front_cm: float
-    rear_cm: float
-    tube_forward_cm: float
-    tube_right_cm: float
-    unload_extension_cm: float = 15.0
+    All distances are measured from the robot origin, which sits between the
+    drive wheels (differential-drive axle center).
+
+    Physical layout (heading = up):
+
+                 ○          ← tube tip (4.5 cm diameter pipe)
+                 │
+                 │  tube_forward_cm (13.1, to pipe center)
+                 │
+        ┌────────┼────────┐  ← front_cm (3.8) from origin
+        │        │        │
+        │       (O)       │  ← origin (wheel axle center)
+        │                 │
+        │                 │
+        │                 │  rear_cm (15.1) from origin
+        └─────────────────┘
+        ←    width_cm    →
+              (19.5)
+
+    The pickup tube is NOT retractable — it protrudes forward at all times
+    (both raised and lowered) and must be included in collision geometry.
+
+    During an in-place (tank) turn the full robot (body + tube) sweeps a
+    circle.  The radius is determined by the farthest point from origin:
+
+        rear corner:  sqrt(rear_cm² + (width_cm / 2)²)           ≈ 18.0 cm
+        tube tip edge: sqrt(tube_forward_cm² + (pipe_radius)²)   ≈ 13.3 cm
+
+        tank_turn_radius ≈ 18.0 cm  (dominated by rear corners)
+
+    Ground-truth values live in data/robot_calibration.json and are loaded at
+    startup; the defaults in config.py RobotGeometryConfig are fallbacks only.
+    """
+
+    width_cm: float  # full body width (left wheel edge to right wheel edge)
+    front_cm: float  # origin to front edge of body
+    rear_cm: float  # origin to rear edge of body
+    tube_forward_cm: float  # origin to pickup tube tip (along heading)
+    tube_right_cm: float  # lateral offset of tube tip (0 = centered)
+    tube_width_cm: float = 6.0  # pickup tube opening diameter
+    mouth_radius_cm: float = 2.0  # tolerance radius around tube tip
+    unload_extension_cm: float = 30.0  # reverse distance when unloading
 
 
 @dataclass(frozen=True)

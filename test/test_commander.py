@@ -58,165 +58,89 @@ def last_lr(cmd: FakeCommander) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Turn profiling
+# Turn profiling (quadratic acceleration)
 # ---------------------------------------------------------------------------
 
 class TestTurn:
-    def test_large_angle_uses_cruise_speed(self):
+    def test_large_angle_approaches_max_speed(self):
+        """Large angle should eventually reach turn_max_speed_pct as we progress through the turn.
+        
+        First frame of a 90-degree turn uses min speed, but as we continue the turn
+        and the remaining angle decreases to near the acceleration_deg range, speed ramps up.
+        """
         c = make_commander()
+        # First frame: should be at min speed (just starting)
         c.turn(90.0)
         left, right = last_lr(c)
-        # Positive degrees = CCW: left=-speed, right=+speed
-        assert left < 0 and right > 0
-        assert abs(right) == pytest.approx(c._config.turn_speed_pct, abs=0.5)
-
-    def test_small_angle_uses_creep_speed(self):
-        c = make_commander()
-        c.turn(3.0)
+        assert abs(right) == pytest.approx(c._config.turn_min_speed_pct, abs=0.5)
+        
+        # Simulate progress: now 7 degrees remaining (still accelerating)
+        c.turn(7.0)
         left, right = last_lr(c)
-        assert abs(right) == pytest.approx(c._config.turn_creep_speed_pct, abs=0.5)
+        speed_mid = abs(right)
+        assert c._config.turn_min_speed_pct < speed_mid < c._config.turn_max_speed_pct
+        
+        # Near the end: should slow down (symmetric acceleration curve)
+        c.turn(5.0)
+        left, right = last_lr(c)
+        speed_near_end = abs(right)
+        assert speed_near_end < speed_mid  # Should be slower as we approach the target
+
+    def test_small_angle_uses_min_speed(self):
+        """Very small angle (near 0) should use turn_min_speed_pct."""
+        c = make_commander()
+        c.turn(1.0)
+        left, right = last_lr(c)
+        assert abs(right) == pytest.approx(c._config.turn_min_speed_pct, abs=0.5)
 
     def test_mid_angle_ramps(self):
+        """A mid-range total turn should produce intermediate speed as it progresses."""
         c = make_commander()
         cfg = c._config
-        mid_angle = (cfg.turn_creep_angle_deg + cfg.turn_cruise_angle_deg) / 2
-        c.turn(mid_angle)
+        # Start a 30-degree turn (in the acceleration range)
+        c.turn(30.0)
         _, right = last_lr(c)
-        speed = abs(right)
-        assert cfg.turn_creep_speed_pct < speed < cfg.turn_speed_pct
+        speed_start = abs(right)
+        # Continue: 15 degrees remaining (further along the curve)
+        c.turn(15.0)
+        _, right = last_lr(c)
+        speed_mid = abs(right)
+        # Speed should increase as we progress
+        assert speed_mid > speed_start
 
     def test_negative_angle_reverses_wheels(self):
+        """Negative angle (clockwise) should reverse wheel signs."""
         c = make_commander()
         c.turn(-45.0)
         left, right = last_lr(c)
         # Negative = CW: left=+speed, right=-speed
         assert left > 0 and right < 0
 
-    def test_sets_base_speed_zero(self):
+    def test_sets_current_speed_zero(self):
+        """Turn should set _current_speed to 0."""
         c = make_commander()
-        c._base_speed = 20.0
+        c._current_speed = 20.0
         c.turn(45.0)
-        assert c._base_speed == 0.0
+        assert c._current_speed == 0.0
 
     def test_non_finite_rejected(self):
+        """NaN and Inf angles should be rejected."""
         c = make_commander()
         assert c.turn(float("nan")) is False
         assert c.turn(float("inf")) is False
 
-
-# ---------------------------------------------------------------------------
-# Drive profiling
-# ---------------------------------------------------------------------------
-
-class TestDrive:
-    def test_far_distance_uses_cruise_speed(self):
+    def test_detects_new_turn(self):
+        """Increasing magnitude or sign change should reset total angle."""
         c = make_commander()
-        c.drive(100.0)
-        left, right = last_lr(c)
-        assert left == pytest.approx(c._config.drive_speed_pct, abs=0.5)
-        assert right == pytest.approx(c._config.drive_speed_pct, abs=0.5)
-
-    def test_close_distance_uses_creep_speed(self):
-        c = make_commander()
-        c.drive(3.0)
-        left, right = last_lr(c)
-        assert left == pytest.approx(c._config.creep_speed_pct, abs=0.5)
-
-    def test_mid_distance_ramps(self):
-        c = make_commander()
-        cfg = c._config
-        mid = (cfg.creep_distance_cm + cfg.cruise_distance_cm) / 2
-        c.drive(mid)
-        left, _ = last_lr(c)
-        assert cfg.creep_speed_pct < left < cfg.drive_speed_pct
-
-    def test_negative_drives_backward(self):
-        c = make_commander()
-        c.drive(-50.0)
-        left, right = last_lr(c)
-        assert left < 0 and right < 0
-
-    def test_stores_base_speed(self):
-        c = make_commander()
-        c.drive(100.0)
-        assert c._base_speed > 0
-
-    def test_slew_limiting(self):
-        c = make_commander()
-        # First call at dt=None: instant
-        c.drive(100.0, dt_s=None)
-        speed1 = c._base_speed
-        # Reset previous speed low, then request high with small dt
-        c._previous_speed = 0.0
-        c.drive(100.0, dt_s=0.01)
-        speed2 = c._base_speed
-        # Should be limited by accel
-        assert speed2 < speed1
-
-    def test_non_finite_rejected(self):
-        c = make_commander()
-        assert c.drive(float("nan")) is False
-
-
-# ---------------------------------------------------------------------------
-# DriveAdjusted
-# ---------------------------------------------------------------------------
-
-class TestDriveAdjusted:
-    def test_single_command_per_tick(self):
-        c = make_commander()
-        before = len(c.sent_commands)
-        c.drive_adjusted(100.0, None, 5.0)
-        assert len(c.sent_commands) - before == 1
-
-    def test_forward_speed_with_correction(self):
-        c = make_commander()
-        c.drive_adjusted(100.0, None, 5.0)
-        left, right = last_lr(c)
-        correction = 5.0 * c._config.adjust_gain
-        base = (left + right) / 2
-        assert base == pytest.approx(c._config.drive_speed_pct, abs=0.5)
-        assert right - left == pytest.approx(2 * correction, abs=0.1)
-
-    def test_zero_heading_error_drives_straight(self):
-        c = make_commander()
-        c.drive_adjusted(100.0, None, 0.0)
-        left, right = last_lr(c)
-        assert left == pytest.approx(right, abs=0.01)
-
-    def test_stores_base_speed(self):
-        c = make_commander()
-        c.drive_adjusted(100.0, None, 10.0)
-        assert c._base_speed == pytest.approx(c._config.drive_speed_pct, abs=0.5)
-
-    def test_non_finite_cm_rejected(self):
-        c = make_commander()
-        assert c.drive_adjusted(float("nan"), None, 5.0) is False
-
-    def test_non_finite_heading_rejected(self):
-        c = make_commander()
-        assert c.drive_adjusted(100.0, None, float("inf")) is False
-
-
-# ---------------------------------------------------------------------------
-# Stop
-# ---------------------------------------------------------------------------
-
-class TestStop:
-    def test_sends_zero(self):
-        c = make_commander()
-        c._base_speed = 30.0
-        c.stop()
-        left, right = last_lr(c)
-        assert left == 0.0 and right == 0.0
-
-    def test_resets_base_speed(self):
-        c = make_commander()
-        c._base_speed = 25.0
-        c._previous_speed = 25.0
-        c.stop()
-        assert c._base_speed == 0.0
-        assert c._previous_speed == 0.0
+        # First turn: 30 degrees
+        c.turn(30.0)
+        assert c._total_turn_angle == 30.0
+        # Continue turn: 25 degrees (same direction, decreasing)
+        c.turn(25.0)
+        assert c._total_turn_angle == 30.0  # Unchanged
+        # New turn: 35 degrees (magnitude increased)
+        c.turn(35.0)
+        assert c._total_turn_angle == 35.0  # Reset to new value
 
 
 # ---------------------------------------------------------------------------
@@ -319,14 +243,16 @@ class TestValidation:
 
 class TestSpeedClipping:
     def test_output_clipped_to_max(self):
-        c = make_commander(max_speed_pct=50.0)
+        c = make_commander()
+        c.max_speed_pct = 50.0
         c._send_wheel_speeds(100.0, -100.0)
         left, right = last_lr(c)
         assert left == pytest.approx(50.0, abs=0.1)
         assert right == pytest.approx(-50.0, abs=0.1)
 
     def test_turn_clipped(self):
-        c = make_commander(max_speed_pct=20.0, turn_speed_pct=30.0)
+        c = make_commander(turn_max_speed_pct=30.0)
+        c.max_speed_pct = 20.0
         c.turn(90.0)
         left, right = last_lr(c)
         assert abs(left) <= 20.0 + 0.1

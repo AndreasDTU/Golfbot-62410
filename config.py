@@ -5,7 +5,8 @@ Typed configuration for everything.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum
 from pathlib import Path
 
@@ -49,11 +50,29 @@ class PathConfig:
 
     def __post_init__(self) -> None:
         root = self.repo_root
-        object.__setattr__(self, "calibration_file", self.calibration_file or root / "data" / "calibration_data.npz")
-        object.__setattr__(self, "robot_calibration_file", self.robot_calibration_file or root / "data" / "robot_calibration.json")
-        object.__setattr__(self, "field_corners_file", self.field_corners_file or root / "data" / "field_corners.json")
-        object.__setattr__(self, "red_cross_file", self.red_cross_file or root / "data" / "red_cross.json")
-        object.__setattr__(self, "yolo_model_path", self.yolo_model_path or Path("best.pt"))
+        object.__setattr__(
+            self,
+            "calibration_file",
+            self.calibration_file or root / "data" / "calibration_data.npz",
+        )
+        object.__setattr__(
+            self,
+            "robot_calibration_file",
+            self.robot_calibration_file or root / "data" / "robot_calibration.json",
+        )
+        object.__setattr__(
+            self,
+            "field_corners_file",
+            self.field_corners_file or root / "data" / "field_corners.json",
+        )
+        object.__setattr__(
+            self,
+            "red_cross_file",
+            self.red_cross_file or root / "data" / "red_cross.json",
+        )
+        object.__setattr__(
+            self, "yolo_model_path", self.yolo_model_path or Path("best.pt")
+        )
 
 
 @dataclass(frozen=True)
@@ -176,10 +195,16 @@ class DetectionConfig:
             "cam_center_y": int(round(field.height_cm * 0.5)),
             "heading_tuning": self.heading_tuning,
             "robot_width_cmx10": int(round(robot.tuned_footprint_width_cm * 10.0)),
-            "robot_front_cmx10": int(round(robot.tuned_footprint_front_from_origin_cm * 10.0)),
-            "robot_rear_cmx10": int(round(robot.tuned_footprint_rear_from_origin_cm * 10.0)),
+            "robot_front_cmx10": int(
+                round(robot.tuned_footprint_front_from_origin_cm * 10.0)
+            ),
+            "robot_rear_cmx10": int(
+                round(robot.tuned_footprint_rear_from_origin_cm * 10.0)
+            ),
             "tube_forward_cmx10": int(round(robot.tuned_tube_offset_cm * 10.0)),
-            "tube_right_cmx10": int(round((robot.tuned_tube_right_offset_cm + 50.0) * 10.0)),
+            "tube_right_cmx10": int(
+                round((robot.tuned_tube_right_offset_cm + 50.0) * 10.0)
+            ),
             "unload_extension_cmx10": int(round(planner.unload_extension_cm * 10.0)),
         }
 
@@ -293,7 +318,7 @@ class PlannerConfig:
 class ConnectionConfig:
     """Robot TCP connection and command dispatch."""
 
-    robot_ip: str = "172.20.10.8"
+    robot_ip: str = "ev3dev"
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     min_send_interval_s: float = 0.02
@@ -304,27 +329,21 @@ class ConnectionConfig:
 class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
-    drive_speed_pct: float = 90.0
-    max_speed_pct: float = 100.0
-    max_heading_for_forward_rad: float = math.radians(15.0)
-    turn_speed_pct: float = 25.0
-    creep_speed_pct: float = 25.0
+    # Drive speed profiling
+    drive_min_speed_pct: float = 10.0  # Minimum travel speed
+    drive_max_speed_pct: float = 90.0  # Maximum travel speed
+    drive_acceleration_cm: float = 15.0  # Distance to go from min to max speed
+    # Turn speed profiling
+    turn_min_speed_pct: float = 7.0
+    turn_max_speed_pct: float = 30.0
+    turn_acceleration_deg: float = 15.0
     # PID gains
     heading_kp: float = 38.0
     heading_kd: float = 6.0
     xte_kp: float = 2.2
     xte_kd: float = 0.25
     # Distance-based speed profiling
-    cruise_distance_cm: float = 30.0
-    creep_distance_cm: float = 10.0
     max_cross_track_error_cm: float = 8.0
-    # Turn speed profiling
-    turn_creep_speed_pct: float = 8.0
-    turn_cruise_angle_deg: float = 30.0
-    turn_creep_angle_deg: float = 8.0
-    # Kinematic limits
-    acceleration_limit_pct_per_s: float = 45.0
-    deceleration_limit_pct_per_s: float = 90.0
     # Edge/wall proximity
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
@@ -332,7 +351,12 @@ class DriveConfig:
     near_zone_cm: float = 10.0
     near_zone_move_speed_pct: float = 7.0
     # Heading correction
-    adjust_gain: float = 15
+    max_heading_for_forward_rad: float = math.radians(15.0)
+    adjust_gain: float = 7.0
+    # Waypoint arrival tolerance
+    waypoint_arrival_cm: float = 4.0
+    ball_arrival_cm: float = 1.0
+    final_heading_tolerance_rad: float = math.radians(2.0)
     # Route tracking
     route_tracking_lookahead_segments: int = 12
 
@@ -369,7 +393,9 @@ class AppConfig:
     connection: ConnectionConfig = dataclass_field(default_factory=ConnectionConfig)
     drive: DriveConfig = dataclass_field(default_factory=DriveConfig)
     telemetry: TelemetryConfig = dataclass_field(default_factory=TelemetryConfig)
-    robot_calibration: RobotCalibrationConfig = dataclass_field(default_factory=RobotCalibrationConfig)
+    robot_calibration: RobotCalibrationConfig = dataclass_field(
+        default_factory=RobotCalibrationConfig
+    )
 
     @classmethod
     def from_repo_root(cls, repo_root: Path) -> "AppConfig":

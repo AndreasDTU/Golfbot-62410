@@ -1177,7 +1177,7 @@ class MainGui:
                     self._commander = RobotCommander(drive_config=self.config.drive, auto_connect=True)
                 self._spin = SpinController(
                     self._commander,
-                    turn_speed_pct=self.config.drive.turn_speed_pct,
+                    turn_speed_pct=self.config.drive.turn_max_speed_pct,
                 )
                 self._calib_phase = CALIB_ALIGN
                 self.message = "Connected. Press Spin to find center, adjust body, then Save."

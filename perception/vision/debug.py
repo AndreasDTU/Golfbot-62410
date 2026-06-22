@@ -65,24 +65,11 @@ class DebugRenderer:
         ).robot_geometry_from_params(params)
 
     def route_velocity_color_for_speed(self, speed_pct: float) -> tuple[int, int, int]:
-        """Map a profiled speed to a BGR heatmap color."""
-        creep = max(0.0, float(self.drive_config.creep_speed_pct))
-        cruise = max(creep + 1e-6, float(self.drive_config.drive_speed_pct))
-        ratio = float(np.clip((speed_pct - creep) / (cruise - creep), 0.0, 1.0))
-        if ratio < 0.5:
-            local = ratio / 0.5
-            red = 255
-            green = int(round(255 * local))
-        else:
-            local = (ratio - 0.5) / 0.5
-            red = int(round(255 * (1.0 - local)))
-            green = 255
-        return (0, green, red)
+        return (0, 255, 0)
 
     def route_velocity_color(self, distance_to_goal_cm: float) -> tuple[int, int, int]:
         """Map the one-sided distance profile to a BGR heatmap color."""
-        target = WheelCommandController.target_speed_for_distance(distance_to_goal_cm, self.drive_config)
-        return self.route_velocity_color_for_speed(target)
+        return (0, 255, 0)
 
     @staticmethod
     def cumulative_route_lengths(route_points_cm: list[HybridPose]) -> list[float]:
@@ -279,13 +266,11 @@ class DebugRenderer:
                 next_stop_cumulative = next((stop for stop in stop_cumulative if stop > start_cumulative + 1e-6), cumulative[-1])
             distance_since_stop = max(0.0, start_cumulative - previous_stop_cumulative)
             distance_to_stop = max(0.0, next_stop_cumulative - start_cumulative)
-            accel_speed = WheelCommandController.target_speed_for_distance(distance_since_stop, self.drive_config)
-            decel_speed = WheelCommandController.target_speed_for_distance(distance_to_stop, self.drive_config)
             cv2.line(
                 schematic,
                 start_px,
                 end_px,
-                self.route_velocity_color_for_speed(min(accel_speed, decel_speed)),
+                self.route_velocity_color_for_speed(0),
                 3,
                 cv2.LINE_AA,
             )

@@ -6,16 +6,19 @@ import math
 
 import pytest
 
+from config import DriveConfig
 from control.commander import RobotCommander
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.models import RobotPose
 from path.models import HybridPose
 from config import DriveConfig
 
+from path.pathfinding.models import HybridPose
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 class FakeCommander(RobotCommander):
     """RobotCommander with TCP stubbed out for unit testing."""
@@ -82,6 +85,7 @@ DT = 0.033  # ~30 fps
 # No pose — stop immediately
 # ---------------------------------------------------------------------------
 
+
 class TestNoPose:
     def test_returns_no_pose(self):
         g, cmd = make_guidance()
@@ -93,13 +97,15 @@ class TestNoPose:
         g, cmd = make_guidance()
         g.set_route([wp(80, 50)])
         g.tick(None, DT)
-        left, right = last_lr(cmd)
-        assert left == 0.0 and right == 0.0
+        assert cmd.sent_commands, "no commands sent"
+        last = cmd.sent_commands[-1]
+        assert last == "stop", "expected stop command"
 
 
 # ---------------------------------------------------------------------------
 # No route
 # ---------------------------------------------------------------------------
+
 
 class TestNoRoute:
     def test_no_route_set(self):
@@ -118,6 +124,7 @@ class TestNoRoute:
 # ---------------------------------------------------------------------------
 # Turn decision — heading error > max_heading_for_forward_rad
 # ---------------------------------------------------------------------------
+
 
 class TestTurnDecision:
     def test_large_heading_error_triggers_turn(self):
@@ -147,6 +154,7 @@ class TestTurnDecision:
 # Drive + adjust
 # ---------------------------------------------------------------------------
 
+
 class TestDriveAdjust:
     def test_forward_drive_sends_positive_speeds(self):
         g, cmd = make_guidance()
@@ -157,10 +165,15 @@ class TestDriveAdjust:
 
     def test_heading_correction_produces_differential(self):
         g, cmd = make_guidance()
-        # Waypoint is at (80, 55) — slightly above +X axis.
+        # Waypoint is at (150, 60) — far away, slightly above +X axis.
         # Robot faces +X (0°). Small positive heading error.
-        g.set_route([wp(80, 55)])
+        g.set_route([wp(150, 60)])
+        # First tick: start driving (uses creep speed for stability)
         g.tick(pose(50, 50, 0), DT)
+        # Second tick: robot has moved partway, higher speed, correction visible
+        # Simulate that robot has moved 50cm closer
+        status = g.tick(pose(100, 53, 3), DT)
+        assert status == GuidanceStatus.RUNNING
         left, right = last_lr(cmd)
         # Positive heading error (CCW correction needed):
         # adjust subtracts from left, adds to right → right > left
@@ -170,6 +183,7 @@ class TestDriveAdjust:
 # ---------------------------------------------------------------------------
 # Waypoint arrival and cursor advance
 # ---------------------------------------------------------------------------
+
 
 class TestArrival:
     def test_arrives_at_single_waypoint(self):
@@ -208,6 +222,7 @@ class TestArrival:
 # Final waypoint heading alignment
 # ---------------------------------------------------------------------------
 
+
 class TestFinalHeadingAlignment:
     def test_position_reached_wrong_heading_keeps_running(self):
         g, cmd = make_guidance()
@@ -237,10 +252,10 @@ class TestFinalHeadingAlignment:
 
     def test_alignment_within_tolerance_is_arrived(self):
         g, cmd = make_guidance()
-        # Default tolerance is 5°
+        # Default tolerance is 2° (from config.final_heading_tolerance_rad)
         g.set_route([wp(50, 50, 90)])
-        # Robot heading is 87° — within 5° of 90° → ARRIVED
-        status = g.tick(pose(50, 50, 87), DT)
+        # Robot heading is 89° — within 2° of 90° → ARRIVED
+        status = g.tick(pose(50, 50, 89), DT)
         assert status == GuidanceStatus.ARRIVED
 
     def test_alignment_outside_tolerance_keeps_turning(self):
@@ -288,6 +303,7 @@ class TestFinalHeadingAlignment:
 # ---------------------------------------------------------------------------
 # Full route completion
 # ---------------------------------------------------------------------------
+
 
 class TestFullRoute:
     def test_three_waypoint_route(self):
@@ -339,6 +355,7 @@ class TestFullRoute:
 # Heading wrapping near ±180°
 # ---------------------------------------------------------------------------
 
+
 class TestHeadingWrapping:
     def test_turn_direction_across_180(self):
         g, cmd = make_guidance()
@@ -370,6 +387,7 @@ class TestHeadingWrapping:
 # set_route / clear_route
 # ---------------------------------------------------------------------------
 
+
 class TestRouteManagement:
     def test_set_route_resets_cursor(self):
         g, cmd = make_guidance()
@@ -385,8 +403,9 @@ class TestRouteManagement:
         g, cmd = make_guidance()
         g.set_route([wp(80, 50)])
         g.clear_route()
-        left, right = last_lr(cmd)
-        assert left == 0.0 and right == 0.0
+        assert cmd.sent_commands, "no commands sent"
+        last = cmd.sent_commands[-1]
+        assert last == "stop", "expected stop command"
 
     def test_clear_route_resets_state(self):
         g, cmd = make_guidance()

@@ -227,8 +227,10 @@ def run(angle_deg: float, trials: int, commander: RobotCommander) -> None:
 
     overshoots: list[float] = []
 
+    current_coast = DriveConfig().turn_coast_deg
     print(f"\nTurn coast calibration — {angle_deg:+.1f}° × {trials} trials")
-    print("turn_coast_deg is forced to 0 for this run to measure raw coast.")
+    print(f"Current turn_coast_deg: {current_coast:.1f}°  (active during this run)")
+    print("Residual overshoot will be added to refine the value.")
     print("Make sure the ArUco markers are fully visible from the camera.\n")
 
     try:
@@ -251,14 +253,39 @@ def run(angle_deg: float, trials: int, commander: RobotCommander) -> None:
         print("No valid trials recorded.")
         return
 
-    avg = sum(overshoots) / len(overshoots)
+    current_coast = DriveConfig().turn_coast_deg
+    avg_residual = sum(overshoots) / len(overshoots)
+    new_coast = current_coast + avg_residual
+
     print("=" * 48)
     print(f"Trials recorded  : {len(overshoots)}")
     print(f"Individual       : {', '.join(f'{v:+.1f}' for v in overshoots)}")
-    print(f"Average overshoot: {avg:+.2f}°")
+    print(f"Residual overshoot: {avg_residual:+.2f}°")
+    print(f"Current turn_coast_deg: {current_coast:.1f}°")
+    print(f"New    turn_coast_deg: {new_coast:.1f}°")
     print()
-    print(f"Set DriveConfig.turn_coast_deg = {avg:.1f}  in config.py")
+
+    _update_config(new_coast)
+
     print("=" * 48)
+
+
+def _update_config(coast_deg: float) -> None:
+    """Write the measured turn_coast_deg into config.py in-place."""
+    config_path = REPO_ROOT / "config.py"
+    text = config_path.read_text(encoding="utf-8")
+
+    import re
+    pattern = r"(turn_coast_deg\s*:\s*float\s*=\s*)[0-9eE+\-.]+"
+    replacement = rf"\g<1>{coast_deg:.1f}"
+    new_text, count = re.subn(pattern, replacement, text)
+
+    if count == 0:
+        print(f"Could not find turn_coast_deg in config.py — set it manually to {coast_deg:.1f}")
+        return
+
+    config_path.write_text(new_text, encoding="utf-8")
+    print(f"config.py updated: turn_coast_deg = {coast_deg:.1f}")
 
 
 def main() -> None:
@@ -277,11 +304,9 @@ def main() -> None:
         commander: RobotCommander = _DummyCommander()
     else:
         try:
-            # Force turn_coast_deg=0 so the stop fires exactly at target
-            cal_drive_config = DriveConfig(turn_coast_deg=0.0)
             commander = RobotCommander(
                 connection_config=ConnectionConfig(),
-                drive_config=cal_drive_config,
+                drive_config=DriveConfig(),
                 auto_connect=True,
             )
         except RuntimeError as exc:

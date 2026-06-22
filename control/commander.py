@@ -273,7 +273,13 @@ class RobotCommander:
         if not math.isfinite(degrees):
             self.last_error = "non-finite turn angle rejected"
             return False
-        if abs(degrees) <= self._config.turn_coast_deg:
+        # Only apply coast prediction when the total turn is larger than the
+        # coast distance — small corrections turn normally with no early stop.
+        if (
+            self._config.turn_coast_deg > 0
+            and abs(degrees) <= self._config.turn_coast_deg
+            and self._total_turn_angle > self._config.turn_coast_deg
+        ):
             return self.stop()
 
         # Detect start of a new turn: sign changed, or remaining angle jumped up by

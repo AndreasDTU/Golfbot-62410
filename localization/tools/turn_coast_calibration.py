@@ -60,7 +60,11 @@ class _NullBallDetector(BallDetector):
             "orange": np.zeros(frame_bgr.shape[:2], dtype=np.uint8),
         }
 
-DEFAULT_SWEEP_ANGLES = [360.0, 180.0, 90.0, 45.0, 30.0, 15.0, 10.0, 5.0]
+# Wrap-safe angles only: the before/after heading measurement folds into
+# [-180, 180), so a turn whose actual rotation (angle + coast) reaches ~180°
+# cannot be measured. Keep the largest angle comfortably below that.
+DEFAULT_SWEEP_ANGLES = [120.0, 90.0, 60.0, 45.0, 30.0, 15.0]
+WRAP_SAFE_MAX_DEG = 150.0  # refuse angles at/above this — measurement would wrap
 DEFAULT_TRIALS = 3   # trials per angle
 SETTLE_S = 1.0        # seconds to wait after stop before sampling final heading
 SAMPLE_FRAMES = 15    # frames to average for stable heading readings
@@ -277,6 +281,10 @@ def run_sweep(angles: list[float], trials_per_angle: int, commander: RobotComman
     results: dict[float, list[float]] = {}
     try:
         for angle in angles:
+            if abs(angle) >= WRAP_SAFE_MAX_DEG:
+                print(f"\n--- {angle:+.0f}° SKIPPED — at/above {WRAP_SAFE_MAX_DEG:.0f}°, the "
+                      f"before/after heading measurement wraps and cannot be trusted. ---")
+                continue
             speed_pct = _turn_speed_pct(cfg, angle)
             print(f"\n--- {angle:+.0f}°  (speed ≈ {speed_pct:.1f}%) ---")
             measured: list[float] = []
@@ -296,11 +304,11 @@ def run_sweep(angles: list[float], trials_per_angle: int, commander: RobotComman
         commander.close()
         camera.release()
 
-    # Validation table
+    # Validation table — collect (speed%, mean measured coast) points for a fit
     print("\n" + "=" * 70)
     print(f"{'Angle':>8}  {'Speed%':>7}  {'Measured coast':>15}  {'Coast@full speed':>17}")
     print("-" * 70)
-    coast_at_full: list[float] = []
+    points: list[tuple[float, float]] = []
     for angle in angles:
         data = results.get(angle, [])
         if not data:
@@ -310,29 +318,39 @@ def run_sweep(angles: list[float], trials_per_angle: int, commander: RobotComman
         speed_ratio = speed_pct / cfg.turn_max_speed_pct
         measured_coast = sum(data) / len(data)
         coast_full = measured_coast / speed_ratio if speed_ratio > 0 else float("nan")
-        if math.isfinite(coast_full):
-            coast_at_full.append(coast_full)
+        points.append((speed_pct, measured_coast))
         print(f"{angle:>7.0f}°  {speed_pct:>6.1f}%  {measured_coast:>14.1f}°  {coast_full:>16.1f}°")
     print("=" * 70)
 
-    if not coast_at_full:
-        print("No valid data collected.")
+    if len(points) < 2:
+        print("Not enough valid data to fit the model.")
         return
 
-    mean_coast = sum(coast_at_full) / len(coast_at_full)
-    variance = sum((v - mean_coast) ** 2 for v in coast_at_full) / len(coast_at_full)
-    std_dev = math.sqrt(variance)
-    print(f"\nMean coast@full speed : {mean_coast:.2f}°")
-    print(f"Std dev               : {std_dev:.2f}°")
+    # Speed-weighted through-origin least squares: coast = slope * speed.
+    # This trusts the clean high-speed points over the noise-amplified floor
+    # points (where speed is pinned at the minimum).
+    sum_sc = sum(s * c for s, c in points)
+    sum_ss = sum(s * s for s, c in points)
+    if sum_ss <= 0:
+        print("All speeds zero — cannot fit.")
+        return
+    slope = sum_sc / sum_ss  # coast degrees per 1% speed
+    coast_deg = slope * cfg.turn_max_speed_pct
 
-    CONSISTENCY_THRESHOLD_DEG = 5.0
-    if std_dev < CONSISTENCY_THRESHOLD_DEG:
-        print(f"Model CONSISTENT (std dev {std_dev:.2f}° < {CONSISTENCY_THRESHOLD_DEG:.1f}°) — "
-              f"coast scales linearly with speed.")
-        _update_config(mean_coast)
+    ss_res = sum((c - slope * s) ** 2 for s, c in points)
+    ss_tot = sum(c * c for s, c in points)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    print(f"\nFit: coast = {slope:.3f}° per 1% speed   (R² = {r2:.3f})")
+    print(f"Implied turn_coast_deg (coast at {cfg.turn_max_speed_pct:.0f}% speed): {coast_deg:.1f}°")
+
+    R2_THRESHOLD = 0.90
+    if r2 >= R2_THRESHOLD:
+        print(f"Model FITS (R² {r2:.3f} >= {R2_THRESHOLD:.2f}) — coast is linear in speed.")
+        _update_config(coast_deg)
     else:
-        print(f"Model INCONSISTENT (std dev {std_dev:.2f}° >= {CONSISTENCY_THRESHOLD_DEG:.1f}°). "
-              f"config.py NOT updated — the coast may not be linear in speed; review the table.")
+        print(f"Model POOR FIT (R² {r2:.3f} < {R2_THRESHOLD:.2f}). config.py NOT updated — "
+              f"coast may not be linear in speed; review the table.")
 
 
 def _update_config(coast_deg: float) -> None:

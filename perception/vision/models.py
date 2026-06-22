@@ -124,6 +124,38 @@ class RedCrossSpec:
             for x, y in local
         ]
 
+    def contains_point(self, point_cm: tuple[float, float], margin_cm: float = 0.0) -> bool:
+        """True when ``point_cm`` is inside the plus, or within ``margin_cm`` of its edge.
+
+        Used for the robot-vs-cross hitbox test: inflating the cross by half the
+        robot width and testing the robot center is the Minkowski-sum way of
+        asking whether the disc-approximated robot overlaps the cross.
+        """
+        px, py = float(point_cm[0]), float(point_cm[1])
+        poly = np.asarray(self.polygon_cm(), dtype=float)
+        starts = poly
+        ends = np.roll(poly, -1, axis=0)
+        sx, sy = starts[:, 0], starts[:, 1]
+        ex, ey = ends[:, 0], ends[:, 1]
+
+        # Even-odd ray cast for strictly-inside.
+        straddles = (sy > py) != (ey > py)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_at_y = sx + (py - sy) / (ey - sy) * (ex - sx)
+        inside = bool(np.count_nonzero(straddles & (px < x_at_y)) % 2 == 1)
+        if inside or margin_cm <= 0.0:
+            return inside
+
+        # Outside: accept if within margin of any edge segment.
+        edge = ends - starts
+        edge_len_sq = (edge * edge).sum(axis=1)
+        edge_len_sq = np.where(edge_len_sq > 0.0, edge_len_sq, 1.0)
+        t = np.clip(((px - sx) * edge[:, 0] + (py - sy) * edge[:, 1]) / edge_len_sq, 0.0, 1.0)
+        proj_x = sx + t * edge[:, 0]
+        proj_y = sy + t * edge[:, 1]
+        dist_sq = (px - proj_x) ** 2 + (py - proj_y) ** 2
+        return bool(dist_sq.min() <= margin_cm * margin_cm)
+
     @classmethod
     def from_tip_and_armpit(
         cls,

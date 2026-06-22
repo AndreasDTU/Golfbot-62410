@@ -35,7 +35,13 @@ from path.tools.pickup_visualizer import (
 )
 from config import AppConfig, RouteStrategyName
 from perception.vision.debug import DebugRenderer
-from perception.vision.models import CalibrationState, RedCrossSpec, RedZoneDetection
+from perception.vision.cross_tracking import CrossAction, CrossCollisionTracker, relocalize_cross
+from perception.vision.models import (
+    CalibrationState,
+    RedCrossSpec,
+    RedZoneDetection,
+    SmoothedBallCoordinate,
+)
 from perception.vision.pipeline import VisionPipeline, VisionFrameResult
 
 
@@ -303,6 +309,9 @@ class MainGui:
     _timer_start_time: float | None = None
     _timer_elapsed: float = 0.0
     _timer_running: bool = False
+
+    # Red-cross collision re-localization (fire-on-exit state machine)
+    _cross_tracker: CrossCollisionTracker = field(default_factory=CrossCollisionTracker)
 
     # Robot self-calibration state
     _calib_collector: RobotCalibrationCollector | None = None
@@ -810,6 +819,7 @@ class MainGui:
         self._attempted_pickups = 0
         self._needs_verification_snapshot = False
         self._verification_snapshot_done = False
+        self._cross_tracker.reset()
         if self._guidance is not None:
             self._guidance.clear_route()
         if self._commander is not None:
@@ -1044,10 +1054,9 @@ class MainGui:
             if self._brain is not None:
                 self._brain.signal_ball_displaced()
 
-    def _replan_after_displacement(self) -> None:
-        """Replan route from the current snapshot after a ball-displaced error."""
-        result = self._last_result
-        targets = [
+    def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
+        """Build planner ball targets from smoothed field coordinates."""
+        return [
             PlannedBallTarget(
                 track_id=b.track_id,
                 label=b.label,
@@ -1055,8 +1064,23 @@ class MainGui:
                 y_cm=b.cm_y,
                 node_cm=self.pipeline.mapper.field_metric_cm_to_grid_node((b.cm_x, b.cm_y)),
             )
-            for b in result.smoothed_ball_coordinates
+            for b in balls
         ]
+
+    def _plan_and_load_route(self, targets: list[PlannedBallTarget]) -> bool:
+        """Plan from the current pose through ``targets`` and load it into the brain.
+
+        Returns True if a route was found and loaded.  Callers own their own
+        status messages and any post-replan bookkeeping.
+        """
+        result = self._last_result
+        if (
+            result is None
+            or result.occupancy_grid is None
+            or self.robot_pose is None
+            or self._brain is None
+        ):
+            return False
         start_pose = HybridPose(
             x_cm=self.robot_pose.x_cm,
             y_cm=self.robot_pose.y_cm,
@@ -1076,12 +1100,22 @@ class MainGui:
 
         if not plan.waypoints:
             self.message = "Rescan: no route found — stopping"
-            return
+            return False
 
         self._brain.load_route(plan)
         self._brain_route_points = [
             HybridPose(w.x_cm, w.y_cm, w.theta_rad) for w in plan.waypoints
         ]
+
+        return True
+
+    def _replan_after_displacement(self) -> None:
+        """Replan route from the current snapshot after a ball-displaced error."""
+        result = self._last_result
+        if not self._plan_and_load_route(self._ball_targets(result.smoothed_ball_coordinates)):
+            self.message = "Rescan: no route found — stopping"
+            return
+
         self._tracked_balls = list(result.smoothed_ball_coordinates)
         self._crop_missing_counts = {}
         self._crop_hsv_ranges = (
@@ -1150,6 +1184,87 @@ class MainGui:
             and self._brain is not None
         ):
             self._replan_after_displacement()
+
+    # ------------------------------------------------------------------
+    # Red-cross collision re-localization (fire-on-exit)
+    # ------------------------------------------------------------------
+
+    def _tick_cross_tracker(self) -> None:
+        """Re-localize the manual cross after the robot drives through its hitbox.
+
+        Cheap every frame: a single point-in-polygon test against the cross
+        inflated by half the robot width.  The state machine and the red
+        re-detection live in ``perception.vision.cross_tracking``; this only
+        wires them to the live robot pose, occupancy grid, and route planner.
+        """
+        if self.mode != AppMode.AUTO or self._brain is None:
+            return
+
+        # Deferred replan: the grid was rebuilt with the new cross last frame.
+        if self._cross_tracker.take_pending_replan():
+            self._replan_after_cross_move()
+            return
+
+        if self._cross_spec is None or self.robot_pose is None:
+            return
+
+        half_robot = 0.5 * float(self.params.get("robot_width_cm", 20.0))
+        in_buffer = self._cross_spec.contains_point(
+            (self.robot_pose.x_cm, self.robot_pose.y_cm), half_robot
+        )
+        if self._cross_tracker.step(in_buffer) is CrossAction.RELOCALIZE:
+            self._relocalize_cross()
+
+    def _relocalize_cross(self) -> None:
+        """Re-detect the displaced cross near its last pose and update the spec silently."""
+        result = self._last_result
+        spec = self._cross_spec
+        if result is None or spec is None or result.frame_for_detection is None:
+            return
+
+        new_spec = relocalize_cross(
+            result.frame_for_detection,
+            spec,
+            self.params,
+            self.pipeline.mapper,
+            self.pipeline.red_zone_detector,
+        )
+        if new_spec is None:
+            log_event("BRAIN", "cross re-localize: not found, keeping prior pose")
+            return
+
+        moved = math.hypot(
+            new_spec.center_cm[0] - spec.center_cm[0],
+            new_spec.center_cm[1] - spec.center_cm[1],
+        )
+        self._cross_spec = new_spec
+        self._save_cross()
+        # Defer the replan one frame so _process_frame rebuilds the occupancy
+        # grid with the cross in its new position first.
+        self._cross_tracker.request_replan()
+        log_event(
+            "BRAIN", "cross re-localized after collision",
+            moved_cm=round(moved, 1),
+            center=(round(new_spec.center_cm[0], 1), round(new_spec.center_cm[1], 1)),
+        )
+
+    def _replan_after_cross_move(self) -> None:
+        """Replan the active route around the updated cross, reusing known ball targets.
+
+        Unlike ``_replan_after_displacement`` this sources targets from the
+        already-tracked balls, because AUTO frames skip ball detection and so
+        carry no fresh ``smoothed_ball_coordinates``.
+        """
+        result = self._last_result
+        if result is None:
+            return
+        balls = self._tracked_balls if self._tracked_balls else list(result.smoothed_ball_coordinates)
+        if not self._plan_and_load_route(self._ball_targets(balls)):
+            self.message = "Cross moved — no route found"
+            log_event("BRAIN", "cross re-localized but no route found")
+            return
+        self.message = f"Cross moved — replanned ({self._brain.step_count} steps)"
+        log_event("BRAIN", "replanned after cross re-localization", steps=self._brain.step_count)
 
     # ------------------------------------------------------------------
     # Robot self-calibration (spin -> fit center -> align body -> save)
@@ -1831,6 +1946,7 @@ class MainGui:
             self._tick_guidance()
             self._tick_crop_monitor()
             self._tick_pickup_verifier()
+            self._tick_cross_tracker()
             self._tick_brain()
             self._tick_calibration()
             left = self._build_left_panel(result)

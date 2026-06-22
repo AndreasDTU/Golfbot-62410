@@ -1,8 +1,8 @@
 """GolfBot Main GUI — camera + 2D schematic with mode controls.
 
-Single-window OpenCV GUI: live top-down camera feed (left) beside the 2D
-schematic field view (right), with a status bar showing mode, pose, and FPS.
-Guidance isolation testing (Stage 2) is available via the Guide Test button.
+Tkinter GUI with two threads: a vision daemon thread captures frames and runs
+the processing pipeline, while the main thread runs the tkinter event loop and
+refreshes the display at ~30 fps independently of vision throughput.
 """
 
 from __future__ import annotations
@@ -11,11 +11,13 @@ import json
 import math
 import threading
 import time
+import tkinter as tk
 from dataclasses import dataclass, field
 from enum import Enum
 
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
 
 from brain.brain import BrainController
 from brain.models import BrainState
@@ -68,8 +70,6 @@ WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
 CROSS_WINDOW_NAME = "Place Red Cross"
 ROUTE_VIEW_WINDOW_NAME = "Route View"
-STATUS_BAR_HEIGHT = 170
-
 
 # ---------------------------------------------------------------------------
 # Hardcoded test routes for Stage 2 guidance isolation testing
@@ -113,13 +113,6 @@ CONFIG_STRATEGY_BY_ROUTE_VIEW_KEY: dict[str, RouteStrategyName] = {
 }
 
 
-@dataclass(frozen=True)
-class GuiButton:
-    label: str
-    action: str
-    rect: tuple[int, int, int, int]  # x, y, w, h
-
-
 # ---------------------------------------------------------------------------
 # Corner selection — temporary window for picking 4 field corners
 # ---------------------------------------------------------------------------
@@ -137,38 +130,6 @@ class CornerSelectionState:
         self.points.clear()
         self.done = False
         self.cancelled = False
-
-
-def _corner_on_mouse(event: int, x: int, y: int, _flags: int, state: CornerSelectionState) -> None:
-    w, h = state.frame_size
-    if w > 0 and h > 0:
-        state.cursor = (int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1)))
-
-    if event == cv2.EVENT_RBUTTONDOWN:
-        state.points.clear()
-        return
-
-    if event == cv2.EVENT_LBUTTONDOWN and len(state.points) < 4:
-        state.points.append(state.cursor)
-        if len(state.points) == 4:
-            state.done = True
-
-
-def _cross_on_mouse(event: int, x: int, y: int, _flags: int, state: CornerSelectionState) -> None:
-    """Collect up to 2 corner clicks for the red-cross placement window."""
-    w, h = state.frame_size
-    if w > 0 and h > 0:
-        state.cursor = (int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1)))
-
-    if event == cv2.EVENT_RBUTTONDOWN:
-        state.points.clear()
-        state.done = False
-        return
-
-    if event == cv2.EVENT_LBUTTONDOWN and len(state.points) < 2:
-        state.points.append(state.cursor)
-        if len(state.points) == 2:
-            state.done = True
 
 
 def _draw_loupe(overlay: np.ndarray, cursor: tuple[int, int],
@@ -252,12 +213,48 @@ def _draw_corner_overlay(frame: np.ndarray, state: CornerSelectionState) -> np.n
 
 
 # ---------------------------------------------------------------------------
+# Shared display state for vision→GUI thread handoff
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SharedDisplayState:
+    """Data published by the vision thread, consumed by the GUI thread."""
+    left_panel: np.ndarray | None = None
+    right_panel: np.ndarray | None = None
+    corner_image: np.ndarray | None = None
+    cross_image: np.ndarray | None = None
+    route_image: np.ndarray | None = None
+    frame_seq: int = 0
+    fps: float = 0.0
+    mode: str = "IDLE"
+    message: str = "Ready"
+    robot_pose: RobotPose | None = None
+    brain_state: str | None = None
+    guidance_status: str | None = None
+    calibration_phase: str = CALIB_IDLE
+    # Extra status fields for the status bar
+    cal_state: str = ""
+    connecting: bool = False
+    commander_connected: bool = False
+    active_route_name: str = ""
+    guidance_cursor: int = 0
+    guidance_wp_count: int = 0
+    brain_step_cursor: int = 0
+    brain_step_count: int = 0
+    timer_elapsed: float = 0.0
+    markers_visible: str = ""
+    corner_window_open: bool = False
+    cross_window_open: bool = False
+    route_view_open: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Main GUI
 # ---------------------------------------------------------------------------
 
 @dataclass
 class MainGui:
-    """OpenCV GUI showing camera feed + 2D schematic side by side."""
+    """Two-thread GUI: vision processing in daemon thread, display in main thread."""
 
     config: AppConfig
     pipeline: VisionPipeline
@@ -273,7 +270,6 @@ class MainGui:
     message: str = "Ready"
     fps: float = 0.0
     closed: bool = False
-    _mouse_pos: tuple[int, int] = (0, 0)
     _corner_state: CornerSelectionState = field(default_factory=CornerSelectionState)
     _corner_window_open: bool = False
 
@@ -339,6 +335,12 @@ class MainGui:
     _right_w: int = 0
     _right_h: int = 0
 
+    # Threading state (initialized in __post_init__)
+    _display_lock: threading.Lock = field(default_factory=threading.Lock)
+    _params_lock: threading.Lock = field(default_factory=threading.Lock)
+    _shared: SharedDisplayState = field(default_factory=SharedDisplayState)
+    _frame_seq: int = 0
+
     def __post_init__(self) -> None:
         self._left_w, self._left_h = self.config.camera.topdown_warp_size
         self._right_w = self.config.windows.schematic_width_px
@@ -376,32 +378,57 @@ class MainGui:
             return
         self._cross_state.clear()
         self._cross_window_open = True
-        cv2.namedWindow(CROSS_WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(CROSS_WINDOW_NAME, _cross_on_mouse, self._cross_state)
+
+        top = tk.Toplevel(self._root)
+        top.title(CROSS_WINDOW_NAME)
+        top.resizable(False, False)
+        top.protocol("WM_DELETE_WINDOW", lambda: self._close_cross_window("Cross placement cancelled"))
+        self._cross_toplevel = top
+
+        canvas = tk.Canvas(top, bg="#000000")
+        canvas.pack()
+        self._cross_canvas = canvas
+        self._cross_photo: ImageTk.PhotoImage | None = None
+
+        def on_click(event):
+            state = self._cross_state
+            w, h = state.frame_size
+            if w > 0 and h > 0:
+                state.cursor = (int(np.clip(event.x, 0, w - 1)), int(np.clip(event.y, 0, h - 1)))
+            if len(state.points) < 2:
+                state.points.append(state.cursor)
+                if len(state.points) == 2:
+                    state.done = True
+
+        def on_right_click(event):
+            self._cross_state.points.clear()
+            self._cross_state.done = False
+
+        def on_motion(event):
+            state = self._cross_state
+            w, h = state.frame_size
+            if w > 0 and h > 0:
+                state.cursor = (int(np.clip(event.x, 0, w - 1)), int(np.clip(event.y, 0, h - 1)))
+
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Button-2>", on_right_click)  # macOS right-click
+        canvas.bind("<Button-3>", on_right_click)
+        canvas.bind("<Motion>", on_motion)
         self.message = "Cross window: click an arm TIP corner, then its inner ARMPIT corner"
 
-    def _close_cross_window(self) -> None:
+    def _close_cross_window(self, msg: str | None = None) -> None:
         self._cross_window_open = False
-        try:
-            cv2.destroyWindow(CROSS_WINDOW_NAME)
-        except cv2.error:
-            pass
+        if msg:
+            self.message = msg
+        if hasattr(self, "_cross_toplevel") and self._cross_toplevel is not None:
+            try:
+                self._cross_toplevel.destroy()
+            except tk.TclError:
+                pass
+            self._cross_toplevel = None
 
-    def _tick_cross_window(self, raw_frame: np.ndarray) -> None:
-        """Drive the zoomed cross-placement window for one frame."""
-        if not self._cross_window_open:
-            return
-
-        try:
-            if cv2.getWindowProperty(CROSS_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                self._close_cross_window()
-                self.message = "Cross placement cancelled"
-                return
-        except cv2.error:
-            self._close_cross_window()
-            self.message = "Cross placement cancelled"
-            return
-
+    def _render_cross_image(self, raw_frame: np.ndarray) -> np.ndarray | None:
+        """Render the cross-placement overlay and return the image, or None if warp unavailable."""
         # Show the top-down (warped) view, where the cross is rectified and pixels
         # map linearly to field cm.
         undistorted = self.pipeline.preprocessor.undistort(raw_frame)
@@ -409,7 +436,7 @@ class MainGui:
         if topdown is None:
             self.message = "No top-down warp — set field corners first"
             self._close_cross_window()
-            return
+            return None
 
         state = self._cross_state
         state.frame_size = (topdown.shape[1], topdown.shape[0])
@@ -440,7 +467,6 @@ class MainGui:
         for i, text in enumerate(help_lines):
             cv2.putText(view, text, (16, 28 + i * 26),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.imshow(CROSS_WINDOW_NAME, view)
 
         if state.done:
             tip_cm = self.pipeline.mapper.topdown_px_to_field_cm(state.points[0])
@@ -448,6 +474,8 @@ class MainGui:
             self._cross_spec = RedCrossSpec.from_tip_and_armpit(tip_cm, armpit_cm)
             self._save_cross()
             self._close_cross_window()
+
+        return view
 
     def _draw_cross_preview(self, image: np.ndarray, tip_px: tuple[int, int], armpit_px: tuple[int, int]) -> None:
         """Draw a cross preview in the window from two top-down pixel corners."""
@@ -558,70 +586,6 @@ class MainGui:
         else:
             self.message = "No robot calibration file"
 
-    def _canvas_width(self) -> int:
-        return self._left_w + self._right_w
-
-    def _canvas_height(self) -> int:
-        return self._panel_height() + STATUS_BAR_HEIGHT
-
-    def _panel_height(self) -> int:
-        return max(self._left_h, self._right_h)
-
-    def buttons(self) -> list[GuiButton]:
-        # Buttons sit on a row below the status text lines
-        y = self._panel_height() + 90
-        bw, bh = 95, 30
-        gap = 8
-        x0 = 20
-        rows = [
-            GuiButton("Set Corners", "set_corners", (x0, y, bw, bh)),
-            GuiButton("Set Cross", "set_cross", (x0 + (bw + gap), y, bw, bh)),
-            GuiButton("Calib Robot", "calib_robot", (x0 + 2 * (bw + gap), y, bw, bh)),
-            GuiButton("Guide Test", "guidance_test", (x0 + 3 * (bw + gap), y, bw, bh)),
-            GuiButton("Route View", "route_view", (x0 + 4 * (bw + gap), y, bw, bh)),
-            GuiButton("Manual", "manual", (x0 + 5 * (bw + gap), y, bw, bh)),
-            GuiButton("Auto", "auto", (x0 + 6 * (bw + gap), y, bw, bh)),
-            GuiButton("Stop", "stop", (x0 + 7 * (bw + gap), y, bw, bh)),
-            GuiButton("Quit", "quit", (x0 + 8 * (bw + gap), y, bw, bh)),
-        ]
-        # Second row: calibration controls (depends on sub-phase)
-        if self.mode == AppMode.CALIBRATE:
-            if self._calib_phase == CALIB_ALIGN:
-                rows.extend(self._calibration_menu_buttons(y + bh + gap))
-            elif self._calib_phase == CALIB_SPIN:
-                rows.append(self._calib_button(0, "Cancel", "calib_cancel", y + bh + gap))
-        return rows
-
-    @staticmethod
-    def _calib_button(index: int, label: str, action: str, y: int) -> GuiButton:
-        bw, gap, x0 = 64, 6, 20
-        return GuiButton(label, action, (x0 + index * (bw + gap), y, bw, 28))
-
-    def _calibration_menu_buttons(self, y: int) -> list[GuiButton]:
-        specs = [
-            ("Spin", "calib_spin"),
-            ("Front+", "front_inc"), ("Front-", "front_dec"),
-            ("Rear+", "rear_inc"), ("Rear-", "rear_dec"),
-            ("Width+", "width_inc"), ("Width-", "width_dec"),
-            ("Pipe+", "pipe_inc"), ("Pipe-", "pipe_dec"),
-            ("Head+", "head_inc"), ("Head-", "head_dec"),
-            ("Save", "calib_save"), ("Cancel", "calib_cancel"),
-        ]
-        return [
-            self._calib_button(i, label, action, y)
-            for i, (label, action) in enumerate(specs)
-        ]
-
-    def handle_mouse(self, event: int, x: int, y: int, _flags: int, _userdata) -> None:
-        self._mouse_pos = (x, y)
-        if event != cv2.EVENT_LBUTTONUP:
-            return
-        for button in self.buttons():
-            bx, by, bw, bh = button.rect
-            if bx <= x <= bx + bw and by <= y <= by + bh:
-                self._handle_button(button.action)
-                return
-
     _GEOMETRY_NUDGES = {
         "front_inc": ("robot_front_cm", GEOM_STEP_CM),
         "front_dec": ("robot_front_cm", -GEOM_STEP_CM),
@@ -698,33 +662,56 @@ class MainGui:
             return
         self._corner_state.clear()
         self._corner_window_open = True
-        cv2.namedWindow(CORNER_WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(CORNER_WINDOW_NAME, _corner_on_mouse, self._corner_state)
+
+        top = tk.Toplevel(self._root)
+        top.title(CORNER_WINDOW_NAME)
+        top.resizable(False, False)
+        top.protocol("WM_DELETE_WINDOW", lambda: self._close_corner_window("Corner selection cancelled"))
+        self._corner_toplevel = top
+
+        canvas = tk.Canvas(top, bg="#000000")
+        canvas.pack()
+        self._corner_canvas = canvas
+        self._corner_photo: ImageTk.PhotoImage | None = None
+
+        def on_click(event):
+            state = self._corner_state
+            w, h = state.frame_size
+            if w > 0 and h > 0:
+                state.cursor = (int(np.clip(event.x, 0, w - 1)), int(np.clip(event.y, 0, h - 1)))
+            if len(state.points) < 4:
+                state.points.append(state.cursor)
+                if len(state.points) == 4:
+                    state.done = True
+
+        def on_right_click(event):
+            self._corner_state.points.clear()
+
+        def on_motion(event):
+            state = self._corner_state
+            w, h = state.frame_size
+            if w > 0 and h > 0:
+                state.cursor = (int(np.clip(event.x, 0, w - 1)), int(np.clip(event.y, 0, h - 1)))
+
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Button-2>", on_right_click)  # macOS right-click
+        canvas.bind("<Button-3>", on_right_click)
+        canvas.bind("<Motion>", on_motion)
         self.message = "Corner selection window opened — click 4 inner field corners"
 
-    def _close_corner_window(self) -> None:
+    def _close_corner_window(self, msg: str | None = None) -> None:
         self._corner_window_open = False
-        try:
-            cv2.destroyWindow(CORNER_WINDOW_NAME)
-        except cv2.error:
-            pass
+        if msg:
+            self.message = msg
+        if hasattr(self, "_corner_toplevel") and self._corner_toplevel is not None:
+            try:
+                self._corner_toplevel.destroy()
+            except tk.TclError:
+                pass
+            self._corner_toplevel = None
 
-    def _tick_corner_window(self, raw_frame: np.ndarray) -> None:
-        """Drive the corner-selection window for one frame."""
-        if not self._corner_window_open:
-            return
-
-        # Check if window was closed by user
-        try:
-            if cv2.getWindowProperty(CORNER_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                self._close_corner_window()
-                self.message = "Corner selection cancelled"
-                return
-        except cv2.error:
-            self._close_corner_window()
-            self.message = "Corner selection cancelled"
-            return
-
+    def _render_corner_image(self, raw_frame: np.ndarray) -> np.ndarray | None:
+        """Render the corner-selection overlay and return the image, or None if not ready."""
         # Undistort (but do NOT warp) so the user sees the real camera with
         # barrel distortion removed — the same view the homography is built on.
         undistorted = self.pipeline.preprocessor.undistort(raw_frame)
@@ -733,7 +720,6 @@ class MainGui:
             self._corner_state.cursor = (undistorted.shape[1] // 2, undistorted.shape[0] // 2)
 
         view = _draw_corner_overlay(undistorted, self._corner_state)
-        cv2.imshow(CORNER_WINDOW_NAME, view)
 
         if self._corner_state.done:
             # Feed the 4 corners into the pipeline's HomographyCalibrator and persist
@@ -747,6 +733,8 @@ class MainGui:
             except OSError as exc:
                 self.message = f"Field corners set — warp active (save failed: {exc})"
             self._close_corner_window()
+
+        return view
 
     # ------------------------------------------------------------------
     # Guidance test (Stage 2 isolation testing)
@@ -1474,17 +1462,40 @@ class MainGui:
         self._route_view_open = True
         self._route_view_cache_id = 0
         self._route_view_cached_image = None
-        cv2.namedWindow(ROUTE_VIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.createTrackbar(
-            "Strategy", ROUTE_VIEW_WINDOW_NAME,
-            self._route_view_strategy_index, len(STRATEGY_OPTIONS) - 1,
-            lambda _v: None,
+
+        top = tk.Toplevel(self._root)
+        top.title(ROUTE_VIEW_WINDOW_NAME)
+        top.resizable(False, False)
+        top.protocol("WM_DELETE_WINDOW", self._close_route_view)
+        self._route_toplevel = top
+
+        self._route_label = tk.Label(top, bg="#000000")
+        self._route_label.pack()
+        self._route_photo: ImageTk.PhotoImage | None = None
+
+        # Strategy slider replaces cv2.createTrackbar
+        strategy_frame = tk.Frame(top, bg="#323232")
+        strategy_frame.pack(fill=tk.X, padx=4, pady=4)
+        tk.Label(strategy_frame, text="Strategy:", fg="#FFFFFF", bg="#323232",
+                 font=("Helvetica", 10)).pack(side=tk.LEFT)
+        self._strategy_scale = tk.Scale(
+            strategy_frame, from_=0, to=len(STRATEGY_OPTIONS) - 1,
+            orient=tk.HORIZONTAL, bg="#323232", fg="#FFFFFF",
+            highlightthickness=0, troughcolor="#5A5A5A",
+            command=self._on_strategy_change,
         )
-        cv2.resizeWindow(
-            ROUTE_VIEW_WINDOW_NAME,
-            self._right_w, self._right_h,
-        )
-        self.message = "Route View opened — use Strategy trackbar to switch"
+        self._strategy_scale.set(self._route_view_strategy_index)
+        self._strategy_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.message = "Route View opened — use Strategy slider to switch"
+
+    def _on_strategy_change(self, value: str) -> None:
+        """Callback for the route view strategy Scale widget."""
+        idx = int(value)
+        if 0 <= idx < len(STRATEGY_OPTIONS):
+            if idx != self._route_view_strategy_index:
+                self._route_view_strategy_index = idx
+                self._sync_route_view_strategy_to_planner()
 
     def _route_view_strategy_index_from_config(self) -> int:
         """Return the route-view option matching the configured route strategy."""
@@ -1501,35 +1512,15 @@ class MainGui:
     def _close_route_view(self) -> None:
         self._route_view_open = False
         self._route_view_cached_image = None
-        try:
-            cv2.destroyWindow(ROUTE_VIEW_WINDOW_NAME)
-        except cv2.error:
-            pass
+        if hasattr(self, "_route_toplevel") and self._route_toplevel is not None:
+            try:
+                self._route_toplevel.destroy()
+            except tk.TclError:
+                pass
+            self._route_toplevel = None
 
-    def _tick_route_view(self) -> None:
-        """Render one frame of the Route View window."""
-        if not self._route_view_open:
-            return
-
-        # Check if window was closed by user
-        try:
-            if cv2.getWindowProperty(ROUTE_VIEW_WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                self._close_route_view()
-                return
-        except cv2.error:
-            self._close_route_view()
-            return
-
-        # Read trackbar
-        tb = cv2.getTrackbarPos("Strategy", ROUTE_VIEW_WINDOW_NAME)
-        if 0 <= tb < len(STRATEGY_OPTIONS):
-            strategy_changed = tb != self._route_view_strategy_index
-            self._route_view_strategy_index = tb
-            if strategy_changed:
-                self._sync_route_view_strategy_to_planner()
-        else:
-            strategy_changed = False
-
+    def _render_route_image(self) -> np.ndarray:
+        """Render the route view image and return it as a numpy array."""
         result = self._last_result
         if result is None or result.occupancy_grid is None:
             placeholder = np.full(
@@ -1540,16 +1531,14 @@ class MainGui:
                 (20, self._right_h // 2),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA,
             )
-            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, placeholder)
-            return
+            return placeholder
 
         # Cache check: skip recompute if data unchanged and strategy unchanged
         cache_id = id(result)
         pose_id = id(self.robot_pose)
         combined_id = hash((cache_id, pose_id, self._route_view_strategy_index))
         if combined_id == self._route_view_cache_id and self._route_view_cached_image is not None:
-            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, self._route_view_cached_image)
-            return
+            return self._route_view_cached_image
         self._route_view_cache_id = combined_id
 
         # Build base schematic
@@ -1590,8 +1579,7 @@ class MainGui:
 
         if not targets:
             self._route_view_cached_image = image
-            cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
-            return
+            return image
 
         geometry_result = compute_pickup_geometry(
             field_w, field_h, result.occupancy_grid, targets, geometry,
@@ -1625,7 +1613,7 @@ class MainGui:
         draw_route_plan(image, strategy_result, geometry_result, mapper, self.config.field)
 
         self._route_view_cached_image = image
-        cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
+        return image
 
     # ------------------------------------------------------------------
     # Per-frame processing
@@ -1833,86 +1821,6 @@ class MainGui:
             manual_waypoints_cm=manual_wp,
         )
 
-    def _draw_status_bar(self, canvas: np.ndarray) -> None:
-        y0 = self._panel_height()
-        cv2.rectangle(canvas, (0, y0), (canvas.shape[1], canvas.shape[0]), (50, 50, 50), -1)
-
-        cal_state = self.pipeline.preprocessor.homography_calibrator.calibration_state.value
-        pose_text = "N/A"
-        if self.robot_pose is not None:
-            p = self.robot_pose
-            pose_text = f"({p.x_cm:.1f}, {p.y_cm:.1f}) heading {math.degrees(p.heading_rad):.1f} deg"
-
-        status = f"Cal: {cal_state} | Pose: {pose_text} | Mode: {self.mode.value} | FPS: {self.fps:.1f}"
-        cv2.putText(canvas, status, (20, y0 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
-
-        # Guidance status line (line 2) — only when in guidance test mode
-        if self.mode == AppMode.GUIDANCE_TEST:
-            gs = self._guidance_status.value if self._guidance_status else "—"
-            cursor = self._guidance.cursor if self._guidance else 0
-            wp_count = self._guidance.waypoint_count if self._guidance else 0
-            connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
-            if self._connecting:
-                connected = "Connecting..."
-            guidance_line = f"Guidance: {gs} | WP: {cursor}/{wp_count} | Route: {self._active_route_name} | {connected}"
-            cv2.putText(canvas, guidance_line, (20, y0 + 42),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, self.message, (20, y0 + 62),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
-        elif self.mode == AppMode.AUTO:
-            bs = self._brain_state.value if self._brain_state else "—"
-            step_cur = self._brain.step_cursor if self._brain else 0
-            step_tot = self._brain.step_count if self._brain else 0
-            connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
-            if self._connecting:
-                connected = "Connecting..."
-            timer_str = f"Time: {self._timer_elapsed:.1f}s"
-            brain_line = f"Brain: {bs} | Step: {step_cur}/{step_tot} | {connected} | {timer_str}"
-            cv2.putText(canvas, brain_line, (20, y0 + 42),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 220), 1, cv2.LINE_AA)
-            cv2.putText(canvas, self.message, (20, y0 + 62),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
-        elif self.mode == AppMode.CALIBRATE:
-            connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
-            if self._connecting:
-                connected = "Connecting..."
-            markers = ",".join(str(m) for m in sorted(self._latest_observations)) or "none"
-            calib_line = f"Calibrate: phase={self._calib_phase} | markers={markers} | {connected}"
-            cv2.putText(canvas, calib_line, (20, y0 + 42),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, self.message, (20, y0 + 62),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
-        else:
-            cv2.putText(canvas, self.message, (20, y0 + 42),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 180), 1, cv2.LINE_AA)
-
-        cv2.putText(canvas,
-                    "Keys: q/Esc quit | f corners | x cross | c calib | g guide | v route | a auto | s stop",
-                    (20, y0 + 78),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
-
-        # Buttons drawn on their own row below text (y computed in buttons())
-        for button in self.buttons():
-            bx, by, bw, bh = button.rect
-            is_active = (
-                (button.action == "set_corners" and self._corner_window_open)
-                or (button.action == "set_cross" and self._cross_window_open)
-                or (button.action == "route_view" and self._route_view_open)
-                or (button.action == "calib_robot" and self.mode == AppMode.CALIBRATE)
-                or (button.action == "guidance_test" and self.mode == AppMode.GUIDANCE_TEST)
-                or (button.action == "manual" and self.mode == AppMode.MANUAL)
-                or (button.action == "auto" and self.mode == AppMode.AUTO)
-                or (button.action == "stop" and self.mode == AppMode.IDLE)
-            )
-            fill_color = (80, 160, 80) if is_active else (90, 90, 90)
-            cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), fill_color, -1, cv2.LINE_AA)
-            cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (200, 200, 200), 1, cv2.LINE_AA)
-            (tw, _), _ = cv2.getTextSize(button.label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            tx = bx + (bw - tw) // 2
-            cv2.putText(canvas, button.label, (tx, by + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
     def _read_frame(self) -> np.ndarray | None:
         if self.static_image is not None:
             return self.static_image.copy()
@@ -1922,64 +1830,352 @@ class MainGui:
                 return frame
         return None
 
-    def tick(self) -> np.ndarray:
-        """Process one frame and return the composited canvas."""
-        frame_start = time.perf_counter()
+    # ------------------------------------------------------------------
+    # Vision thread
+    # ------------------------------------------------------------------
 
-        raw_frame = self._read_frame()
+    def _vision_loop(self) -> None:
+        """Daemon thread: capture → process → tick controllers → render panels."""
+        while not self.closed:
+            frame_start = time.perf_counter()
 
-        # Drive the corner-selection window if open
-        if self._corner_window_open and raw_frame is not None:
-            self._tick_corner_window(raw_frame)
+            # Snapshot params under lock so GUI button nudges are safe
+            with self._params_lock:
+                params_snapshot = dict(self.params) if self.params else {}
+            self.params = params_snapshot
 
-        # Drive the cross-placement window if open
-        if self._cross_window_open and raw_frame is not None:
-            self._tick_cross_window(raw_frame)
+            raw_frame = self._read_frame()
 
-        # Drive the route view window if open
+            # Render secondary window images (pure rendering, no cv2.imshow)
+            corner_img = None
+            cross_img = None
+            route_img = None
+            if self._corner_window_open and raw_frame is not None:
+                corner_img = self._render_corner_image(raw_frame)
+            if self._cross_window_open and raw_frame is not None:
+                cross_img = self._render_cross_image(raw_frame)
+            if self._route_view_open:
+                route_img = self._render_route_image()
+
+            if raw_frame is not None:
+                result = self._process_frame(raw_frame)
+                self._last_result = result
+                self._estimate_pose(result)
+                self._tick_guidance()
+                self._tick_crop_monitor()
+                self._tick_pickup_verifier()
+                self._tick_cross_tracker()
+                self._tick_brain()
+                self._tick_calibration()
+                left = self._build_left_panel(result)
+                right = self._build_right_panel(result)
+            else:
+                left = self.renderer.make_topdown_placeholder("No camera input")
+                if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
+                    left = cv2.resize(left, (self._left_w, self._left_h))
+                right = np.full((self._right_h, self._right_w, 3), (40, 100, 40), dtype=np.uint8)
+                cv2.putText(right, "No camera input", (30, self._right_h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
+
+            dt = time.perf_counter() - frame_start
+            self.fps = 1.0 / max(dt, 1e-6)
+
+            # Publish to shared state under lock
+            self._frame_seq += 1
+            with self._display_lock:
+                self._shared.left_panel = left
+                self._shared.right_panel = right
+                self._shared.corner_image = corner_img
+                self._shared.cross_image = cross_img
+                self._shared.route_image = route_img
+                self._shared.frame_seq = self._frame_seq
+                self._shared.fps = self.fps
+                self._shared.mode = self.mode.value
+                self._shared.message = self.message
+                self._shared.robot_pose = self.robot_pose
+                self._shared.brain_state = self._brain_state.value if self._brain_state else None
+                self._shared.guidance_status = self._guidance_status.value if self._guidance_status else None
+                self._shared.calibration_phase = self._calib_phase
+                self._shared.cal_state = self.pipeline.preprocessor.homography_calibrator.calibration_state.value
+                self._shared.connecting = self._connecting
+                self._shared.commander_connected = bool(self._commander and self._commander.sock)
+                self._shared.active_route_name = self._active_route_name
+                self._shared.guidance_cursor = self._guidance.cursor if self._guidance else 0
+                self._shared.guidance_wp_count = self._guidance.waypoint_count if self._guidance else 0
+                self._shared.brain_step_cursor = self._brain.step_cursor if self._brain else 0
+                self._shared.brain_step_count = self._brain.step_count if self._brain else 0
+                self._shared.timer_elapsed = self._timer_elapsed
+                self._shared.markers_visible = ",".join(str(m) for m in sorted(self._latest_observations)) or "none"
+                self._shared.corner_window_open = self._corner_window_open
+                self._shared.cross_window_open = self._cross_window_open
+                self._shared.route_view_open = self._route_view_open
+
+    def _params_write(self, key: str, value) -> None:
+        """Thread-safe write to a single params key (used by GUI thread button nudges)."""
+        with self._params_lock:
+            self.params[key] = value
+
+    def _params_read(self, key: str, default=None):
+        """Thread-safe read of a single params key."""
+        with self._params_lock:
+            return self.params.get(key, default)
+
+    # ------------------------------------------------------------------
+    # Tkinter UI construction (main thread)
+    # ------------------------------------------------------------------
+
+    def _build_tk_ui(self) -> None:
+        """Build the tkinter window and all widgets."""
+        self._root = tk.Tk()
+        self._root.title(WINDOW_NAME)
+        self._root.configure(bg="#323232")
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._root.bind("<Key>", self._on_key)
+
+        # PhotoImage references (prevent GC)
+        self._left_photo: ImageTk.PhotoImage | None = None
+        self._right_photo: ImageTk.PhotoImage | None = None
+
+        # --- Panel frame: left (camera) + right (schematic) ---
+        panel_frame = tk.Frame(self._root, bg="#000000")
+        panel_frame.pack(side=tk.TOP, fill=tk.BOTH)
+
+        self._left_label = tk.Label(panel_frame, bg="#000000")
+        self._left_label.pack(side=tk.LEFT, padx=0, pady=0)
+
+        self._right_label = tk.Label(panel_frame, bg="#000000")
+        self._right_label.pack(side=tk.LEFT, padx=0, pady=0)
+
+        # --- Status frame ---
+        status_frame = tk.Frame(self._root, bg="#323232")
+        status_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(4, 0))
+
+        self._status_line1 = tk.Label(
+            status_frame, text="", anchor=tk.W,
+            font=("Courier", 11), fg="#DCDCDC", bg="#323232",
+        )
+        self._status_line1.pack(fill=tk.X)
+
+        self._status_line2 = tk.Label(
+            status_frame, text="", anchor=tk.W,
+            font=("Courier", 11), fg="#B4DCFF", bg="#323232",
+        )
+        self._status_line2.pack(fill=tk.X)
+
+        self._message_label = tk.Label(
+            status_frame, text="Ready", anchor=tk.W,
+            font=("Courier", 11), fg="#B4DCB4", bg="#323232",
+        )
+        self._message_label.pack(fill=tk.X)
+
+        self._keys_label = tk.Label(
+            status_frame, anchor=tk.W,
+            text="Keys: q/Esc quit | f corners | x cross | c calib | g guide | v route | a auto | s stop",
+            font=("Courier", 9), fg="#A0A0A0", bg="#323232",
+        )
+        self._keys_label.pack(fill=tk.X)
+
+        # --- Button frame ---
+        # Using tk.Label widgets instead of tk.Button because macOS Aqua
+        # rendering ignores bg/fg on native buttons, making them unreadable.
+        button_frame = tk.Frame(self._root, bg="#323232")
+        button_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(4, 4))
+
+        button_specs = [
+            ("Set Corners", "set_corners"),
+            ("Set Cross", "set_cross"),
+            ("Calib Robot", "calib_robot"),
+            ("Guide Test", "guidance_test"),
+            ("Route View", "route_view"),
+            ("Manual", "manual"),
+            ("Auto", "auto"),
+            ("Stop", "stop"),
+            ("Quit", "quit"),
+        ]
+        self._tk_buttons: dict[str, tk.Label] = {}
+        for label, action in button_specs:
+            btn = tk.Label(
+                button_frame, text=label, width=10,
+                relief=tk.RAISED, bg="#5A5A5A", fg="#FFFFFF",
+                font=("Helvetica", 10), padx=4, pady=4, cursor="hand2",
+            )
+            btn.pack(side=tk.LEFT, padx=2, pady=2)
+            btn.bind("<Button-1>", lambda e, a=action: self._handle_button(a))
+            self._tk_buttons[action] = btn
+
+        # --- Calibration sub-buttons (hidden by default) ---
+        self._calib_frame = tk.Frame(self._root, bg="#323232")
+        # Not packed initially — shown/hidden dynamically
+
+        calib_specs = [
+            ("Spin", "calib_spin"),
+            ("Front+", "front_inc"), ("Front-", "front_dec"),
+            ("Rear+", "rear_inc"), ("Rear-", "rear_dec"),
+            ("Width+", "width_inc"), ("Width-", "width_dec"),
+            ("Pipe+", "pipe_inc"), ("Pipe-", "pipe_dec"),
+            ("Head+", "head_inc"), ("Head-", "head_dec"),
+            ("Save", "calib_save"), ("Cancel", "calib_cancel"),
+        ]
+        self._calib_buttons: dict[str, tk.Label] = {}
+        for label, action in calib_specs:
+            btn = tk.Label(
+                self._calib_frame, text=label, width=7,
+                relief=tk.RAISED, bg="#5A5A5A", fg="#FFFFFF",
+                font=("Helvetica", 9), padx=2, pady=3, cursor="hand2",
+            )
+            btn.pack(side=tk.LEFT, padx=1, pady=2)
+            btn.bind("<Button-1>", lambda e, a=action: self._handle_button(a))
+            self._calib_buttons[action] = btn
+
+        self._calib_frame_visible = False
+        self._last_gui_seq = -1
+
+    def _bgr_to_photo(self, bgr: np.ndarray) -> ImageTk.PhotoImage:
+        """Convert a BGR numpy array to a tkinter PhotoImage."""
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return ImageTk.PhotoImage(image=Image.fromarray(rgb))
+
+    # ------------------------------------------------------------------
+    # GUI tick (main thread, called via root.after)
+    # ------------------------------------------------------------------
+
+    def _gui_tick(self) -> None:
+        """Poll shared state and update tkinter widgets (~30 fps)."""
+        if self.closed:
+            self._root.quit()
+            return
+
+        # Read shared state snapshot under lock
+        with self._display_lock:
+            left = self._shared.left_panel
+            right = self._shared.right_panel
+            seq = self._shared.frame_seq
+            s_mode = self._shared.mode
+            s_message = self._shared.message
+            s_fps = self._shared.fps
+            s_robot_pose = self._shared.robot_pose
+            s_brain_state = self._shared.brain_state
+            s_guidance_status = self._shared.guidance_status
+            s_calib_phase = self._shared.calibration_phase
+            s_cal_state = self._shared.cal_state
+            s_connecting = self._shared.connecting
+            s_commander_connected = self._shared.commander_connected
+            s_active_route_name = self._shared.active_route_name
+            s_guidance_cursor = self._shared.guidance_cursor
+            s_guidance_wp_count = self._shared.guidance_wp_count
+            s_brain_step_cursor = self._shared.brain_step_cursor
+            s_brain_step_count = self._shared.brain_step_count
+            s_timer_elapsed = self._shared.timer_elapsed
+            s_markers_visible = self._shared.markers_visible
+            corner_img = self._shared.corner_image
+            cross_img = self._shared.cross_image
+            route_img = self._shared.route_image
+
+        # Update panel images if new frame available
+        if left is not None and right is not None and seq != self._last_gui_seq:
+            self._last_gui_seq = seq
+
+            self._left_photo = self._bgr_to_photo(left)
+            self._left_label.configure(image=self._left_photo)
+
+            self._right_photo = self._bgr_to_photo(right)
+            self._right_label.configure(image=self._right_photo)
+
+        # Update secondary window images
+        if self._corner_window_open and corner_img is not None and hasattr(self, "_corner_canvas"):
+            self._corner_photo = self._bgr_to_photo(corner_img)
+            h, w = corner_img.shape[:2]
+            self._corner_canvas.configure(width=w, height=h)
+            self._corner_canvas.delete("all")
+            self._corner_canvas.create_image(0, 0, anchor=tk.NW, image=self._corner_photo)
+
+        if self._cross_window_open and cross_img is not None and hasattr(self, "_cross_canvas"):
+            self._cross_photo = self._bgr_to_photo(cross_img)
+            h, w = cross_img.shape[:2]
+            self._cross_canvas.configure(width=w, height=h)
+            self._cross_canvas.delete("all")
+            self._cross_canvas.create_image(0, 0, anchor=tk.NW, image=self._cross_photo)
+
+        if self._route_view_open and route_img is not None and hasattr(self, "_route_label"):
+            self._route_photo = self._bgr_to_photo(route_img)
+            self._route_label.configure(image=self._route_photo)
+
+        # Update status labels
+        pose_text = "N/A"
+        if s_robot_pose is not None:
+            p = s_robot_pose
+            pose_text = f"({p.x_cm:.1f}, {p.y_cm:.1f}) heading {math.degrees(p.heading_rad):.1f} deg"
+        self._status_line1.configure(
+            text=f"Cal: {s_cal_state} | Pose: {pose_text} | Mode: {s_mode} | FPS: {s_fps:.1f}"
+        )
+
+        connected = "Connected" if s_commander_connected else "Disconnected"
+        if s_connecting:
+            connected = "Connecting..."
+
+        line2 = ""
+        line2_fg = "#B4DCFF"
+        if s_mode == AppMode.GUIDANCE_TEST.value:
+            gs = s_guidance_status or "\u2014"
+            line2 = f"Guidance: {gs} | WP: {s_guidance_cursor}/{s_guidance_wp_count} | Route: {s_active_route_name} | {connected}"
+        elif s_mode == AppMode.AUTO.value:
+            bs = s_brain_state or "\u2014"
+            timer_str = f"Time: {s_timer_elapsed:.1f}s"
+            line2 = f"Brain: {bs} | Step: {s_brain_step_cursor}/{s_brain_step_count} | {connected} | {timer_str}"
+            line2_fg = "#B4FFDC"
+        elif s_mode == AppMode.CALIBRATE.value:
+            line2 = f"Calibrate: phase={s_calib_phase} | markers={s_markers_visible} | {connected}"
+        self._status_line2.configure(text=line2, fg=line2_fg)
+        self._message_label.configure(text=s_message)
+
+        # Highlight active buttons
+        active_actions = set()
+        mode_enum = AppMode(s_mode) if s_mode in AppMode.__members__ else AppMode.IDLE
+        if self._corner_window_open:
+            active_actions.add("set_corners")
+        if self._cross_window_open:
+            active_actions.add("set_cross")
         if self._route_view_open:
-            self._tick_route_view()
+            active_actions.add("route_view")
+        if mode_enum == AppMode.CALIBRATE:
+            active_actions.add("calib_robot")
+        if mode_enum == AppMode.GUIDANCE_TEST:
+            active_actions.add("guidance_test")
+        if mode_enum == AppMode.MANUAL:
+            active_actions.add("manual")
+        if mode_enum == AppMode.AUTO:
+            active_actions.add("auto")
+        if mode_enum == AppMode.IDLE:
+            active_actions.add("stop")
 
-        if raw_frame is not None:
-            result = self._process_frame(raw_frame)
-            self._last_result = result
-            self._estimate_pose(result)
-            self._tick_guidance()
-            self._tick_crop_monitor()
-            self._tick_pickup_verifier()
-            self._tick_cross_tracker()
-            self._tick_brain()
-            self._tick_calibration()
-            left = self._build_left_panel(result)
-            right = self._build_right_panel(result)
-        else:
-            left = self.renderer.make_topdown_placeholder("No camera input")
-            if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
-                left = cv2.resize(left, (self._left_w, self._left_h))
-            right = np.full((self._right_h, self._right_w, 3), (40, 100, 40), dtype=np.uint8)
-            cv2.putText(right, "No camera input", (30, self._right_h // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
+        for action, btn in self._tk_buttons.items():
+            if action in active_actions:
+                btn.configure(bg="#50A050", relief=tk.SUNKEN)
+            else:
+                btn.configure(bg="#5A5A5A", relief=tk.RAISED)
 
-        # Top-align: pad the shorter panel at the bottom with black
-        target_h = max(left.shape[0], right.shape[0])
-        if left.shape[0] < target_h:
-            pad = np.zeros((target_h - left.shape[0], left.shape[1], 3), dtype=np.uint8)
-            left = np.vstack([left, pad])
-        if right.shape[0] < target_h:
-            pad = np.zeros((target_h - right.shape[0], right.shape[1], 3), dtype=np.uint8)
-            right = np.vstack([right, pad])
+        # Show/hide calibration sub-buttons
+        show_calib = (mode_enum == AppMode.CALIBRATE and s_calib_phase in (CALIB_ALIGN, CALIB_SPIN))
+        if show_calib and not self._calib_frame_visible:
+            self._calib_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
+            self._calib_frame_visible = True
+        elif not show_calib and self._calib_frame_visible:
+            self._calib_frame.pack_forget()
+            self._calib_frame_visible = False
 
-        panels = np.hstack([left, right])
-        canvas = np.zeros((panels.shape[0] + STATUS_BAR_HEIGHT, panels.shape[1], 3), dtype=np.uint8)
-        canvas[:panels.shape[0], :panels.shape[1]] = panels
-        self._draw_status_bar(canvas)
+        # Schedule next tick
+        self._root.after(33, self._gui_tick)
 
-        dt = time.perf_counter() - frame_start
-        self.fps = 1.0 / max(dt, 1e-6)
-        return canvas
+    # ------------------------------------------------------------------
+    # Keyboard handling (tkinter)
+    # ------------------------------------------------------------------
 
-    def handle_key(self, key: int) -> None:
-        if key in (27, ord("q")):
+    def _on_key(self, event: tk.Event) -> None:
+        """Handle keyboard events from tkinter."""
+        ch = event.char
+        keysym = event.keysym
+
+        if keysym == "Escape" or ch == "q":
             if self._corner_window_open:
                 self._close_corner_window()
                 self.message = "Corner selection cancelled"
@@ -1988,42 +2184,50 @@ class MainGui:
                 self.message = "Cross placement cancelled"
             else:
                 self.closed = True
-        elif key == ord("f"):
+        elif ch == "f":
             self._handle_button("set_corners")
-        elif key == ord("g"):
+        elif ch == "g":
             self._handle_button("guidance_test")
-        elif key == ord("r") and self._corner_window_open:
-            self._corner_state.points.clear()
-        elif key == ord("r") and self._cross_window_open:
-            self._cross_state.points.clear()
-            self._cross_state.done = False
-        elif key == ord("m"):
+        elif ch == "r":
+            if self._corner_window_open:
+                self._corner_state.points.clear()
+            elif self._cross_window_open:
+                self._cross_state.points.clear()
+                self._cross_state.done = False
+        elif ch == "m":
             self._handle_button("manual")
-        elif key == ord("a"):
+        elif ch == "a":
             self._handle_button("auto")
-        elif key == ord("c"):
+        elif ch == "c":
             self._handle_button("calib_robot")
-        elif key == ord("x"):
+        elif ch == "x":
             self._handle_button("set_cross")
-        elif key == ord("v"):
+        elif ch == "v":
             self._handle_button("route_view")
-        elif key == ord("s"):
+        elif ch == "s":
             self._handle_button("stop")
 
+    def _on_close(self) -> None:
+        """Handle window close button (X)."""
+        self.closed = True
+
+    # ------------------------------------------------------------------
+    # run() — tkinter main loop + vision thread
+    # ------------------------------------------------------------------
+
     def run(self) -> None:
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, self._canvas_width(), self._canvas_height())
-        cv2.setMouseCallback(WINDOW_NAME, self.handle_mouse)
+        self._build_tk_ui()
 
-        while not self.closed:
-            canvas = self.tick()
-            cv2.imshow(WINDOW_NAME, canvas)
-            key = cv2.waitKey(1) & 0xFF
-            if key != 255:
-                self.handle_key(key)
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                self.closed = True
+        # Start vision thread
+        vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
+        vision_thread.start()
 
+        self._root.after(33, self._gui_tick)
+        self._root.mainloop()  # blocks here
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        """Release resources on shutdown."""
         if self.mode == AppMode.CALIBRATE:
             self._cancel_calibration()
         self._disconnect_guidance()
@@ -2035,7 +2239,6 @@ class MainGui:
             self._close_route_view()
         if self.camera is not None:
             self.camera.release()
-        cv2.destroyWindow(WINDOW_NAME)
 
     def close(self) -> None:
         if self.mode == AppMode.CALIBRATE:

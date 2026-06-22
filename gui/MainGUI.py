@@ -964,6 +964,12 @@ class MainGui:
             dt_s = max(0.001, min(0.5, now - self._last_brain_time))
         self._last_brain_time = now
 
+        if self._timer_running and self._timer_start_time is not None:
+            self._timer_elapsed = now - self._timer_start_time
+
+            if self._brain_state and self._brain_state.name == "DONE":
+                self._timer_running = False
+
         prev_state = self._brain_state
         self._brain_state = self._brain.tick(self.robot_pose, dt_s)
 
@@ -1139,11 +1145,6 @@ class MainGui:
         ):
             self._replan_after_displacement()
 
-        if self._timer_running and self._timer_start_time is not None:
-            self._timer_elapsed = time.perf_counter() - self._timer_start_time
-
-            if self._brain_state and self._brain_state.name == "DONE":
-                self._timer_running = False
     # ------------------------------------------------------------------
     # Robot self-calibration (spin -> fit center -> align body -> save)
     # ------------------------------------------------------------------

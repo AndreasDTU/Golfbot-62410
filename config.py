@@ -318,7 +318,7 @@ class PlannerConfig:
 class ConnectionConfig:
     """Robot TCP connection and command dispatch."""
 
-    robot_ip: str = "ev3dev"
+    robot_ip: str = "172.20.10.8"
     robot_tcp_port: int = 5555
     robot_command_format: str = "LR {left:.1f} {right:.1f}"
     min_send_interval_s: float = 0.02

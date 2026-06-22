@@ -16,6 +16,9 @@ from enum import Enum
 
 import cv2
 import numpy as np
+import multiprocessing as mp
+from queue import Empty, Full
+
 
 from brain.brain import BrainController
 from brain.models import BrainState
@@ -273,6 +276,8 @@ class MainGui:
     message: str = "Ready"
     fps: float = 0.0
     closed: bool = False
+    control_queue: mp.Queue | None = None
+    frame_queue: mp.Queue | None = None
     _mouse_pos: tuple[int, int] = (0, 0)
     _corner_state: CornerSelectionState = field(default_factory=CornerSelectionState)
     _corner_window_open: bool = False
@@ -679,6 +684,62 @@ class MainGui:
                 self.message = "Stopped"
         elif action == "quit":
             self.closed = True
+
+    def _handle_remote_event(self, event: object) -> None:
+        if event is None:
+            self.closed = True
+            return
+        if not isinstance(event, tuple) or not event:
+            return
+
+        kind = event[0]
+        if kind == "close":
+            self.closed = True
+        elif kind == "key" and len(event) >= 2:
+            self.handle_key(int(event[1]))
+        elif kind == "mouse" and len(event) >= 5:
+            self.handle_mouse(int(event[1]), int(event[2]), int(event[3]), int(event[4]), None)
+
+    def _drain_remote_events(self) -> None:
+        if self.control_queue is None:
+            return
+        while True:
+            try:
+                event = self.control_queue.get_nowait()
+            except Empty:
+                return
+            self._handle_remote_event(event)
+
+    def _publish_canvas(self, canvas: np.ndarray) -> None:
+        if self.frame_queue is None:
+            return
+        try:
+            self.frame_queue.put_nowait(canvas)
+        except Full:
+            try:
+                self.frame_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self.frame_queue.put_nowait(canvas)
+            except Full:
+                pass
+
+    def _publish_shutdown(self) -> None:
+        if self.frame_queue is None:
+            return
+        try:
+            self.frame_queue.put_nowait(None)
+        except Full:
+            try:
+                self.frame_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self.frame_queue.put_nowait(None)
+            except Full:
+                pass
+
 
     def _block_during_calibration(self) -> bool:
         """Refuse mode switches while a calibration is in progress."""

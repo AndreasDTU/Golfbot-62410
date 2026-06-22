@@ -4,10 +4,11 @@ import sys
 import platform
 from pathlib import Path
 import numpy as np
-
+import multiprocessing as mp
 from config import AppConfig
 from gui.MainGUI import MainGui
 
+from control.robot.robot_service import RemoteRobotCommander, RobotControlService
 from perception.vision.pipeline import VisionPipeline
 from localization.localization import RobotPoseEstimator
 from config import AppConfig
@@ -36,11 +37,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Use a static image instead of live camera.")
     return parser
 
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    config = AppConfig.from_repo_root(REPO_ROOT)
-
+def _build_pipeline(config: AppConfig) -> tuple[VisionPipeline, RobotPoseEstimator, DebugRenderer]:
     try:
         pipeline = VisionPipeline(app_config=config, normalize_illumination=True)
     except Exception as exc:
@@ -52,13 +49,21 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     mapper = pipeline.mapper
-    pose_estimator = RobotPoseEstimator(
-        config.field, config.robot, mapper,
-        smoothing_config=config.pose_smoothing,
-        planner_config=config.planner,
-    )
-    renderer = DebugRenderer(config.field, config.windows, config.robot, config.drive, mapper, config.planner)
+    pose_estimator = RobotPoseEstimator(config.field, config.robot, mapper)
+    renderer = DebugRenderer(config.field, config.windows, config.robot, config.drive, mapper)
+    return pipeline, pose_estimator, renderer
 
+def _gui_process_main(
+    repo_root: str,
+    arg_values: dict[str, object],
+    request_queue,
+    response_queue,
+) -> None:
+    repo_root_path = Path(repo_root)
+    config = AppConfig.from_repo_root(repo_root_path)
+    pipeline, pose_estimator, renderer = _build_pipeline(config)
+
+    args = argparse.Namespace(**arg_values)
     camera = None
     static_image = None
 
@@ -66,11 +71,10 @@ def main(argv: list[str] | None = None) -> int:
         img = cv2.imread(args.image)
         if img is None:
             print(f"Could not read image: {args.image}", file=sys.stderr)
-            return 1
+            return
         static_image = img
     elif not args.no_camera:
         cam_index = args.camera if args.camera is not None else config.camera.camera_index
-        print("Camera " + str(cam_index))
         if platform.system() == "Windows":
             camera = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
         else:
@@ -78,18 +82,50 @@ def main(argv: list[str] | None = None) -> int:
 
         if not camera.isOpened():
             print(f"Could not open camera {cam_index}", file=sys.stderr)
-            return 1
+            return
+
+    def commander_factory(**kwargs):
+        return RemoteRobotCommander(request_queue, response_queue, **kwargs)
 
     gui = MainGui(
         config=config,
         pipeline=pipeline,
         pose_estimator=pose_estimator,
         renderer=renderer,
+        commander_factory=commander_factory,
         camera=camera,
         static_image=static_image,
     )
     gui.run()
-    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    config = AppConfig.from_repo_root(REPO_ROOT)
+    service = RobotControlService(config.connection, config.drive)
+    service.start()
+
+    try:
+        status = service.status_queue.get(timeout=15.0)
+        if status[0] == "error":
+            print(f"Warning: robot service failed to connect ({status[1]})", file=sys.stderr)
+    except Exception:
+        print("Warning: robot service did not report ready state", file=sys.stderr)
+
+    ctx = mp.get_context("spawn")
+    gui_proc = ctx.Process(
+        target=_gui_process_main,
+        args=(str(REPO_ROOT), vars(args), service.request_queue, service.response_queue),
+        daemon=False,
+    )
+    gui_proc.start()
+
+    try:
+        gui_proc.join()
+    finally:
+        service.close()
+
+    return gui_proc.exitcode or 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

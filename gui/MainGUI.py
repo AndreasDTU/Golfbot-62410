@@ -25,19 +25,23 @@ from control.spin_calibration import SpinController, SpinStatus
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
 from localization.models import RobotCalibrationRuntime, RobotMarkerObservation, RobotPose
-from path.pathfinding.models import HybridPose, PlannedBallTarget
-from path.pathfinding.planner import RoutePlanningFacade
+from path.models import HybridPose, PlannedBallTarget
+from path.planner import plan_route
 from path.pickup_geometry import compute_pickup_geometry
-from path.route_strategy import ObstacleGeometry, RoutePlannerInput
 from path.tools.pickup_visualizer import (
     STRATEGY_OPTIONS,
     draw_pickup_geometry,
     draw_route_plan,
-    draw_strategy_label,
 )
 from config import AppConfig, RouteStrategyName
 from perception.vision.debug import DebugRenderer
-from perception.vision.models import CalibrationState, RedCrossSpec, RedZoneDetection
+from perception.vision.cross_tracking import CrossAction, CrossCollisionTracker, relocalize_cross
+from perception.vision.models import (
+    CalibrationState,
+    RedCrossSpec,
+    RedZoneDetection,
+    SmoothedBallCoordinate,
+)
 from perception.vision.pipeline import VisionPipeline, VisionFrameResult
 
 
@@ -301,6 +305,14 @@ class MainGui:
     _needs_verification_snapshot: bool = False                  # triggers YOLO on next _process_frame
     _verification_snapshot_done: bool = False                   # set by _process_frame, consumed by verifier
 
+    # Timer state
+    _timer_start_time: float | None = None
+    _timer_elapsed: float = 0.0
+    _timer_running: bool = False
+
+    # Red-cross collision re-localization (fire-on-exit state machine)
+    _cross_tracker: CrossCollisionTracker = field(default_factory=CrossCollisionTracker)
+
     # Robot self-calibration state
     _calib_collector: RobotCalibrationCollector | None = None
     _calib_runtime: RobotCalibrationRuntime | None = None
@@ -337,11 +349,7 @@ class MainGui:
         self._load_field_corners()
         self._load_cross()
         self._route_view_strategy_index = self._route_view_strategy_index_from_config()
-        self._route_planner = RoutePlanningFacade(
-            field_config=self.config.field,
-            robot_config=self.config.robot,
-            planner_config=self.config.planner,
-        )
+        # Route planning uses the standalone plan_route() facade from path.pathfinding.
 
     def _load_field_corners(self) -> None:
         """Restore the saved manual top-down warp, if a corners file exists."""
@@ -795,6 +803,8 @@ class MainGui:
 
     def _disconnect_guidance(self) -> None:
         """Clear route, stop robot, close socket, reset guidance and brain state."""
+        self._timer_running = False
+
         if self._brain is not None:
             self._brain.reset()
         self._brain = None
@@ -809,6 +819,7 @@ class MainGui:
         self._attempted_pickups = 0
         self._needs_verification_snapshot = False
         self._verification_snapshot_done = False
+        self._cross_tracker.reset()
         if self._guidance is not None:
             self._guidance.clear_route()
         if self._commander is not None:
@@ -901,15 +912,18 @@ class MainGui:
                 ]
                 geometry = self.pose_estimator.robot_geometry_from_params(self.params)
 
-                plan = self._route_planner.plan_route(
+                unload_reach = geometry.rear_cm + geometry.unload_extension_cm
+                unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
+                plan = plan_route(
                     captured_grid,
                     targets,
                     start_pose,
                     geometry,
-                    cross_spec=self._cross_spec,
+                    self.config.field,
+                    unload_position=unload_pos,
                 )
 
-                if not plan.points:
+                if not plan.waypoints:
                     self.message = "Planner returned empty route"
                     commander.close()
                     return
@@ -919,7 +933,9 @@ class MainGui:
                 self._commander = commander
                 self._guidance = guidance
                 self._brain = brain
-                self._brain_route_points = plan.points
+                self._brain_route_points = [
+                    HybridPose(w.x_cm, w.y_cm, w.theta_rad) for w in plan.waypoints
+                ]
                 self._last_brain_time = None
                 self._brain_state = None
                 self._tracked_balls = list(captured_balls)
@@ -930,6 +946,10 @@ class MainGui:
                 )
                 self.mode = AppMode.AUTO
                 self.message = f"Brain running — {brain.step_count} steps"
+
+                self._timer_start_time = time.perf_counter()
+                self._timer_elapsed = 0.0
+                self._timer_running = True
             except Exception as exc:
                 self.message = f"Brain start failed: {exc}"
                 self._commander = None
@@ -953,6 +973,12 @@ class MainGui:
         else:
             dt_s = max(0.001, min(0.5, now - self._last_brain_time))
         self._last_brain_time = now
+
+        if self._timer_running and self._timer_start_time is not None:
+            self._timer_elapsed = now - self._timer_start_time
+
+            if self._brain_state and self._brain_state.name == "DONE":
+                self._timer_running = False
 
         prev_state = self._brain_state
         self._brain_state = self._brain.tick(self.robot_pose, dt_s)
@@ -1028,10 +1054,9 @@ class MainGui:
             if self._brain is not None:
                 self._brain.signal_ball_displaced()
 
-    def _replan_after_displacement(self) -> None:
-        """Replan route from the current snapshot after a ball-displaced error."""
-        result = self._last_result
-        targets = [
+    def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
+        """Build planner ball targets from smoothed field coordinates."""
+        return [
             PlannedBallTarget(
                 track_id=b.track_id,
                 label=b.label,
@@ -1039,28 +1064,58 @@ class MainGui:
                 y_cm=b.cm_y,
                 node_cm=self.pipeline.mapper.field_metric_cm_to_grid_node((b.cm_x, b.cm_y)),
             )
-            for b in result.smoothed_ball_coordinates
+            for b in balls
         ]
+
+    def _plan_and_load_route(self, targets: list[PlannedBallTarget]) -> bool:
+        """Plan from the current pose through ``targets`` and load it into the brain.
+
+        Returns True if a route was found and loaded.  Callers own their own
+        status messages and any post-replan bookkeeping.
+        """
+        result = self._last_result
+        if (
+            result is None
+            or result.occupancy_grid is None
+            or self.robot_pose is None
+            or self._brain is None
+        ):
+            return False
         start_pose = HybridPose(
             x_cm=self.robot_pose.x_cm,
             y_cm=self.robot_pose.y_cm,
             theta_rad=self.robot_pose.heading_rad,
         )
         geometry = self.pose_estimator.robot_geometry_from_params(self.params)
-        plan = self._route_planner.plan_route(
+        unload_reach = geometry.rear_cm + geometry.unload_extension_cm
+        unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
+        plan = plan_route(
             result.occupancy_grid,
             targets,
             start_pose,
             geometry,
-            cross_spec=self._cross_spec,
+            self.config.field,
+            unload_position=unload_pos,
         )
 
-        if not plan.points:
+        if not plan.waypoints:
+            self.message = "Rescan: no route found — stopping"
+            return False
+
+        self._brain.load_route(plan)
+        self._brain_route_points = [
+            HybridPose(w.x_cm, w.y_cm, w.theta_rad) for w in plan.waypoints
+        ]
+
+        return True
+
+    def _replan_after_displacement(self) -> None:
+        """Replan route from the current snapshot after a ball-displaced error."""
+        result = self._last_result
+        if not self._plan_and_load_route(self._ball_targets(result.smoothed_ball_coordinates)):
             self.message = "Rescan: no route found — stopping"
             return
 
-        self._brain.load_route(plan)
-        self._brain_route_points = plan.points
         self._tracked_balls = list(result.smoothed_ball_coordinates)
         self._crop_missing_counts = {}
         self._crop_hsv_ranges = (
@@ -1131,6 +1186,87 @@ class MainGui:
             self._replan_after_displacement()
 
     # ------------------------------------------------------------------
+    # Red-cross collision re-localization (fire-on-exit)
+    # ------------------------------------------------------------------
+
+    def _tick_cross_tracker(self) -> None:
+        """Re-localize the manual cross after the robot drives through its hitbox.
+
+        Cheap every frame: a single point-in-polygon test against the cross
+        inflated by half the robot width.  The state machine and the red
+        re-detection live in ``perception.vision.cross_tracking``; this only
+        wires them to the live robot pose, occupancy grid, and route planner.
+        """
+        if self.mode != AppMode.AUTO or self._brain is None:
+            return
+
+        # Deferred replan: the grid was rebuilt with the new cross last frame.
+        if self._cross_tracker.take_pending_replan():
+            self._replan_after_cross_move()
+            return
+
+        if self._cross_spec is None or self.robot_pose is None:
+            return
+
+        half_robot = 0.5 * float(self.params.get("robot_width_cm", 20.0))
+        in_buffer = self._cross_spec.contains_point(
+            (self.robot_pose.x_cm, self.robot_pose.y_cm), half_robot
+        )
+        if self._cross_tracker.step(in_buffer) is CrossAction.RELOCALIZE:
+            self._relocalize_cross()
+
+    def _relocalize_cross(self) -> None:
+        """Re-detect the displaced cross near its last pose and update the spec silently."""
+        result = self._last_result
+        spec = self._cross_spec
+        if result is None or spec is None or result.frame_for_detection is None:
+            return
+
+        new_spec = relocalize_cross(
+            result.frame_for_detection,
+            spec,
+            self.params,
+            self.pipeline.mapper,
+            self.pipeline.red_zone_detector,
+        )
+        if new_spec is None:
+            log_event("BRAIN", "cross re-localize: not found, keeping prior pose")
+            return
+
+        moved = math.hypot(
+            new_spec.center_cm[0] - spec.center_cm[0],
+            new_spec.center_cm[1] - spec.center_cm[1],
+        )
+        self._cross_spec = new_spec
+        self._save_cross()
+        # Defer the replan one frame so _process_frame rebuilds the occupancy
+        # grid with the cross in its new position first.
+        self._cross_tracker.request_replan()
+        log_event(
+            "BRAIN", "cross re-localized after collision",
+            moved_cm=round(moved, 1),
+            center=(round(new_spec.center_cm[0], 1), round(new_spec.center_cm[1], 1)),
+        )
+
+    def _replan_after_cross_move(self) -> None:
+        """Replan the active route around the updated cross, reusing known ball targets.
+
+        Unlike ``_replan_after_displacement`` this sources targets from the
+        already-tracked balls, because AUTO frames skip ball detection and so
+        carry no fresh ``smoothed_ball_coordinates``.
+        """
+        result = self._last_result
+        if result is None:
+            return
+        balls = self._tracked_balls if self._tracked_balls else list(result.smoothed_ball_coordinates)
+        if not self._plan_and_load_route(self._ball_targets(balls)):
+            self.message = "Cross moved — no route found"
+            log_event("BRAIN", "cross re-localized but no route found")
+            return
+        self.message = f"Cross moved — replanned ({self._brain.step_count} steps)"
+        log_event("BRAIN", "replanned after cross re-localization", steps=self._brain.step_count)
+
+    # ------------------------------------------------------------------
     # Robot self-calibration (spin -> fit center -> align body -> save)
     # ------------------------------------------------------------------
 
@@ -1162,7 +1298,7 @@ class MainGui:
                     self._commander = RobotCommander(drive_config=self.config.drive, auto_connect=True)
                 self._spin = SpinController(
                     self._commander,
-                    turn_speed_pct=self.config.drive.turn_speed_pct,
+                    turn_speed_pct=self.config.drive.turn_max_speed_pct,
                 )
                 self._calib_phase = CALIB_ALIGN
                 self.message = "Connected. Press Spin to find center, adjust body, then Save."
@@ -1358,13 +1494,8 @@ class MainGui:
         return 0
 
     def _sync_route_view_strategy_to_planner(self) -> None:
-        """Apply the selected route-view strategy to the shared planner facade."""
-        if not (0 <= self._route_view_strategy_index < len(STRATEGY_OPTIONS)):
-            return
-        option = STRATEGY_OPTIONS[self._route_view_strategy_index]
-        strategy_name = CONFIG_STRATEGY_BY_ROUTE_VIEW_KEY.get(option.key)
-        if strategy_name is not None:
-            self._route_planner.set_strategy(strategy_name)
+        """No-op: fit-based pathing uses a single strategy (NearestNeighborStrategy)."""
+        pass
 
     def _close_route_view(self) -> None:
         self._route_view_open = False
@@ -1457,7 +1588,6 @@ class MainGui:
         ]
 
         if not targets:
-            draw_strategy_label(image, STRATEGY_OPTIONS[self._route_view_strategy_index])
             self._route_view_cached_image = image
             cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
             return
@@ -1467,24 +1597,6 @@ class MainGui:
         )
         mapper = self.renderer.mapper
         draw_pickup_geometry(image, geometry_result, mapper, self.config.field)
-
-        # Build obstacle from cross spec
-        if self._cross_spec is not None:
-            cs = self._cross_spec
-            obstacle = ObstacleGeometry(
-                center_x_cm=cs.center_cm[0],
-                center_y_cm=cs.center_cm[1],
-                half_size_cm=cs.length_cm / 2.0,
-                half_arm_width_cm=cs.arm_width_cm / 2.0,
-                angle_rad=cs.angle_rad,
-            )
-        else:
-            obstacle = ObstacleGeometry(
-                center_x_cm=-1000.0,
-                center_y_cm=-1000.0,
-                half_size_cm=0.0,
-                half_arm_width_cm=0.0,
-            )
 
         # Build start pose and route
         if self.robot_pose is not None:
@@ -1496,26 +1608,20 @@ class MainGui:
         else:
             start_pose = HybridPose(x_cm=20.0, y_cm=20.0, theta_rad=0.0)
 
-        margin = self._route_planner.hybrid_config.unload_staging_margin_cm
-        unload_pose = self._route_planner.hybrid_planner.small_goal_unload_pose(geometry, margin)
-        unload_goal_cm = self._route_planner.hybrid_planner.small_goal_center_cm()
+        unload_reach = geometry.rear_cm + geometry.unload_extension_cm
+        unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
 
+        from path.route_strategy import NearestNeighborStrategy, RoutePlannerInput
         route_input = RoutePlannerInput(
             geometry_result=geometry_result,
-            obstacle=obstacle,
             start_pose=start_pose,
-            robot_radius_cm=geometry_result.ring_radius_cm,
             field_width_cm=field_w,
             field_height_cm=field_h,
-            unload_pose=unload_pose,
-            unload_goal_cm=unload_goal_cm,
+            unload_position=unload_pos,
         )
-
-        strategy_option = STRATEGY_OPTIONS[self._route_view_strategy_index]
-        strategy = strategy_option.create()
+        strategy = NearestNeighborStrategy()
         strategy_result = strategy.plan(route_input)
         draw_route_plan(image, strategy_result, geometry_result, mapper, self.config.field)
-        draw_strategy_label(image, strategy_option)
 
         self._route_view_cached_image = image
         cv2.imshow(ROUTE_VIEW_WINDOW_NAME, image)
@@ -1760,7 +1866,8 @@ class MainGui:
             connected = "Connected" if self._commander and self._commander.sock else "Disconnected"
             if self._connecting:
                 connected = "Connecting..."
-            brain_line = f"Brain: {bs} | Step: {step_cur}/{step_tot} | {connected}"
+            timer_str = f"Time: {self._timer_elapsed:.1f}s"
+            brain_line = f"Brain: {bs} | Step: {step_cur}/{step_tot} | {connected} | {timer_str}"
             cv2.putText(canvas, brain_line, (20, y0 + 42),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 220), 1, cv2.LINE_AA)
             cv2.putText(canvas, self.message, (20, y0 + 62),
@@ -1839,6 +1946,7 @@ class MainGui:
             self._tick_guidance()
             self._tick_crop_monitor()
             self._tick_pickup_verifier()
+            self._tick_cross_tracker()
             self._tick_brain()
             self._tick_calibration()
             left = self._build_left_panel(result)

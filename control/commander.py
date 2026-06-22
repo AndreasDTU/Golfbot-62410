@@ -10,9 +10,12 @@ from typing import Callable
 
 import numpy as np
 
-from control.telemetry import log_event
-from control.tools.drive_calibration import DriveCalibrationValues, parse_drive_calibration_response
 from config import ConnectionConfig, DriveConfig
+from control.telemetry import log_event
+from control.tools.drive_calibration import (
+    DriveCalibrationValues,
+    parse_drive_calibration_response,
+)
 
 
 class RobotCommander:
@@ -62,7 +65,6 @@ class RobotCommander:
         # Dispatch state
         self.command_format: str = conn.robot_command_format
         self.min_send_interval_s: float = conn.min_send_interval_s
-        self.max_speed_pct: float = config.max_speed_pct
         self.command_deadband_pct: float = conn.command_deadband_pct
         self.last_send_time: float = 0.0
         self.last_sent: tuple[float, float] | None = None
@@ -70,8 +72,18 @@ class RobotCommander:
         self.time_fn: Callable[[], float] = time_fn or time.perf_counter
 
         # Speed state
-        self._base_speed: float = 0.0
-        self._previous_speed: float = 0.0
+        self._current_speed: float = 0.0
+        self._total_distance: float = 0.0
+        self._total_turn_angle: float = 0.0
+        self._last_turn_angle: float = 0.0
+        self.max_speed_pct: float = 100.0
+
+        self._drive_acceleration: float = (
+            config.drive_max_speed_pct - config.drive_min_speed_pct
+        ) / (config.drive_acceleration_cm**2)
+        self._drive_deacceleration: float = (
+            config.drive_max_speed_pct - config.drive_min_speed_pct
+        ) / (config.drive_deacceleration_cm**2)
 
         # TCP connection
         self.sock: socket.socket | None = None
@@ -137,7 +149,9 @@ class RobotCommander:
             self.sock.sendall(payload)
             return self.sock.recv(1024).decode("utf-8").strip()
         except OSError as exc:
-            raise RuntimeError(f"EV3 command failed after send attempt ({cmd!r}): {exc}") from exc
+            raise RuntimeError(
+                f"EV3 command failed after send attempt ({cmd!r}): {exc}"
+            ) from exc
 
     def _send_nowait(self, cmd: str) -> bool:
         """Send a command without waiting for the reply (fire-and-forget).
@@ -172,7 +186,9 @@ class RobotCommander:
     # Dispatch internals (from TcpWheelDispatcher)
     # ------------------------------------------------------------------
 
-    def _send_wheel_speeds(self, left_pct: float, right_pct: float, force: bool = False) -> bool:
+    def _send_wheel_speeds(
+        self, left_pct: float, right_pct: float, force: bool = False
+    ) -> bool:
         """Validate, clip, rate-limit, and send one LR wheel command."""
         if not (math.isfinite(left_pct) and math.isfinite(right_pct)):
             self.last_error = "non-finite wheel command rejected"
@@ -209,91 +225,121 @@ class RobotCommander:
     # ------------------------------------------------------------------
 
     def _target_speed_for_distance(self, distance_cm: float) -> float:
-        """Profiled forward speed for a remaining distance."""
-        cfg = self._config
-        distance = max(0.0, abs(float(distance_cm)))
-        if distance <= cfg.creep_distance_cm:
-            return cfg.creep_speed_pct
-        if distance >= cfg.cruise_distance_cm:
-            return cfg.drive_speed_pct
-        span = max(1e-6, cfg.cruise_distance_cm - cfg.creep_distance_cm)
-        ratio = (distance - cfg.creep_distance_cm) / span
-        return cfg.creep_speed_pct + ratio * (cfg.drive_speed_pct - cfg.creep_speed_pct)
+        """
+        Profiled forward speed for a remaining distance.
+        Following this graph (quadratic acceleration): https://www.desmos.com/calculator/kwkobx9vta
+        """
 
-    def _target_speed_for_angle(self, degrees: float) -> float:
-        """Profiled rotation speed for a remaining angle."""
         cfg = self._config
-        angle = abs(float(degrees))
-        if angle <= cfg.turn_creep_angle_deg:
-            return cfg.turn_creep_speed_pct
-        if angle >= cfg.turn_cruise_angle_deg:
-            return cfg.turn_speed_pct
-        span = max(1e-6, cfg.turn_cruise_angle_deg - cfg.turn_creep_angle_deg)
-        ratio = (angle - cfg.turn_creep_angle_deg) / span
-        return cfg.turn_creep_speed_pct + ratio * (cfg.turn_speed_pct - cfg.turn_creep_speed_pct)
+        distance_left = max(0.0, abs(float(distance_cm))) - cfg.waypoint_arrival_cm
+        distance_driven = self._total_distance - distance_left
+        raw_speed = min(
+            cfg.drive_min_speed_pct
+            + self._drive_acceleration * (distance_driven * distance_driven),
+            cfg.drive_min_speed_pct
+            + self._drive_deacceleration * (distance_left * distance_left),
+        )
 
-    def _slew_limited_speed(self, desired_speed_pct: float, dt_s: float | None = None) -> float:
-        """Apply acceleration / deceleration limits to forward speed."""
-        desired = float(np.clip(desired_speed_pct, -self.max_speed_pct, self.max_speed_pct))
-        if dt_s is None or dt_s <= 1e-6:
-            self._previous_speed = desired
-            return desired
-        previous = self._previous_speed
-        accel_step = max(0.0, self._config.acceleration_limit_pct_per_s) * dt_s
-        decel_step = max(0.0, self._config.deceleration_limit_pct_per_s) * dt_s
-        limited = float(np.clip(desired, previous - decel_step, previous + accel_step))
-        self._previous_speed = limited
-        return limited
+        speed = max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
+        print(f"DRIVING speed={speed} dist_left={distance_left} dist_driven={distance_driven}")
+        return speed
+
+    def _target_speed_for_angle(self, total_angle: float) -> float:
+        """Flat turn speed proportional to the TOTAL commanded angle.
+
+            speed = clamp(total / turn_reference_angle_deg * turn_max_speed_pct,
+                          turn_min_speed_pct, turn_max_speed_pct)
+
+        Computed once per turn from the total angle and held flat for the whole
+        turn (no ramp). Larger turns spin faster; the coast compensation scales
+        with this speed so the robot lands on target.
+        """
+        cfg = self._config
+        raw = abs(float(total_angle)) / cfg.turn_reference_angle_deg * cfg.turn_max_speed_pct
+        return max(cfg.turn_min_speed_pct, min(cfg.turn_max_speed_pct, raw))
 
     # ------------------------------------------------------------------
     # Movement API (non-blocking, per-frame, all produce LR commands)
     # ------------------------------------------------------------------
 
     def turn(self, degrees: float) -> bool:
-        """In-place rotation.  *degrees* = remaining angle (positive = CCW)."""
+        """In-place rotation.  *degrees* = remaining angle (positive = CCW).
+
+        Speed is proportional to the total commanded angle (set once per new
+        turn). Stops early by an effective coast distance that scales linearly
+        with speed: turn_coast_deg is the coast at full speed and shrinks as the
+        turn speed drops.
+        """
         if not math.isfinite(degrees):
             self.last_error = "non-finite turn angle rejected"
             return False
-        speed = self._target_speed_for_angle(degrees)
+
+        # Detect start of a new turn: sign changed, or remaining angle jumped up by
+        # more than the noise threshold (guards against ArUco jitter resetting the
+        # profile on every noisy frame and pinning the robot at minimum speed).
+        abs_degrees = abs(degrees)
+        if (
+            self._last_turn_angle == 0
+            or abs_degrees > abs(self._last_turn_angle) + self._config.turn_reset_noise_deg
+            or ((degrees >= 0) != (self._last_turn_angle >= 0))
+        ):
+            self._total_turn_angle = abs_degrees
+        self._last_turn_angle = degrees
+
+        # Flat speed proportional to the total turn magnitude.
+        speed = self._target_speed_for_angle(self._total_turn_angle)
+
+        # Coast scales linearly with speed (physics: coast ∝ momentum ∝ speed).
+        effective_coast = (speed / self._config.turn_max_speed_pct) * self._config.turn_coast_deg
+
+        # Fire the early stop only when the total turn is large enough that
+        # coasting matters — small corrections turn normally to the target.
+        if (
+            effective_coast > 0
+            and abs_degrees <= effective_coast
+            and self._total_turn_angle > effective_coast
+        ):
+            self._total_turn_angle = 0
+            return self.stop()
+
         sign = 1.0 if degrees >= 0 else -1.0
-        self._base_speed = 0.0
+        self._current_speed = 0.0
         return self._send_wheel_speeds(-sign * speed, sign * speed)
 
-    def drive(self, cm: float, dt_s: float | None = None) -> bool:
-        """Straight-line drive.  *cm* = remaining distance (positive = forward)."""
+    def start_drive(self, cm: float, heading_error_deg: float = 0) -> bool:
+        """Initialize drive.  *cm* = remaining distance (positive = forward).
+
+        Optional *heading_error_deg* allows applying heading correction from the start.
+        """
         if not math.isfinite(cm):
             self.last_error = "non-finite drive distance rejected"
             return False
-        desired = self._target_speed_for_distance(cm)
-        if cm < 0:
-            desired = -desired
-        speed = self._slew_limited_speed(desired, dt_s)
-        self._base_speed = speed
-        return self._send_wheel_speeds(speed, speed)
 
-    def drive_adjusted(self, cm: float, dt_s: float | None, heading_error_deg: float) -> bool:
+        self._total_distance = abs(cm)
+        return self.drive_adjusted(cm, heading_error_deg)
+
+    def drive_adjusted(self, cm: float, heading_error_deg: float) -> bool:
         """Forward drive with simultaneous arc correction.
 
         Computes a single wheel-speed command combining profiled forward speed
-        (from *cm*) with heading correction (from *heading_error_deg*).  This
-        replaces the two-call ``drive() + adjust()`` pattern, which sent an
-        intermediate straight-drive command before the arc correction.
+        (from *cm*) with heading correction (from *heading_error_deg*).
         """
         if not (math.isfinite(cm) and math.isfinite(heading_error_deg)):
             self.last_error = "non-finite drive_adjusted argument rejected"
             return False
-        desired = self._target_speed_for_distance(cm)
+        speed = self._target_speed_for_distance(abs(cm))
         if cm < 0:
-            desired = -desired
-        speed = self._slew_limited_speed(desired, dt_s)
-        self._base_speed = speed
-        correction = heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
+            speed = -speed
+        self._current_speed = speed
+        correction = (
+            heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
+        )
         return self._send_wheel_speeds(speed - correction, speed + correction)
 
     def stop(self, force: bool = True) -> bool:
         """Zero wheel speeds and reset base speed."""
         self._base_speed = 0.0
-        self._previous_speed = 0.0
+        self._driving = False
         self._send("stop")
         return True
 
@@ -301,7 +347,9 @@ class RobotCommander:
     # Legacy steer() — bridge for guidance code until full migration
     # ------------------------------------------------------------------
 
-    def steer(self, base_speed_pct: float, turn_speed_pct: float, force: bool = False) -> bool:
+    def steer(
+        self, base_speed_pct: float, turn_speed_pct: float, force: bool = False
+    ) -> bool:
         """Differential steer compatible with the old MotorCommander API."""
         left = base_speed_pct - turn_speed_pct
         right = base_speed_pct + turn_speed_pct
@@ -349,5 +397,7 @@ class RobotCommander:
 
     def set_drive_calibration(self, axle_track_mm: float, mm_per_unit: float):
         values = DriveCalibrationValues(float(axle_track_mm), float(mm_per_unit))
-        response = self._send(f"drivecal set {values.axle_track_mm:.6f} {values.mm_per_unit:.6f}")
+        response = self._send(
+            f"drivecal set {values.axle_track_mm:.6f} {values.mm_per_unit:.6f}"
+        )
         return parse_drive_calibration_response(response)

@@ -9,8 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from path.pathfinding.models import HybridPose, PlannedBallTarget, RouteSegmentType
-from path.pathfinding.planner import HybridAStarPlanner
+from path.models import HybridPose, PlannedBallTarget, RouteSegmentType, tube_center_for_pose, rear_unload_point_for_pose
 from guidance.route_tracking import WheelCommandController, route_checkpoint_indices
 from localization.localization import RobotPoseEstimator
 from localization.models import (
@@ -66,24 +65,11 @@ class DebugRenderer:
         ).robot_geometry_from_params(params)
 
     def route_velocity_color_for_speed(self, speed_pct: float) -> tuple[int, int, int]:
-        """Map a profiled speed to a BGR heatmap color."""
-        creep = max(0.0, float(self.drive_config.creep_speed_pct))
-        cruise = max(creep + 1e-6, float(self.drive_config.drive_speed_pct))
-        ratio = float(np.clip((speed_pct - creep) / (cruise - creep), 0.0, 1.0))
-        if ratio < 0.5:
-            local = ratio / 0.5
-            red = 255
-            green = int(round(255 * local))
-        else:
-            local = (ratio - 0.5) / 0.5
-            red = int(round(255 * (1.0 - local)))
-            green = 255
-        return (0, green, red)
+        return (0, 255, 0)
 
     def route_velocity_color(self, distance_to_goal_cm: float) -> tuple[int, int, int]:
         """Map the one-sided distance profile to a BGR heatmap color."""
-        target = WheelCommandController.target_speed_for_distance(distance_to_goal_cm, self.drive_config)
-        return self.route_velocity_color_for_speed(target)
+        return (0, 255, 0)
 
     @staticmethod
     def cumulative_route_lengths(route_points_cm: list[HybridPose]) -> list[float]:
@@ -280,13 +266,11 @@ class DebugRenderer:
                 next_stop_cumulative = next((stop for stop in stop_cumulative if stop > start_cumulative + 1e-6), cumulative[-1])
             distance_since_stop = max(0.0, start_cumulative - previous_stop_cumulative)
             distance_to_stop = max(0.0, next_stop_cumulative - start_cumulative)
-            accel_speed = WheelCommandController.target_speed_for_distance(distance_since_stop, self.drive_config)
-            decel_speed = WheelCommandController.target_speed_for_distance(distance_to_stop, self.drive_config)
             cv2.line(
                 schematic,
                 start_px,
                 end_px,
-                self.route_velocity_color_for_speed(min(accel_speed, decel_speed)),
+                self.route_velocity_color_for_speed(0),
                 3,
                 cv2.LINE_AA,
             )
@@ -337,7 +321,7 @@ class DebugRenderer:
             pickup_index = self.closest_route_index(route_points, pickup_pose)
             if pickup_index is None:
                 continue
-            tube_x, tube_y = HybridAStarPlanner.tube_center_for_pose(pickup_pose, geometry)
+            tube_x, tube_y = tube_center_for_pose(pickup_pose, geometry)
             nearest_track_id: int | None = None
             nearest_distance_sq = pickup_match_threshold_sq
             for obstacle in ball_obstacles:
@@ -458,7 +442,7 @@ class DebugRenderer:
             pose.x_cm - forward[0] * geometry.rear_cm,
             pose.y_cm - forward[1] * geometry.rear_cm,
         )
-        unload_tip = HybridAStarPlanner.rear_unload_point_for_pose(pose, geometry)
+        unload_tip = rear_unload_point_for_pose(pose, geometry)
         return [
             (rear_center[0] + right[0] * half_width_cm, rear_center[1] + right[1] * half_width_cm),
             (rear_center[0] - right[0] * half_width_cm, rear_center[1] - right[1] * half_width_cm),
@@ -500,9 +484,9 @@ class DebugRenderer:
             else None
         )
         origin_px = self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
-        tube_px = self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.tube_center_for_pose(pose, geometry))
+        tube_px = self.mapper.field_metric_cm_to_schematic(tube_center_for_pose(pose, geometry))
         unload_tip_px = (
-            self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.rear_unload_point_for_pose(pose, geometry))
+            self.mapper.field_metric_cm_to_schematic(rear_unload_point_for_pose(pose, geometry))
             if show_unload
             else None
         )
@@ -536,7 +520,7 @@ class DebugRenderer:
         for index in range(0, len(route), max(1, interval)):
             pose = route[index]
             origin_px = self.mapper.field_metric_cm_to_schematic((pose.x_cm, pose.y_cm))
-            tube_px = self.mapper.field_metric_cm_to_schematic(HybridAStarPlanner.tube_center_for_pose(pose, geometry))
+            tube_px = self.mapper.field_metric_cm_to_schematic(tube_center_for_pose(pose, geometry))
             cv2.arrowedLine(schematic, origin_px, tube_px, (255, 255, 0), 2, cv2.LINE_AA, tipLength=0.35)
 
     def draw_loupe(self, frame: np.ndarray, cursor: tuple[int, int]) -> np.ndarray:
@@ -1032,6 +1016,7 @@ class DebugRenderer:
         num_intermediate_snapshots: int = 0,
         route_heading_marker_interval: int = 20,
         manual_waypoints_cm: list[tuple[float, float]] | None = None,
+        show_labels: bool = True,
     ) -> np.ndarray:
         """Draw a clean synthetic field view containing detected objects and route state."""
         source_height, source_width = frame_shape[:2]
@@ -1063,19 +1048,20 @@ class DebugRenderer:
             cv2.circle(schematic, center, radius, fill_color, -1, cv2.LINE_AA)
             cv2.circle(schematic, center, radius, edge_color, 1, cv2.LINE_AA)
 
-            label = f"X: {ball.cm_x:.1f}, Y: {ball.cm_y:.1f}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.45
-            thickness = 2
-            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-            text_x = center[0] + 10
-            if text_x + text_width > self.window.schematic_width_px - 1:
-                text_x = max(0, center[0] - 10 - text_width)
-            text_y = center[1] - 10
-            min_text_y = text_height + baseline
-            if text_y < min_text_y:
-                text_y = min(self.window.schematic_height_px - baseline - 1, center[1] + text_height + 10)
-            cv2.putText(schematic, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            if show_labels:
+                label = f"X: {ball.cm_x:.1f}, Y: {ball.cm_y:.1f}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.45
+                thickness = 2
+                (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                text_x = center[0] + 10
+                if text_x + text_width > self.window.schematic_width_px - 1:
+                    text_x = max(0, center[0] - 10 - text_width)
+                text_y = center[1] - 10
+                min_text_y = text_height + baseline
+                if text_y < min_text_y:
+                    text_y = min(self.window.schematic_height_px - baseline - 1, center[1] + text_height + 10)
+                cv2.putText(schematic, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
         geometry = self.robot_geometry_from_params(params)
         if route_points_cm:
@@ -1146,50 +1132,51 @@ class DebugRenderer:
             )
 
         self.draw_control_xte_on_schematic(schematic, robot_pose, drive_runtime)
-        camera_center_schematic = self.mapper.map_point_between_frames(
-            (int(round(camera_center_pixels[0])), int(round(camera_center_pixels[1]))),
-            (source_width, source_height),
-            self.window.schematic_size_px,
-        )
-        cv2.line(
-            schematic,
-            (camera_center_schematic[0] - 12, camera_center_schematic[1]),
-            (camera_center_schematic[0] + 12, camera_center_schematic[1]),
-            (255, 80, 80),
-            3,
-            cv2.LINE_AA,
-        )
-        cv2.line(
-            schematic,
-            (camera_center_schematic[0], camera_center_schematic[1] - 12),
-            (camera_center_schematic[0], camera_center_schematic[1] + 12),
-            (255, 80, 80),
-            3,
-            cv2.LINE_AA,
-        )
-        cv2.circle(schematic, camera_center_schematic, 7, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(
-            schematic,
-            f"Field {self.field.width_cm:.1f}x{self.field.height_cm:.1f} cm",
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            schematic,
-            "White balls: "
-            f"{sum(ball.label == 'white' for ball in smoothed_ball_coordinates)}  Orange balls: "
-            f"{sum(ball.label == 'orange' for ball in smoothed_ball_coordinates)}",
-            (20, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        if show_labels:
+            camera_center_schematic = self.mapper.map_point_between_frames(
+                (int(round(camera_center_pixels[0])), int(round(camera_center_pixels[1]))),
+                (source_width, source_height),
+                self.window.schematic_size_px,
+            )
+            cv2.line(
+                schematic,
+                (camera_center_schematic[0] - 12, camera_center_schematic[1]),
+                (camera_center_schematic[0] + 12, camera_center_schematic[1]),
+                (255, 80, 80),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.line(
+                schematic,
+                (camera_center_schematic[0], camera_center_schematic[1] - 12),
+                (camera_center_schematic[0], camera_center_schematic[1] + 12),
+                (255, 80, 80),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.circle(schematic, camera_center_schematic, 7, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                schematic,
+                f"Field {self.field.width_cm:.1f}x{self.field.height_cm:.1f} cm",
+                (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                schematic,
+                "White balls: "
+                f"{sum(ball.label == 'white' for ball in smoothed_ball_coordinates)}  Orange balls: "
+                f"{sum(ball.label == 'orange' for ball in smoothed_ball_coordinates)}",
+                (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
         if manual_waypoints_cm:
             self.draw_manual_waypoints(schematic, manual_waypoints_cm)
         return schematic

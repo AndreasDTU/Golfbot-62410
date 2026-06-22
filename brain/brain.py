@@ -15,7 +15,7 @@ from control.telemetry import log_event
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import normalize_angle
 from localization.models import RobotPose
-from path.pathfinding.models import RoutePlan
+from path.models import RoutePlan
 
 from brain.models import BrainIntent, BrainState, IntentAction, StepKind
 from brain.route_interpreter import interpret_route

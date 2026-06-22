@@ -19,8 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from path.pathfinding.models import HybridPose, PlannedBallTarget, RoutePlan
-from path.pathfinding.planner import RoutePlanningFacade
+from path.models import HybridPose, PlannedBallTarget, RoutePlan, WaypointKind
+from path.planner import plan_route
 from localization.models import RobotPose
 from config import AppConfig
 from perception.vision.debug import SchematicRenderer
@@ -34,7 +34,7 @@ RANDOM_BALL_COUNT = 11
 RANDOM_WHITE_BALL_COUNT = 10
 CENTER_CROSS_SIZE_CM = 20.0
 CENTER_CROSS_ARM_WIDTH_CM = 3.0
-RANDOM_BALL_MARGIN_CM = 8.0
+RANDOM_BALL_MARGIN_CM = 0.0
 RANDOM_BALL_MIN_SPACING_CM = 13.0
 
 
@@ -290,18 +290,62 @@ def is_inside_center_cross_clearance(
     return in_vertical or in_horizontal
 
 
-def random_ball_positions(state: SandboxState, count: int) -> list[tuple[float, float]]:
-    """Generate scattered ball positions with deterministic rejection sampling."""
+def _edge_biased_point(
+    rng: np.random.Generator,
+    width: float,
+    height: float,
+    min_offset_cm: float = 3.0,
+    max_offset_cm: float = 18.0,
+) -> tuple[float, float]:
+    """Sample a point near a random field wall.
+
+    Balls in competition are dropped into the center and roll toward the
+    nearest wall, so realistic placement concentrates near the perimeter.
+    """
+    # Pick a random wall weighted by wall length (top/bottom vs left/right).
+    perimeter = 2 * (width + height)
+    p = float(rng.uniform(0, perimeter))
+    offset = float(rng.uniform(min_offset_cm, max_offset_cm))
+
+    if p < width:
+        # Bottom wall
+        return float(rng.uniform(0, width)), offset
+    p -= width
+    if p < height:
+        # Right wall
+        return width - offset, float(rng.uniform(0, height))
+    p -= height
+    if p < width:
+        # Top wall
+        return float(rng.uniform(0, width)), height - offset
+    # Left wall
+    return offset, float(rng.uniform(0, height))
+
+
+def random_ball_positions(
+    state: SandboxState,
+    count: int,
+    edge_biased: bool = True,
+) -> list[tuple[float, float]]:
+    """Generate scattered ball positions with deterministic rejection sampling.
+
+    When ``edge_biased`` is True (default), balls are placed near the field
+    perimeter to simulate real competition conditions where balls roll toward
+    the nearest wall after being dropped in the center.
+    """
     field = state.config.field
     positions: list[tuple[float, float]] = []
     max_attempts = 2000
     for _attempt in range(max_attempts):
         if len(positions) >= count:
             break
-        point = (
-            float(state.rng.uniform(RANDOM_BALL_MARGIN_CM, field.width_cm - RANDOM_BALL_MARGIN_CM)),
-            float(state.rng.uniform(RANDOM_BALL_MARGIN_CM, field.height_cm - RANDOM_BALL_MARGIN_CM)),
-        )
+        if edge_biased:
+            point = _edge_biased_point(state.rng, field.width_cm, field.height_cm)
+        else:
+            point = (
+                float(state.rng.uniform(RANDOM_BALL_MARGIN_CM, field.width_cm - RANDOM_BALL_MARGIN_CM)),
+                float(state.rng.uniform(RANDOM_BALL_MARGIN_CM, field.height_cm - RANDOM_BALL_MARGIN_CM)),
+            )
         if is_inside_center_cross_clearance(state, point, RANDOM_BALL_MARGIN_CM):
             continue
         if any(
@@ -455,7 +499,7 @@ def ball_colors(label: str) -> tuple[tuple[int, int, int], tuple[int, int, int]]
 
 def draw_help_text(image: np.ndarray, state: SandboxState, route_plan: RoutePlan | None) -> None:
     """Draw compact sandbox controls and route status."""
-    route_points = 0 if route_plan is None else len(route_plan.points)
+    route_points = 0 if route_plan is None else len(route_plan.waypoints)
     lines = [
         "r: robot   t: add ball   o: obstacle   a: random scenario   1: white   2: orange   x/right-click: toggle   c: clear",
         (
@@ -475,7 +519,6 @@ def draw_help_text(image: np.ndarray, state: SandboxState, route_plan: RoutePlan
 def compute_route(
     state: SandboxState,
     occupancy_builder: OccupancyGridBuilder,
-    route_planner: RoutePlanningFacade,
 ) -> tuple[np.ndarray, RoutePlan | None]:
     """Build occupancy and route from the current manual scenario."""
     if state.planned_revision == state.scenario_revision and state.cached_grid is not None:
@@ -495,11 +538,16 @@ def compute_route(
         y_cm=state.robot_pose.y_cm,
         theta_rad=state.robot_pose.heading_rad,
     )
-    route_plan = route_planner.plan_route(
+    geometry = state.renderer.robot_geometry_from_params(None)
+    unload_reach = geometry.rear_cm + geometry.unload_extension_cm
+    unload_pos = (unload_reach + 2.0, state.config.field.height_cm * 0.5)
+    route_plan = plan_route(
         raw_grid,
         balls_as_planned_targets(state),
         start_pose,
-        state.renderer.robot_geometry_from_params(None),
+        geometry,
+        state.config.field,
+        unload_position=unload_pos,
     )
     state.cached_grid = raw_grid
     state.cached_route = route_plan
@@ -510,10 +558,27 @@ def compute_route(
 def render_sandbox(state: SandboxState, route_plan: RoutePlan | None) -> np.ndarray:
     """Render the full sandbox view using the existing schematic renderer."""
     red_zones = build_red_zones(state)
-    route_points = None if route_plan is None else route_plan.points
-    pickup_poses = None if route_plan is None else route_plan.pickup_poses
-    unload_pose = None if route_plan is None else route_plan.unload_pose
-    unload_goal = None if route_plan is None else route_plan.unload_goal_cm
+    if route_plan is not None:
+        route_points: list[HybridPose] | None = [
+            HybridPose(w.x_cm, w.y_cm, w.theta_rad) for w in route_plan.waypoints
+        ]
+        pickup_poses: list[HybridPose] | None = [
+            HybridPose(w.x_cm, w.y_cm, w.theta_rad)
+            for w in route_plan.waypoints if w.kind == WaypointKind.PICKUP
+        ]
+        unload_wp = next(
+            (w for w in route_plan.waypoints if w.kind == WaypointKind.UNLOAD), None,
+        )
+        unload_pose = (
+            HybridPose(unload_wp.x_cm, unload_wp.y_cm, unload_wp.theta_rad)
+            if unload_wp is not None else None
+        )
+        unload_goal = route_plan.unload_goal_cm
+    else:
+        route_points = None
+        pickup_poses = None
+        unload_pose = None
+        unload_goal = None
     camera_center = (
         state.config.windows.schematic_width_px * 0.5,
         state.config.windows.schematic_height_px * 0.5,
@@ -595,7 +660,7 @@ def main() -> int:
     config = AppConfig.from_repo_root(REPO_ROOT)
     renderer = SchematicRenderer(config.field, config.windows, config.robot)
     occupancy_builder = OccupancyGridBuilder(config.field, config.robot, renderer.mapper)
-    route_planner = RoutePlanningFacade(config.field, config.robot, config.planner)
+    # Route planning now uses the standalone plan_route() facade.
     state = SandboxState(config=config, renderer=renderer)
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -604,7 +669,7 @@ def main() -> int:
     create_random_scenario_button(state)
 
     while True:
-        _raw_grid, route_plan = compute_route(state, occupancy_builder, route_planner)
+        _raw_grid, route_plan = compute_route(state, occupancy_builder)
         cv2.imshow(WINDOW_NAME, render_sandbox(state, route_plan))
 
         key = cv2.waitKey(20) & 0xFF

@@ -8,11 +8,11 @@
     "front_cm": 3.8000000000000007,
     "heading_tuning_deg": 80.00000000000009,
     "heading_tuning_rad": 1.3962634015954651,
-    "rear_cm": 15.1,
+    "rear_cm": 16.0,
     "tube_forward_cm": 13.100000000000001,
     "tube_right_cm": 0.0,
     "unload_extension_cm": 25.0,
-    "width_cm": 19.5
+    "width_cm": 21.0
   },
   "marker_height_cm": 9.0,
   "marker_ids": [

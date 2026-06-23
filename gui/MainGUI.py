@@ -1184,12 +1184,14 @@ class MainGui:
         return True
 
     def _replan_after_displacement(self) -> None:
-        """Replan route from the current snapshot after a ball-displaced error."""
-        result = self._last_result
-        if not self._plan_and_load_route(self._ball_targets(result.smoothed_ball_coordinates)):
+        """Replan route from current tracked balls after a ball-displaced error."""
+        balls = self._tracked_balls if self._tracked_balls else []
+        if not balls:
+            self.message = "Rescan: no tracked balls — stopping"
+            return
+        if not self._plan_and_load_route(self._ball_targets(balls)):
             self.message = "Rescan: no route found — stopping"
             return
-        self._tracked_balls = list(result.smoothed_ball_coordinates)
         self.message = f"Replanned — {self._brain.step_count} steps"
         log_event("BRAIN", "replanned after rescan", steps=self._brain.step_count)
 

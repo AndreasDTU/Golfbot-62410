@@ -985,7 +985,10 @@ class MainGui:
             self._needs_verification_snapshot = True
             #Check for any missed pickups every 60 frames (2 seconds at 30fps) to catch any balls that were displaced before the crop monitor could detect them. Also gives a chance to catch any missed pickups after the brain is done, before stopping
         self._frames_elapsed += 1
-
+        if self._verification_snapshot_done:
+            self._verification_snapshot_done = False
+            self._verify_pickups()
+            return
 
         if (
             self._brain_state == BrainState.ERROR

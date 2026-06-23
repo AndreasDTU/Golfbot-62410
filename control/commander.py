@@ -362,9 +362,10 @@ class RobotCommander:
     def collector_travel_position(self) -> str:
         return self._send("collector_travel_position")
 
-    def pickup_assist(self) -> str:
+    def pickup_assist(self, retreat: bool = False) -> str:
         self._send("stop")
-        return self._send("pickup_assist")
+        cmd = "pickup_assist retreat" if retreat else "pickup_assist"
+        return self._send(cmd)
 
     def unload_full_cycle(self) -> str:
         self._send("stop")
@@ -382,8 +383,8 @@ class RobotCommander:
     def pipe_stop(self) -> str:
         return self._send("pipe stop")
 
-    def pickup(self) -> str:
-        return self.pickup_assist()
+    def pickup(self, retreat: bool = False) -> str:
+        return self.pickup_assist(retreat=retreat)
 
     def dropoff(self) -> str:
         return self.unload_full_cycle()

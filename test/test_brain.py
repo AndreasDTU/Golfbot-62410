@@ -27,6 +27,7 @@ class FakeCommander(RobotCommander):
         super().__init__(drive_config=drive_config, **kwargs)
         self.sent_commands: list[str] = []
         self.pickup_calls: int = 0
+        self.pickup_retreats: list[bool] = []
         self.dropoff_calls: int = 0
         self.pickup_should_fail: bool = False
         self.dropoff_should_fail: bool = False
@@ -39,8 +40,9 @@ class FakeCommander(RobotCommander):
         self.sent_commands.append(cmd)
         return True
 
-    def pickup(self) -> str:
+    def pickup(self, retreat: bool = False) -> str:
         self.pickup_calls += 1
+        self.pickup_retreats.append(retreat)
         if self.pickup_should_fail:
             raise RuntimeError("pickup actuator failed")
         return "ok"
@@ -284,6 +286,24 @@ class TestPickup:
         state = brain.tick(pose(20, 0, 0), DT)  # PICKUP -> blocks -> IDLE
         assert cmd.pickup_calls == 1
         assert state == BrainState.IDLE
+        # Unconstrained pickup must not request a retreat.
+        assert cmd.pickup_retreats == [False]
+
+    def test_pickup_constrained_requests_retreat(self):
+        """A pickup flagged obstacle_constrained drives pickup(retreat=True)."""
+        brain, _, cmd = make_brain()
+        plan = RoutePlan(waypoints=(
+            RouteWaypoint(20, 0, 0, WaypointKind.PICKUP,
+                          obstacle_constrained=True),
+        ))
+        brain.load_route(plan)
+
+        brain.tick(pose(0, 0, 0), DT)    # DRIVE
+        brain.tick(pose(20, 0, 0), DT)   # arrive -> IDLE
+        brain.tick(pose(20, 0, 0), DT)   # IDLE -> PICKUP (dispatch)
+        brain.tick(pose(20, 0, 0), DT)   # PICKUP -> blocks -> IDLE
+
+        assert cmd.pickup_retreats == [True]
 
     def test_pickup_failure_enters_error(self):
         brain, _, cmd = make_brain()

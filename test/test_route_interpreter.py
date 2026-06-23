@@ -19,9 +19,18 @@ def nav(x: float, y: float, theta_deg: float = 0.0) -> RouteWaypoint:
     return RouteWaypoint(x, y, math.radians(theta_deg), WaypointKind.NAVIGATE)
 
 
-def pickup(x: float, y: float, theta_deg: float = 0.0, ball_index: int = 0) -> RouteWaypoint:
+def pickup(
+    x: float,
+    y: float,
+    theta_deg: float = 0.0,
+    ball_index: int = 0,
+    obstacle_constrained: bool = False,
+) -> RouteWaypoint:
     """Shorthand PICKUP waypoint."""
-    return RouteWaypoint(x, y, math.radians(theta_deg), WaypointKind.PICKUP, ball_index)
+    return RouteWaypoint(
+        x, y, math.radians(theta_deg), WaypointKind.PICKUP, ball_index,
+        obstacle_constrained=obstacle_constrained,
+    )
 
 
 def unload(x: float, y: float, theta_deg: float = 0.0) -> RouteWaypoint:
@@ -70,6 +79,17 @@ class TestPickupSplitting:
         assert steps[0].kind == StepKind.DRIVE
         assert len(steps[0].waypoints) == 3  # 2 nav + 1 pickup position
         assert steps[1].kind == StepKind.PICKUP
+
+    def test_obstacle_constrained_flag_propagates_to_pickup_step(self):
+        plan = make_plan([
+            nav(0, 0),
+            pickup(10, 0),                              # unconstrained
+            nav(20, 0),
+            pickup(30, 0, obstacle_constrained=True),  # against cross/wall
+        ])
+        steps = interpret_route(plan)
+        pickups = [s for s in steps if s.kind == StepKind.PICKUP]
+        assert [s.obstacle_constrained for s in pickups] == [False, True]
 
     def test_two_pickups(self):
         plan = make_plan([nav(0, 0), pickup(10, 0), nav(20, 0), pickup(30, 0)])

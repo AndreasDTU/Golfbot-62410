@@ -1616,7 +1616,7 @@ class MainGui:
         unload_reach = geometry.rear_cm + geometry.unload_extension_cm
         unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
 
-        from path.route_strategy import NearestNeighborStrategy, RoutePlannerInput
+        from path.route_strategy import NearestNeighborStrategy, IntersectionPriorityStrategy, RoutePlannerInput
         route_input = RoutePlannerInput(
             geometry_result=geometry_result,
             start_pose=start_pose,
@@ -1624,7 +1624,7 @@ class MainGui:
             field_height_cm=field_h,
             unload_position=unload_pos,
         )
-        strategy = NearestNeighborStrategy()
+        strategy = IntersectionPriorityStrategy()
         strategy_result = strategy.plan(route_input)
         draw_route_plan(image, strategy_result, geometry_result, mapper, self.config.field)
 

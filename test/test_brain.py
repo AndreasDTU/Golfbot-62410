@@ -28,6 +28,8 @@ class FakeCommander(RobotCommander):
         self.sent_commands: list[str] = []
         self.pickup_calls: int = 0
         self.pickup_retreats: list[bool] = []
+        self.pickup_pre_lowereds: list[bool] = []
+        self.prelower_calls: int = 0
         self.dropoff_calls: int = 0
         self.pickup_should_fail: bool = False
         self.dropoff_should_fail: bool = False
@@ -40,9 +42,14 @@ class FakeCommander(RobotCommander):
         self.sent_commands.append(cmd)
         return True
 
-    def pickup(self, retreat: bool = False) -> str:
+    def pickup_prelower(self) -> str:
+        self.prelower_calls += 1
+        return "ok"
+
+    def pickup(self, retreat: bool = False, pre_lowered: bool = False) -> str:
         self.pickup_calls += 1
         self.pickup_retreats.append(retreat)
+        self.pickup_pre_lowereds.append(pre_lowered)
         if self.pickup_should_fail:
             raise RuntimeError("pickup actuator failed")
         return "ok"

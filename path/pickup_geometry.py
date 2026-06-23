@@ -147,6 +147,29 @@ def _field_cm_to_grid(
     return None
 
 
+def is_corner_ball(
+    x_cm: float,
+    y_cm: float,
+    field_width_cm: float,
+    field_height_cm: float,
+    margin_cm: float,
+) -> bool:
+    """True when a ball is tucked tightly into a field corner.
+
+    A corner ball sits within ``margin_cm`` of *both* a left/right wall and a
+    top/bottom wall, so the two perpendicular borders can physically guide a
+    pre-lowered pickup tube in.  ``margin_cm <= 0`` disables detection.
+
+    This is pure geometry on the ball position; it never changes where the
+    robot aims (the tube still targets the ball, not the corner).
+    """
+    if margin_cm <= 0.0:
+        return False
+    near_x_wall = min(x_cm, field_width_cm - x_cm) <= margin_cm
+    near_y_wall = min(y_cm, field_height_cm - y_cm) <= margin_cm
+    return near_x_wall and near_y_wall
+
+
 def _classify(
     obstacle_distance_cm: float,
     safe_radius_cm: float,

@@ -28,6 +28,10 @@ class FieldConfig:
     ball_height_cm: float = 2.0
     floor_height_cm: float = 0.0
     obstacle_margin_cm: float = 3.0
+    # A ball whose center is within this distance of two perpendicular walls
+    # (i.e. tucked in a corner) gets a pre-lowered tube on its final approach
+    # so the border guides the tube in.  0 disables corner pre-lowering.
+    corner_margin_cm: float = 8.0
 
     @property
     def grid_width_cm(self) -> int:

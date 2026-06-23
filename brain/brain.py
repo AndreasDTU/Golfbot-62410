@@ -199,6 +199,11 @@ class BrainController:
         step = self._steps[self._step_cursor]
 
         if step.kind == StepKind.DRIVE:
+            if step.pre_lower:
+                # Corner ball: drop the tube below the border before this
+                # final leg so the walls guide it in during the approach.
+                self._commander.pickup_prelower()
+                log_event("BRAIN", "PRELOWER", step=self._step_cursor)
             self._guidance.set_route(list(step.waypoints))
             target = step.waypoints[-1] if step.waypoints else None
             self._intent = BrainIntent(
@@ -267,7 +272,10 @@ class BrainController:
         """Execute blocking pickup and advance."""
         step = self._steps[self._step_cursor]
         try:
-            result = self._commander.pickup(retreat=step.obstacle_constrained)
+            result = self._commander.pickup(
+                retreat=step.obstacle_constrained,
+                pre_lowered=step.pre_lower,
+            )
             log_event(
                 "BRAIN", "PICKUP complete",
                 result=result, step=self._step_cursor,

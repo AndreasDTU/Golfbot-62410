@@ -58,8 +58,14 @@ class Step:
     *obstacle_constrained* is only meaningful for PICKUP steps: when True the
     ball sits against the cross/wall, so the executor backs away before raising
     the tube.
+
+    *pre_lower* marks the final approach of a corner ball.  On a DRIVE step it
+    tells the executor to pre-lower the tube before driving the leg (so the
+    border guides it in); on the following PICKUP step it tells the executor
+    the tube is already part-way down, so the capture stroke is shortened.
     """
 
     kind: StepKind
     waypoints: tuple[HybridPose, ...] = ()
     obstacle_constrained: bool = False
+    pre_lower: bool = False

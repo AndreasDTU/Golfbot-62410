@@ -41,18 +41,42 @@ def interpret_route(plan: RoutePlan) -> list[Step]:
             current_waypoints.append(pose)
 
         elif wp.kind == WaypointKind.PICKUP:
-            # Include the pickup position as the final drive destination
-            # so guidance drives all the way there.
-            current_waypoints.append(pose)
-            steps.append(Step(
-                kind=StepKind.DRIVE,
-                waypoints=tuple(current_waypoints),
-            ))
-            current_waypoints = []
-            steps.append(Step(
-                kind=StepKind.PICKUP,
-                obstacle_constrained=wp.obstacle_constrained,
-            ))
+            if wp.corner and current_waypoints:
+                # Corner ball: split the approach so the tube pre-lowers at the
+                # standoff, then creep the final leg with the tube already low
+                # and let the border guide it in.
+                #   DRIVE → standoff (tube up)
+                #   DRIVE → pickup   (pre_lower: drop tube before this leg)
+                #   PICKUP           (pre_lower: shortened capture stroke)
+                standoff = current_waypoints[-1]
+                steps.append(Step(
+                    kind=StepKind.DRIVE,
+                    waypoints=tuple(current_waypoints),
+                ))
+                steps.append(Step(
+                    kind=StepKind.DRIVE,
+                    waypoints=(standoff, pose),
+                    pre_lower=True,
+                ))
+                current_waypoints = []
+                steps.append(Step(
+                    kind=StepKind.PICKUP,
+                    obstacle_constrained=wp.obstacle_constrained,
+                    pre_lower=True,
+                ))
+            else:
+                # Include the pickup position as the final drive destination
+                # so guidance drives all the way there.
+                current_waypoints.append(pose)
+                steps.append(Step(
+                    kind=StepKind.DRIVE,
+                    waypoints=tuple(current_waypoints),
+                ))
+                current_waypoints = []
+                steps.append(Step(
+                    kind=StepKind.PICKUP,
+                    obstacle_constrained=wp.obstacle_constrained,
+                ))
 
         elif wp.kind == WaypointKind.UNLOAD:
             current_waypoints.append(pose)

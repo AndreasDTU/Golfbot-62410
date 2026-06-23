@@ -362,10 +362,22 @@ class RobotCommander:
     def collector_travel_position(self) -> str:
         return self._send("collector_travel_position")
 
-    def pickup_assist(self, retreat: bool = False) -> str:
+    def pickup_prelower(self) -> str:
+        """Pre-lower the tube a small amount before a corner ball's final
+        approach, so the border guides it in.  The remaining stroke is taken
+        by the following ``pickup_assist(pre_lowered=True)``."""
         self._send("stop")
-        cmd = "pickup_assist retreat" if retreat else "pickup_assist"
-        return self._send(cmd)
+        return self._send("pickup_prelower")
+
+    def pickup_assist(self, retreat: bool = False,
+                      pre_lowered: bool = False) -> str:
+        self._send("stop")
+        tokens = ["pickup_assist"]
+        if retreat:
+            tokens.append("retreat")
+        if pre_lowered:
+            tokens.append("prelowered")
+        return self._send(" ".join(tokens))
 
     def unload_full_cycle(self) -> str:
         self._send("stop")
@@ -383,8 +395,8 @@ class RobotCommander:
     def pipe_stop(self) -> str:
         return self._send("pipe stop")
 
-    def pickup(self, retreat: bool = False) -> str:
-        return self.pickup_assist(retreat=retreat)
+    def pickup(self, retreat: bool = False, pre_lowered: bool = False) -> str:
+        return self.pickup_assist(retreat=retreat, pre_lowered=pre_lowered)
 
     def dropoff(self) -> str:
         return self.unload_full_cycle()

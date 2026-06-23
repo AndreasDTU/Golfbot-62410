@@ -43,7 +43,11 @@ from path.models import (
     RouteWaypoint,
     WaypointKind,
 )
-from path.pickup_geometry import PickupCategory, compute_pickup_geometry
+from path.pickup_geometry import (
+    PickupCategory,
+    compute_pickup_geometry,
+    is_corner_ball,
+)
 from path.route_strategy import (
     IntersectionPriorityStrategy,
     RoutePlannerInput,
@@ -489,6 +493,7 @@ def compile_route(
     balls: list[PlannedBallTarget] | None = None,
     ball_radius_cm: float = 2.0,
     obstacle_margin_cm: float = 0.0,
+    corner_margin_cm: float = 0.0,
 ) -> RoutePlan:
     """Compile ordered route stops into a flat annotated waypoint sequence.
 
@@ -536,11 +541,14 @@ def compile_route(
     blocked_base = (distance_field < clearance).astype(np.uint8)
     collected: set[int] = set()
 
+    # Field width in cm (grid is 1 cm/px) for corner detection.
+    field_width_cm = float(distance_field.shape[1])
+
     # ----- Build target sequence from stops -----
     # Each target: (x_cm, y_cm, theta_rad, WaypointKind, ball_index | None,
-    #               obstacle_constrained)
+    #               obstacle_constrained, corner)
     targets: list[
-        tuple[float, float, float, WaypointKind, int | None, bool]
+        tuple[float, float, float, WaypointKind, int | None, bool, bool]
     ] = []
 
     for stop in strategy_result.stops:
@@ -548,25 +556,38 @@ def compile_route(
         # Non-SAFE pickups sit tight against the cross/wall, so the executor
         # must back away before raising the tube.
         constrained = cand.category != PickupCategory.SAFE
+        # Corner balls pre-lower the tube on the final approach so the border
+        # guides it in.  Only meaningful when a separate standoff→pickup leg
+        # exists (the pre-lower happens at the standoff, before that leg).
+        corner = False
+        if (balls is not None and stop.intermediate_node is not None
+                and 0 <= stop.ball_index < len(balls)):
+            b = balls[stop.ball_index]
+            corner = is_corner_ball(
+                b.x_cm, b.y_cm, field_width_cm, field_height_cm,
+                corner_margin_cm,
+            )
         if stop.intermediate_node is not None:
             inter = stop.intermediate_node
             # Constrained/in-between: intermediate → pickup → intermediate
             targets.append((inter.x_cm, inter.y_cm, inter.theta_rad,
-                            WaypointKind.NAVIGATE, None, False))
+                            WaypointKind.NAVIGATE, None, False, False))
             targets.append((cand.x_cm, cand.y_cm, cand.theta_rad,
-                            WaypointKind.PICKUP, stop.ball_index, constrained))
+                            WaypointKind.PICKUP, stop.ball_index, constrained,
+                            corner))
             targets.append((inter.x_cm, inter.y_cm, inter.theta_rad,
-                            WaypointKind.NAVIGATE, None, False))
+                            WaypointKind.NAVIGATE, None, False, False))
         else:
             # Safe: direct pickup
             targets.append((cand.x_cm, cand.y_cm, cand.theta_rad,
-                            WaypointKind.PICKUP, stop.ball_index, constrained))
+                            WaypointKind.PICKUP, stop.ball_index, constrained,
+                            corner))
 
     # Unload at end.
     unload_goal_cm: tuple[float, float] | None = None
     if strategy_result.unload_position is not None:
         ux, uy = strategy_result.unload_position
-        targets.append((ux, uy, 0.0, WaypointKind.UNLOAD, None, False))
+        targets.append((ux, uy, 0.0, WaypointKind.UNLOAD, None, False, False))
         unload_goal_cm = (0.0, uy)
 
     # ----- Connect targets with collision-free paths -----
@@ -582,7 +603,7 @@ def compile_route(
     ]
     cx, cy = start_pose.x_cm, start_pose.y_cm
 
-    for tx, ty, theta, kind, ball_idx, constrained in targets:
+    for tx, ty, theta, kind, ball_idx, constrained, corner in targets:
         # Build blocked grid for this segment (with uncollected balls).
         # Exclude the ball we're about to pick up — we're driving to it.
         if balls:
@@ -640,6 +661,7 @@ def compile_route(
             x_cm=tx, y_cm=ty, theta_rad=theta,
             kind=kind, ball_index=ball_idx,
             obstacle_constrained=constrained,
+            corner=corner,
         ))
 
         # Mark ball as collected after pickup.
@@ -727,6 +749,7 @@ def plan_route(
         strategy=compile_strategy,
         balls=balls,
         obstacle_margin_cm=obstacle_margin_cm,
+        corner_margin_cm=field_config.corner_margin_cm,
     )
 
     return plan

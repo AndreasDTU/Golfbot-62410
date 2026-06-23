@@ -71,6 +71,10 @@ class RouteWaypoint:
     # True when this pickup sits against the cross/wall, so the executor must
     # back away before raising the tube. Always False for NAVIGATE/UNLOAD.
     obstacle_constrained: bool = False
+    # True when this pickup is a ball tucked in a field corner: the executor
+    # pre-lowers the tube on the final approach so the border guides it in.
+    # Always False for NAVIGATE/UNLOAD.
+    corner: bool = False
 
 
 @dataclass(frozen=True)

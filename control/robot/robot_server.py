@@ -19,8 +19,12 @@ Commands:
   drivecal get            - Read active drive calibration constants
   drivecal set <axle_track_mm> <mm_per_unit> - Persist/apply drive calibration
   collector_travel_position - Raise collector to safe driving position
-  pickup_assist [retreat] - Small pipe jiggle for collecting one ball;
-                            'retreat' backs away before raising near obstacles
+  pickup_prelower         - Drop the tube a little before a corner ball's
+                            final approach so the border guides it in
+  pickup_assist [retreat] [prelowered] - Small pipe jiggle for collecting one
+                            ball; 'retreat' backs away before raising near
+                            obstacles; 'prelowered' shortens the capture stroke
+                            after a pickup_prelower
   unload_full_cycle       - Full pipe cycle for unloading balls at the goal
   pickup                  - Compatibility alias for pickup_assist
   dropoff                 - Compatibility alias for unload_full_cycle
@@ -76,6 +80,11 @@ COLLECTOR_TRAVEL_UNITS = 5
 COLLECTOR_TRAVEL_SPEED = 50
 PICKUP_ASSIST_UNITS = 25
 PICKUP_ASSIST_SPEED = 60
+# Pipe travel for a corner ball's pre-lower: drop the tube just below the field
+# border so the walls guide it in on the final approach. Must be < the full
+# PICKUP_ASSIST_UNITS stroke; the capture lowers only the remainder.
+PICKUP_PRELOWER_UNITS = 8
+PICKUP_PRELOWER_SPEED = 40
 # Drive units to back the tube clear of the cross/wall before raising it on a
 # constrained pickup. Tune for the smallest reverse that frees the tube.
 PICKUP_RETREAT_UNITS = 6
@@ -229,24 +238,49 @@ def cmd_collector_travel_position():
     )
     return "ok: collector travel position"
 
-def cmd_pickup_assist(retreat=False):
+def cmd_pickup_prelower():
+    """Drop the tube a small amount before a corner ball's final approach.
+
+    Lowers PICKUP_PRELOWER_UNITS so the tube sits below the field border and is
+    guided by the corner walls as the robot creeps in. The remaining stroke is
+    taken by cmd_pickup_assist(pre_lowered=True).
+    """
+    motor_deg = PICKUP_PRELOWER_UNITS * PIPE_DEGREES_PER_UNIT
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(PICKUP_PRELOWER_SPEED),
+        degrees=motor_deg,
+        brake=True,
+        block=True
+    )
+    return "ok: pipe pre-lowered"
+
+def cmd_pickup_assist(retreat=False, pre_lowered=False):
     """Small local pipe motion for collection; never a full unload stroke.
 
     When *retreat* is set the ball sits against the cross/wall: back the robot
     away after capturing but before raising, so the rising tube neither nudges
     the (very light) cross nor jams against the wall and skips gears.
+
+    When *pre_lowered* is set the tube was already lowered PICKUP_PRELOWER_UNITS
+    by cmd_pickup_prelower (corner ball), so the capture only lowers the
+    remainder.  The raise is always the full stroke back to travel position.
     """
     units = PICKUP_ASSIST_UNITS
     speed = PICKUP_ASSIST_SPEED
-    motor_deg = units * PIPE_DEGREES_PER_UNIT
+    raise_deg = units * PIPE_DEGREES_PER_UNIT
 
-    # Lower the tube over the ball (capture).
-    pipe_motor.on_for_degrees(
-        speed=SpeedPercent(speed),
-        degrees=motor_deg,
-        brake=True,
-        block=True
-    )
+    # Lower the tube the rest of the way over the ball (capture). If the tube
+    # was pre-lowered, subtract that travel so total depth still reaches units.
+    capture_units = units - (PICKUP_PRELOWER_UNITS if pre_lowered else 0)
+    if capture_units < 0:
+        capture_units = 0
+    if capture_units > 0:
+        pipe_motor.on_for_degrees(
+            speed=SpeedPercent(speed),
+            degrees=capture_units * PIPE_DEGREES_PER_UNIT,
+            brake=True,
+            block=True
+        )
 
     if retreat:
         retreat_deg = units_to_degrees(PICKUP_RETREAT_UNITS)
@@ -257,7 +291,7 @@ def cmd_pickup_assist(retreat=False):
     # Raise the tube back to travel position (now clear of the obstacle).
     pipe_motor.on_for_degrees(
         speed=SpeedPercent(-speed),
-        degrees=motor_deg,
+        degrees=raise_deg,
         brake=True,
         block=True
     )
@@ -349,9 +383,13 @@ def handle_command(cmd):
             return cmd_stop()
         elif action == "collector_travel_position":
             return cmd_collector_travel_position()
+        elif action == "pickup_prelower":
+            return cmd_pickup_prelower()
         elif action in ("pickup_assist", "pickup"):
-            retreat = len(parts) > 1 and parts[1].lower() == "retreat"
-            return cmd_pickup_assist(retreat=retreat)
+            flags = [p.lower() for p in parts[1:]]
+            retreat = "retreat" in flags
+            pre_lowered = "prelowered" in flags
+            return cmd_pickup_assist(retreat=retreat, pre_lowered=pre_lowered)
         elif action in ("unload_full_cycle", "dropoff"):
             return cmd_unload_full_cycle()
         else:

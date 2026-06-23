@@ -199,7 +199,10 @@ class BrainController:
         step = self._steps[self._step_cursor]
 
         if step.kind == StepKind.DRIVE:
-            self._guidance.set_route(list(step.waypoints))
+            self._guidance.set_route(
+                list(step.waypoints),
+                final_heading_tol=step.accept_heading_tol_rad,
+            )
             target = step.waypoints[-1] if step.waypoints else None
             self._intent = BrainIntent(
                 action=IntentAction.DRIVE,

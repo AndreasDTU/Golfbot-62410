@@ -27,7 +27,7 @@ from control.spin_calibration import SpinController, SpinStatus
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import RobotCalibrationCollector, RobotPoseEstimator
 from localization.models import RobotCalibrationRuntime, RobotMarkerObservation, RobotPose
-from path.models import HybridPose, PlannedBallTarget
+from path.models import HybridPose, PlannedBallTarget, tube_center_for_pose
 from path.planner import plan_route
 from path.pickup_geometry import compute_pickup_geometry
 from path.tools.pickup_visualizer import (
@@ -909,6 +909,7 @@ class MainGui:
                     self.config.field,
                     unload_position=unload_pos,
                     obstacle_margin_cm=self.config.field.obstacle_margin_cm,
+                    approach_turn_weight=self.config.planner.approach_turn_weight_cm_per_rad,
                 )
 
                 if not plan.waypoints:
@@ -1150,6 +1151,43 @@ class MainGui:
             for b in balls
         ]
 
+    def _committed_pickups(
+        self,
+        targets: list[PlannedBallTarget],
+        geometry,
+    ) -> dict[int, HybridPose]:
+        """Pickup poses the robot is too close to re-decide on a replan.
+
+        If the robot is actively driving to a pickup and already within the
+        commit radius of it, return ``{ball_index: pose}`` so the planner
+        reuses that exact approach instead of flipping to another side right
+        next to the ball.  ``ball_index`` indexes into *targets*.
+        """
+        if self._brain is None or self.robot_pose is None:
+            return {}
+        if self._brain.state is not BrainState.DRIVE:
+            return {}
+        target = self._brain.intent.target_pose
+        if target is None:
+            return {}
+        dist = math.hypot(
+            target.x_cm - self.robot_pose.x_cm,
+            target.y_cm - self.robot_pose.y_cm,
+        )
+        if dist > self.config.planner.pickup_commit_radius_cm:
+            return {}
+        # Match the committed pose to the ball it grabs (tube tip ~ ball centre)
+        # so a DRIVE toward an unload or a stale target never locks anything.
+        tube_x, tube_y = tube_center_for_pose(target, geometry)
+        best_idx, best_d = -1, float("inf")
+        for idx, ball in enumerate(targets):
+            d = math.hypot(ball.x_cm - tube_x, ball.y_cm - tube_y)
+            if d < best_d:
+                best_idx, best_d = idx, d
+        if best_idx < 0 or best_d > self.config.planner.ball_radius_cm + 3.0:
+            return {}
+        return {best_idx: target}
+
     def _plan_and_load_route(self, targets: list[PlannedBallTarget]) -> bool:
         """Plan from the current pose through ``targets`` and load it into the brain.
 
@@ -1180,6 +1218,8 @@ class MainGui:
             self.config.field,
             unload_position=unload_pos,
             obstacle_margin_cm=self.config.field.obstacle_margin_cm,
+            approach_turn_weight=self.config.planner.approach_turn_weight_cm_per_rad,
+            locked_pickups=self._committed_pickups(targets, geometry),
         )
 
         if not plan.waypoints:
@@ -1638,6 +1678,7 @@ class MainGui:
             field_width_cm=field_w,
             field_height_cm=field_h,
             unload_position=unload_pos,
+            approach_turn_weight=self.config.planner.approach_turn_weight_cm_per_rad,
         )
         strategy = IntersectionPriorityStrategy()
         strategy_result = strategy.plan(route_input)

@@ -17,7 +17,7 @@ Hard constraints
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -27,6 +27,7 @@ from path.pickup_geometry import (
     PickupCandidate,
     PickupCategory,
     PickupGeometryResult,
+    acceptance_tolerance_rad,
 )
 
 
@@ -40,6 +41,14 @@ class RoutePlannerInput:
 
     ``start_pose`` is the robot's current position -- the route always
     begins here (hard constraint).
+
+    ``approach_turn_weight`` biases SAFE candidate selection toward poses the
+    robot can drive straight into (see ``PlannerConfig``).
+
+    ``locked_pickups`` maps a ball index to a pickup pose the robot has
+    already committed to (it is close enough to be actively approaching it);
+    the strategy reuses that exact pose and visits the ball first instead of
+    re-selecting, so a replan cannot flip the approach side near the ball.
     """
 
     geometry_result: PickupGeometryResult
@@ -47,15 +56,23 @@ class RoutePlannerInput:
     field_width_cm: float
     field_height_cm: float
     unload_position: tuple[float, float] | None = None
+    approach_turn_weight: float = 0.0
+    locked_pickups: dict[int, HybridPose] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class RouteStop:
-    """One ball visit: chosen candidate plus optional intermediate node."""
+    """One ball visit: chosen candidate plus optional intermediate node.
+
+    ``accept_heading_tol_rad`` is the final-heading acceptance window for this
+    pickup: wide for open (SAFE) balls so the robot grabs without a hard final
+    pivot, ``None`` for constrained pickups (keep the tight default).
+    """
 
     candidate: PickupCandidate
     intermediate_node: HybridPose | None  # None if SAFE
     ball_index: int
+    accept_heading_tol_rad: float | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +106,70 @@ _CATEGORY_PREFERENCE = {
 
 # Maximum distance (cm) to walk backward looking for a safe intermediate.
 _MAX_INTERMEDIATE_SEARCH_CM = 30.0
+
+
+def _angle_diff(a: float, b: float) -> float:
+    """Smallest signed difference ``a - b`` wrapped to [-pi, pi)."""
+    return (a - b + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _safe_candidate_cost(
+    c: PickupCandidate,
+    cx: float,
+    cy: float,
+    turn_weight: float,
+) -> float:
+    """Approach cost for a SAFE candidate from position ``(cx, cy)``.
+
+    Combines travel distance with the final in-place turn the robot would
+    owe on arrival (the gap between the candidate heading and the bearing it
+    is driving in on).  Picking the minimum therefore prefers a pose the
+    robot can roll straight into rather than one it must pivot hard to face.
+    """
+    dx = c.x_cm - cx
+    dy = c.y_cm - cy
+    dist = math.hypot(dx, dy)
+    if turn_weight <= 0.0 or dist < 1e-6:
+        return dist
+    bearing = math.atan2(dy, dx)
+    turn = abs(_angle_diff(c.theta_rad, bearing))
+    return dist + turn_weight * turn
+
+
+def _make_stop(
+    geo: PickupGeometryResult,
+    candidate: PickupCandidate,
+    intermediate_node: HybridPose | None,
+    ball_idx: int,
+) -> RouteStop:
+    """Build a RouteStop, attaching its computed acceptance window."""
+    return RouteStop(
+        candidate=candidate,
+        intermediate_node=intermediate_node,
+        ball_index=ball_idx,
+        accept_heading_tol_rad=acceptance_tolerance_rad(geo, candidate),
+    )
+
+
+def _locked_stop(
+    geo: PickupGeometryResult,
+    ball_idx: int,
+    pose: HybridPose,
+) -> RouteStop:
+    """Synthesize a fixed SAFE stop from a committed pickup *pose*.
+
+    Used when the robot is already approaching this ball: the exact pose is
+    reused (no re-selection) so a replan cannot flip the approach side.
+    """
+    candidate = PickupCandidate(
+        x_cm=pose.x_cm,
+        y_cm=pose.y_cm,
+        theta_rad=pose.theta_rad,
+        category=PickupCategory.SAFE,
+        obstacle_distance_cm=geo.safe_radius_cm,
+        ball_index=ball_idx,
+    )
+    return _make_stop(geo, candidate, None, ball_idx)
 
 
 def _approach_distance(stop: RouteStop | None, cx: float, cy: float) -> float:
@@ -152,13 +233,16 @@ def _select_stops(
     geo: PickupGeometryResult,
     field_height_cm: float,
     approach_hint: tuple[float, float] | None = None,
+    turn_weight: float = 0.0,
+    locked_pickups: dict[int, HybridPose] | None = None,
 ) -> tuple[list[RouteStop | None], list[int]]:
     """Step 1: pick best candidate per ball, compute intermediates.
 
     When *approach_hint* is provided (typically the robot start position),
-    SAFE candidates are sorted so that those closer to the hint are
-    preferred.  This avoids selecting a pickup point on the far side of
-    the ball relative to the robot's approach direction.
+    SAFE candidates are sorted by approach cost -- travel distance plus the
+    final turn implied by *turn_weight* -- so the chosen pose is one the
+    robot can drive straight into rather than pivot hard to face.  Balls in
+    *locked_pickups* reuse their committed pose unchanged.
 
     Returns ``(per_ball, unreachable)`` where *per_ball[i]* is the
     chosen RouteStop for ball *i* (or None if unreachable) and
@@ -166,24 +250,33 @@ def _select_stops(
     """
     distance_field = geo.distance_field
     safe_radius = geo.safe_radius_cm
+    locked = locked_pickups or {}
 
     per_ball: list[RouteStop | None] = []
     unreachable: list[int] = []
 
     for ball_idx, ball_cands in enumerate(geo.balls):
+        if ball_idx in locked:
+            per_ball.append(_locked_stop(geo, ball_idx, locked[ball_idx]))
+            continue
         if not ball_cands.reachable:
             per_ball.append(None)
             unreachable.append(ball_idx)
             continue
 
-        # Sort candidates: category first, then prefer those closer to
-        # the approach hint (if given), otherwise fall back to obstacle
-        # clearance.
+        # Sort candidates: category first, then by approach cost relative to
+        # the hint (SAFE poses favour driving straight in), falling back to
+        # obstacle clearance when no hint is available.
         def _candidate_sort_key(c: PickupCandidate) -> tuple:
             pref = _CATEGORY_PREFERENCE[c.category]
             if approach_hint is not None:
-                dist = math.hypot(c.x_cm - approach_hint[0], c.y_cm - approach_hint[1])
-                return (pref, dist)
+                if c.category is PickupCategory.SAFE:
+                    return (pref, _safe_candidate_cost(
+                        c, approach_hint[0], approach_hint[1], turn_weight,
+                    ))
+                return (pref, math.hypot(
+                    c.x_cm - approach_hint[0], c.y_cm - approach_hint[1],
+                ))
             return (pref, -c.obstacle_distance_cm)
 
         sorted_candidates = sorted(ball_cands.candidates, key=_candidate_sort_key)
@@ -191,33 +284,21 @@ def _select_stops(
         stop: RouteStop | None = None
         for cand in sorted_candidates:
             if cand.category == PickupCategory.SAFE:
-                stop = RouteStop(
-                    candidate=cand,
-                    intermediate_node=None,
-                    ball_index=ball_idx,
-                )
+                stop = _make_stop(geo, cand, None, ball_idx)
                 break
             # Non-safe: need an intermediate node.
             intermediate = _find_intermediate_node(
                 cand, distance_field, safe_radius, field_height_cm,
             )
             if intermediate is not None:
-                stop = RouteStop(
-                    candidate=cand,
-                    intermediate_node=intermediate,
-                    ball_index=ball_idx,
-                )
+                stop = _make_stop(geo, cand, intermediate, ball_idx)
                 break
 
         if stop is None:
             # Fall back: use the best candidate even without intermediate.
             best = _pick_best_candidate(ball_cands.candidates)
             if best is not None:
-                stop = RouteStop(
-                    candidate=best,
-                    intermediate_node=None,
-                    ball_index=ball_idx,
-                )
+                stop = _make_stop(geo, best, None, ball_idx)
 
         if stop is None:
             per_ball.append(None)
@@ -374,12 +455,14 @@ def _best_stop_for_ball_from(
     field_height_cm: float,
     cx: float,
     cy: float,
+    turn_weight: float = 0.0,
 ) -> RouteStop | None:
     """Pick the best candidate for *ball_idx* given that the robot is at (cx, cy).
 
-    Among SAFE candidates, prefer the one whose pickup position is
-    closest to (cx, cy).  For non-SAFE, prefer obstacle clearance and
-    require a valid intermediate node.
+    Among SAFE candidates, prefer the one with the lowest approach cost --
+    travel distance plus the final turn implied by *turn_weight* -- so the
+    robot drives straight in instead of pivoting hard beside the ball.  For
+    non-SAFE, prefer obstacle clearance and require a valid intermediate node.
     """
     ball_cands = geo.balls[ball_idx]
     if not ball_cands.reachable:
@@ -397,10 +480,10 @@ def _best_stop_for_ball_from(
         else:
             non_safe.append(c)
 
-    # Among SAFE candidates, pick the closest to current position.
+    # Among SAFE candidates, pick the cheapest to drive straight into.
     if safe:
-        best_safe = min(safe, key=lambda c: math.hypot(c.x_cm - cx, c.y_cm - cy))
-        return RouteStop(candidate=best_safe, intermediate_node=None, ball_index=ball_idx)
+        best_safe = min(safe, key=lambda c: _safe_candidate_cost(c, cx, cy, turn_weight))
+        return _make_stop(geo, best_safe, None, ball_idx)
 
     # Non-safe: try in preference order (IN_BETWEEN before CONSTRAINED).
     non_safe.sort(key=lambda c: (
@@ -410,12 +493,12 @@ def _best_stop_for_ball_from(
     for cand in non_safe:
         intermediate = _find_intermediate_node(cand, distance_field, safe_radius, field_height_cm)
         if intermediate is not None:
-            return RouteStop(candidate=cand, intermediate_node=intermediate, ball_index=ball_idx)
+            return _make_stop(geo, cand, intermediate, ball_idx)
 
     # Fallback: best candidate without intermediate.
     best = _pick_best_candidate(ball_cands.candidates)
     if best is not None:
-        return RouteStop(candidate=best, intermediate_node=None, ball_index=ball_idx)
+        return _make_stop(geo, best, None, ball_idx)
     return None
 
 
@@ -438,6 +521,8 @@ def _intersection_priority_plan(
     """
     geo = inp.geometry_result
     cx, cy = inp.start_pose.x_cm, inp.start_pose.y_cm
+    turn_weight = inp.approach_turn_weight
+    locked = inp.locked_pickups or {}
 
     remaining = {
         i for i, bc in enumerate(geo.balls) if bc.reachable
@@ -445,13 +530,26 @@ def _intersection_priority_plan(
     unreachable = [i for i, bc in enumerate(geo.balls) if not bc.reachable]
     ordered: list[RouteStop] = []
 
+    # Committed pickups first: the robot is already approaching these, so
+    # reuse the exact pose and visit them before anything else.  This takes
+    # precedence over orange-first because we are seconds from the grab.
+    for ball_idx in sorted(locked, key=lambda i: _approach_distance(
+        _locked_stop(geo, i, locked[i]), cx, cy,
+    )):
+        if ball_idx not in remaining:
+            continue
+        stop = _locked_stop(geo, ball_idx, locked[ball_idx])
+        remaining.discard(ball_idx)
+        ordered.append(stop)
+        cx, cy = stop.candidate.x_cm, stop.candidate.y_cm
+
     # Orange-first constraint.
     orange_indices = [i for i in remaining if geo.balls[i].ball.label == "orange"]
     if orange_indices:
         # Pick the orange ball with the best candidate from start.
         best_orange: RouteStop | None = None
         for oi in orange_indices:
-            stop = _best_stop_for_ball_from(oi, geo, inp.field_height_cm, cx, cy)
+            stop = _best_stop_for_ball_from(oi, geo, inp.field_height_cm, cx, cy, turn_weight)
             if stop is None:
                 continue
             if best_orange is None or _approach_distance(stop, cx, cy) < _approach_distance(best_orange, cx, cy):
@@ -467,7 +565,7 @@ def _intersection_priority_plan(
         best_dist = math.inf
 
         for i in remaining:
-            stop = _best_stop_for_ball_from(i, geo, inp.field_height_cm, cx, cy)
+            stop = _best_stop_for_ball_from(i, geo, inp.field_height_cm, cx, cy, turn_weight)
             if stop is None:
                 continue
             d = _approach_distance(stop, cx, cy)
@@ -498,6 +596,7 @@ class NearestNeighborStrategy:
         hint = (inp.start_pose.x_cm, inp.start_pose.y_cm)
         per_ball, unreachable = _select_stops(
             inp.geometry_result, inp.field_height_cm, approach_hint=hint,
+            turn_weight=inp.approach_turn_weight, locked_pickups=inp.locked_pickups,
         )
         ordered = _nearest_neighbor_order(per_ball, inp)
         return RouteStrategyResult(
@@ -518,6 +617,7 @@ class TwoOptStrategy:
         hint = (inp.start_pose.x_cm, inp.start_pose.y_cm)
         per_ball, unreachable = _select_stops(
             inp.geometry_result, inp.field_height_cm, approach_hint=hint,
+            turn_weight=inp.approach_turn_weight, locked_pickups=inp.locked_pickups,
         )
         # Build initial ordering via nearest-neighbor.
         ordered = _nearest_neighbor_order(per_ball, inp)
@@ -541,6 +641,7 @@ class SweepStrategy:
         hint = (inp.start_pose.x_cm, inp.start_pose.y_cm)
         per_ball, unreachable = _select_stops(
             inp.geometry_result, inp.field_height_cm, approach_hint=hint,
+            turn_weight=inp.approach_turn_weight, locked_pickups=inp.locked_pickups,
         )
         ordered = _angular_sweep_order(per_ball, inp)
         return RouteStrategyResult(

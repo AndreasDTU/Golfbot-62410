@@ -71,6 +71,10 @@ class RouteWaypoint:
     # True when this pickup sits against the cross/wall, so the executor must
     # back away before raising the tube. Always False for NAVIGATE/UNLOAD.
     obstacle_constrained: bool = False
+    # Final-heading acceptance window (radians) for a PICKUP: wide for open
+    # balls so the robot grabs without a hard final pivot. None means "use the
+    # executor's tight default". Always None for NAVIGATE/UNLOAD.
+    accept_heading_tol_rad: float | None = None
 
 
 @dataclass(frozen=True)

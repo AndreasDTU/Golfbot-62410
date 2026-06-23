@@ -292,6 +292,17 @@ class PlannerConfig:
     flexible_standoff_max_cm: float = 15.0
     flexible_standoff_min_cm: float = 0.0
     flexible_standoff_heading_tolerance_rad: float = math.radians(10.0)
+    # Approach selection: how strongly to prefer a pickup pose whose heading
+    # already lines up with the robot's incoming travel direction, so it can
+    # drive straight in instead of pivoting hard next to the ball.  Cost is
+    # ``travel_cm + approach_turn_weight_cm_per_rad * final_turn_rad`` -- the
+    # weight is the centimetres of extra travel worth trading to erase one
+    # radian of final in-place turn.  Only affects SAFE candidates.
+    approach_turn_weight_cm_per_rad: float = 20.0
+    # Once the robot is within this distance of the pickup pose it is actively
+    # approaching, a replan keeps that ball's already-chosen approach pose
+    # instead of re-selecting (prevents last-second target flips near the ball).
+    pickup_commit_radius_cm: float = 12.0
     unload_staging_margin_cm: float = 2.0
     wall_pickup_prefer_distance_cm: float = 12.0
     wall_pickup_perpendicular_tolerance_rad: float = math.radians(35.0)

@@ -301,6 +301,44 @@ class TestFinalHeadingAlignment:
 
 
 # ---------------------------------------------------------------------------
+# Per-route acceptance window (open-ball pickups)
+# ---------------------------------------------------------------------------
+
+
+class TestAcceptanceWindowOverride:
+    def test_wide_window_accepts_without_pivot(self):
+        g, cmd = make_guidance()
+        # Open ball: wide acceptance window handed in with the route.
+        g.set_route([wp(50, 50, 90)], final_heading_tol=math.radians(20))
+        # Robot arrives 15° off heading -- inside the window -> ARRIVED, no turn.
+        status = g.tick(pose(50, 50, 75), DT)
+        assert status == GuidanceStatus.ARRIVED
+
+    def test_default_window_still_aligns(self):
+        g, cmd = make_guidance()
+        # No override -> tight default; 15° off must still align (RUNNING).
+        g.set_route([wp(50, 50, 90)])
+        status = g.tick(pose(50, 50, 75), DT)
+        assert status == GuidanceStatus.RUNNING
+
+    def test_override_never_tightens_below_default(self):
+        g, cmd = make_guidance()
+        # A sub-default override must not make the robot fight for fractions
+        # of a degree: the default floor still applies.
+        g.set_route([wp(50, 50, 90)], final_heading_tol=math.radians(0.1))
+        status = g.tick(pose(50, 50, 89), DT)  # 1° off, within default 1.5°
+        assert status == GuidanceStatus.ARRIVED
+
+    def test_window_resets_between_routes(self):
+        g, cmd = make_guidance()
+        g.set_route([wp(50, 50, 90)], final_heading_tol=math.radians(20))
+        # New route without override -> tight default again.
+        g.set_route([wp(50, 50, 90)])
+        status = g.tick(pose(50, 50, 75), DT)
+        assert status == GuidanceStatus.RUNNING
+
+
+# ---------------------------------------------------------------------------
 # Full route completion
 # ---------------------------------------------------------------------------
 

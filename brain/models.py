@@ -58,8 +58,14 @@ class Step:
     *obstacle_constrained* is only meaningful for PICKUP steps: when True the
     ball sits against the cross/wall, so the executor backs away before raising
     the tube.
+
+    *accept_heading_tol_rad* is only meaningful for DRIVE steps that end at a
+    pickup: the final-heading acceptance window handed to guidance so an open
+    ball is grabbed without a hard final pivot.  None means "use the tight
+    default".
     """
 
     kind: StepKind
     waypoints: tuple[HybridPose, ...] = ()
     obstacle_constrained: bool = False
+    accept_heading_tol_rad: float | None = None

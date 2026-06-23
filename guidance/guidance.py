@@ -65,6 +65,9 @@ class GuidanceController:
         self._cursor: int = 0
         self._route_complete: bool = False
         self._aligning: bool = False
+        # Per-route override for the final-heading acceptance window (radians).
+        # None falls back to the tight config default.
+        self._route_final_tol: float | None = None
 
         self._driving: bool = False
 
@@ -72,12 +75,23 @@ class GuidanceController:
     # Route management
     # ------------------------------------------------------------------
 
-    def set_route(self, waypoints: list[HybridPose]) -> None:
-        """Load a new route and reset the cursor to the first waypoint."""
+    def set_route(
+        self,
+        waypoints: list[HybridPose],
+        final_heading_tol: float | None = None,
+    ) -> None:
+        """Load a new route and reset the cursor to the first waypoint.
+
+        *final_heading_tol* optionally widens the final-waypoint heading
+        acceptance window (radians) for this route -- used so an open-ball
+        pickup is accepted without a hard final pivot.  None keeps the tight
+        config default.  The override never tightens below that default.
+        """
         self._waypoints = list(waypoints)
         self._cursor = 0
         self._route_complete = False
         self._aligning = False
+        self._route_final_tol = final_heading_tol
         log_event("GUIDANCE", "route set", waypoints=len(self._waypoints))
 
     def clear_route(self) -> None:
@@ -86,6 +100,7 @@ class GuidanceController:
         self._cursor = 0
         self._route_complete = False
         self._aligning = False
+        self._route_final_tol = None
         self._driving = False
         self._commander.stop()
         log_event("GUIDANCE", "route cleared")
@@ -207,11 +222,20 @@ class GuidanceController:
     # ------------------------------------------------------------------
 
     def _tick_align(self, pose: RobotPose) -> GuidanceStatus:
-        """Rotate in place to match the final waypoint's heading."""
+        """Rotate in place to match the final waypoint's heading.
+
+        The acceptance window is the route's per-pickup override when present
+        (wider for open balls so we accept without a hard pivot), but never
+        tighter than the config default.
+        """
         target = self._waypoints[self._cursor]
         heading_error = normalize_angle(target.theta_rad - pose.heading_rad)
 
-        if abs(heading_error) <= self._final_heading_tolerance_rad:
+        tolerance = self._final_heading_tolerance_rad
+        if self._route_final_tol is not None:
+            tolerance = max(tolerance, self._route_final_tol)
+
+        if abs(heading_error) <= tolerance:
             self._commander.stop()
             self._route_complete = True
             self._log("ARRIVED", heading_err=math.degrees(heading_error))

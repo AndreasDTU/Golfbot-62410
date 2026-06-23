@@ -42,11 +42,14 @@ def interpret_route(plan: RoutePlan) -> list[Step]:
 
         elif wp.kind == WaypointKind.PICKUP:
             # Include the pickup position as the final drive destination
-            # so guidance drives all the way there.
+            # so guidance drives all the way there.  Carry the pickup's
+            # acceptance window onto the DRIVE step so guidance can finish
+            # without a hard pivot on open balls.
             current_waypoints.append(pose)
             steps.append(Step(
                 kind=StepKind.DRIVE,
                 waypoints=tuple(current_waypoints),
+                accept_heading_tol_rad=wp.accept_heading_tol_rad,
             ))
             current_waypoints = []
             steps.append(Step(

@@ -85,6 +85,7 @@ class PickupGeometryResult:
     safe_radius_cm: float            # max(tank_turn, tube_sweep) — SAFE threshold
     constrained_radius_cm: float     # min(tank_turn, tube_sweep) — CONSTRAINED threshold
     ring_radius_cm: float
+    mouth_radius_cm: float           # tube-mouth capture radius (ball-grab tolerance)
 
 
 # ---------------------------------------------------------------------------
@@ -297,4 +298,44 @@ def compute_pickup_geometry(
         safe_radius_cm=safe_radius,
         constrained_radius_cm=constrained_radius,
         ring_radius_cm=R,
+        mouth_radius_cm=mouth_r,
     )
+
+
+# ---------------------------------------------------------------------------
+# Approach acceptance window
+# ---------------------------------------------------------------------------
+
+def capture_tolerance_rad(mouth_radius_cm: float, ring_radius_cm: float) -> float:
+    """Heading slack at which the tube mouth still swallows the ball.
+
+    If the robot is at the planned pickup position but its heading is off by
+    ``delta``, the tube tip swings off the ball centre by roughly
+    ``ring_radius * delta``.  Capture still succeeds while that offset stays
+    within the mouth radius, so the tolerance is ``asin(mouth / ring)``.
+    """
+    if ring_radius_cm <= 1e-6 or mouth_radius_cm <= 0.0:
+        return 0.0
+    return math.asin(min(1.0, mouth_radius_cm / ring_radius_cm))
+
+
+def acceptance_tolerance_rad(
+    geo: PickupGeometryResult,
+    candidate: PickupCandidate,
+) -> float | None:
+    """Per-pickup final-heading acceptance window for *candidate*.
+
+    Returns ``None`` for non-SAFE candidates: the caller keeps its tight
+    default tolerance and the careful straight-line approach.
+
+    For a SAFE candidate the window is the physical capture tolerance.  A
+    SAFE position has clearance above ``safe_radius`` (the larger of the
+    tank-turn and tube-sweep radii), so the body and tube stay clear through
+    *any* in-place rotation there -- the only thing that bounds how far the
+    arrival heading may deviate is whether the mouth still swallows the ball.
+    This stays strictly within the SAFE region while letting open balls be
+    grabbed without a hard final pivot.
+    """
+    if candidate.category is not PickupCategory.SAFE:
+        return None
+    return capture_tolerance_rad(geo.mouth_radius_cm, geo.ring_radius_cm)

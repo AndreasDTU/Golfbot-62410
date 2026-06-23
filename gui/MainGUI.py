@@ -1042,18 +1042,6 @@ class MainGui:
 
         needs_replan = False
 
-        if missing:
-            for b in missing:
-                log_event("RECONCILE", "ball missing — removed", track_id=b.track_id)
-            self._tracked_balls = [b for ti, b in enumerate(self._tracked_balls) if ti in matched_tracked]
-            needs_replan = True
-
-        if new_balls:
-            for b in new_balls:
-                log_event("RECONCILE", "new ball detected — added", x=round(b.cm_x, 1), y=round(b.cm_y, 1))
-            self._tracked_balls.extend(new_balls)
-            needs_replan = True
-
         if moved_balls:
             for old, new in moved_balls:
                 log_event("RECONCILE", "ball moved", track_id=old.track_id,
@@ -1069,6 +1057,18 @@ class MainGui:
                         fresh_lookup[ti] = fb
             for ti, fb in fresh_lookup.items():
                 self._tracked_balls[ti] = fb
+            needs_replan = True
+
+        if missing:
+            for b in missing:
+                log_event("RECONCILE", "ball missing — removed", track_id=b.track_id)
+            self._tracked_balls = [b for ti, b in enumerate(self._tracked_balls) if ti in matched_tracked]
+            needs_replan = True
+
+        if new_balls:
+            for b in new_balls:
+                log_event("RECONCILE", "new ball detected — added", x=round(b.cm_x, 1), y=round(b.cm_y, 1))
+            self._tracked_balls.extend(new_balls)
             needs_replan = True
 
         if needs_replan and self.robot_pose is not None:

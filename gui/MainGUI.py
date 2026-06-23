@@ -290,17 +290,9 @@ class MainGui:
     _brain_route_points: list[HybridPose] | None = None
     _last_result: VisionFrameResult | None = None
 
-    # Crop monitor state (ROI-based ball tracking during AUTO mode)
+    # Ball tracking state (YOLO reconciliation during AUTO mode)
     _tracked_balls: list | None = None        # fixed positions from last full scan
-    _crop_missing_counts: dict = field(default_factory=dict)  # track_id → consecutive missing frames
-    _last_crop_missing: set = field(default_factory=set)      # track_ids missing on last check
-    _crop_hsv_ranges: dict = field(default_factory=dict)      # track_id → (lower, upper) per-ball HSV
-
-    # Pickup verification state (deferred YOLO snapshot after cluster exit)
-    _pending_verification: list = field(default_factory=list)  # balls awaiting post-pickup YOLO check
-    _attempted_pickups: int = 0                                 # count of attempts in current pending batch
-    _needs_verification_snapshot: bool = False                  # triggers YOLO on next _process_frame
-    _verification_snapshot_done: bool = False                   # set by _process_frame, consumed by verifier
+    _yolo_ran_this_frame: bool = False        # set by _process_frame when YOLO runs
 
     # Timer state
     _timer_start_time: float | None = None
@@ -806,13 +798,7 @@ class MainGui:
         self._brain_route_points = None
         self._last_brain_time = None
         self._tracked_balls = None
-        self._crop_missing_counts = {}
-        self._last_crop_missing = set()
-        self._crop_hsv_ranges = {}
-        self._pending_verification = []
-        self._attempted_pickups = 0
-        self._needs_verification_snapshot = False
-        self._verification_snapshot_done = False
+        self._yolo_ran_this_frame = False
         self._cross_tracker.reset()
         if self._guidance is not None:
             self._guidance.clear_route()
@@ -934,11 +920,6 @@ class MainGui:
                 self._last_brain_time = None
                 self._brain_state = None
                 self._tracked_balls = list(captured_balls)
-                self._crop_missing_counts = {}
-                self._crop_hsv_ranges = (
-                    self.pipeline.calibrate_crop_hsv(captured_frame, captured_balls, self.params)
-                    if captured_frame is not None else {}
-                )
                 self.mode = AppMode.AUTO
                 self.message = f"Brain running — {brain.step_count} steps"
 
@@ -981,12 +962,7 @@ class MainGui:
         if prev_state == BrainState.PICKUP and self._brain_state == BrainState.IDLE:
             self._remove_collected_ball()
 
-        
-        if (self._frames_elapsed % 60 == 0): #Hvis ikke alle bolde er fundet til at starte med, så får de ikke et hsv crop.
-            self._needs_verification_snapshot = True
-            #Check for any missed pickups every 60 frames (2 seconds at 30fps) to catch any balls that were displaced before the crop monitor could detect them. Also gives a chance to catch any missed pickups after the brain is done, before stopping
         self._frames_elapsed += 1
-
 
         if (
             self._brain_state == BrainState.ERROR
@@ -998,18 +974,11 @@ class MainGui:
         ):
             self._replan_after_displacement()
 
-        if (self._brain_state == BrainState.DONE
-            and self._last_result.smoothed_ball_coordinates
-            and self._last_result.occupancy_grid is not None
-            and self.robot_pose is not None
-        ): #If brain is done, verify pickups to check for any missed balls before stopping
-            self._needs_verification_snapshot = True
-            #Could add a return 0 here to end program or someshit. Maybe move dance to here?
 
 
 
     def _remove_collected_ball(self) -> None:
-        """Stage the nearest tracked ball for deferred YOLO pickup verification."""
+        """Remove the nearest tracked ball after a successful pickup."""
         if not self._tracked_balls or self.robot_pose is None:
             return
         nearest = min(
@@ -1017,48 +986,100 @@ class MainGui:
             key=lambda b: (b.cm_x - self.robot_pose.x_cm) ** 2 + (b.cm_y - self.robot_pose.y_cm) ** 2,
         )
         self._tracked_balls = [b for b in self._tracked_balls if b.track_id != nearest.track_id]
-        self._crop_missing_counts.pop(nearest.track_id, None)
-        self._crop_hsv_ranges.pop(nearest.track_id, None)
-        self._pending_verification.append(nearest)
-        self._attempted_pickups += 1
-        log_event("BRAIN", "pickup staged for verification", track_id=nearest.track_id)
+        log_event("BRAIN", "pickup removed from tracking", track_id=nearest.track_id)
 
-    def _tick_crop_monitor(self) -> None:
-        """Check fixed HSV crops for each tracked ball; trigger rescan if any are missing."""
-        if self.mode != AppMode.AUTO or self._tracked_balls is None:
+    def _tick_reconciliation(self) -> None:
+        """Compare fresh YOLO detections against tracked balls; add/remove/replan as needed."""
+        if self.mode != AppMode.AUTO or not self._yolo_ran_this_frame:
+            return
+        self._yolo_ran_this_frame = False
+
+        if self._tracked_balls is None or self._brain is None:
             return
         result = self._last_result
-        if result is None or result.frame_for_detection is None:
+        if result is None:
             return
+        fresh = list(result.smoothed_ball_coordinates)
 
-        robot_xy = (
-            (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose is not None else None
-        )
+        robot_xy = (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose else None
         robot_radius = float(self.params.get("robot_radius_cm", 30.0))
-        threshold = int(self.params.get("crop_missing_threshold", 5))
 
-        missing_now = self.pipeline.check_ball_crops(
-            result.frame_for_detection,
-            self._tracked_balls,
-            self.params,
-            robot_pose_cm=robot_xy,
-            robot_radius_cm=robot_radius,
-            per_ball_hsv=self._crop_hsv_ranges,
-        )
-        self._last_crop_missing = missing_now
+        # Greedy nearest-neighbor matching (tracked → fresh)
+        MATCH_RADIUS_CM = 15.0
+        matched_tracked: set[int] = set()   # indices into _tracked_balls
+        matched_fresh: set[int] = set()     # indices into fresh
+        moved_balls: list[tuple] = []       # (tracked_ball, fresh_ball) pairs where position shifted >1cm
 
-        for ball in self._tracked_balls:
-            tid = ball.track_id
-            if tid in missing_now:
-                self._crop_missing_counts[tid] = self._crop_missing_counts.get(tid, 0) + 1
-            else:
-                self._crop_missing_counts[tid] = 0
+        for ti, tb in enumerate(self._tracked_balls):
+            best_dist = MATCH_RADIUS_CM
+            best_fi = -1
+            for fi, fb in enumerate(fresh):
+                if fi in matched_fresh:
+                    continue
+                dist = ((tb.cm_x - fb.cm_x) ** 2 + (tb.cm_y - fb.cm_y) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_fi = fi
+            if best_fi >= 0:
+                matched_tracked.add(ti)
+                matched_fresh.add(best_fi)
+                if best_dist > 1.0:
+                    moved_balls.append((tb, fresh[best_fi]))
 
-        if any(c >= threshold for c in self._crop_missing_counts.values()):
-            self._tracked_balls = None
-            self._crop_missing_counts = {}
-            if self._brain is not None:
-                self._brain.signal_ball_displaced()
+        # Missing balls: tracked but not matched (skip if under robot)
+        missing = []
+        for ti, tb in enumerate(self._tracked_balls):
+            if ti in matched_tracked:
+                continue
+            if robot_xy is not None:
+                dist_to_robot = ((tb.cm_x - robot_xy[0]) ** 2 + (tb.cm_y - robot_xy[1]) ** 2) ** 0.5
+                if dist_to_robot < robot_radius:
+                    continue  # under robot — don't remove
+            missing.append(tb)
+
+        # New balls: fresh but not matched to any tracked ball
+        new_balls = [fresh[fi] for fi in range(len(fresh)) if fi not in matched_fresh]
+
+        needs_replan = False
+
+        if missing:
+            for b in missing:
+                log_event("RECONCILE", "ball missing — removed", track_id=b.track_id)
+            self._tracked_balls = [b for ti, b in enumerate(self._tracked_balls) if ti in matched_tracked]
+            needs_replan = True
+
+        if new_balls:
+            for b in new_balls:
+                log_event("RECONCILE", "new ball detected — added", x=round(b.cm_x, 1), y=round(b.cm_y, 1))
+            self._tracked_balls.extend(new_balls)
+            needs_replan = True
+
+        if moved_balls:
+            for old, new in moved_balls:
+                log_event("RECONCILE", "ball moved", track_id=old.track_id,
+                          dx=round(new.cm_x - old.cm_x, 1), dy=round(new.cm_y - old.cm_y, 1))
+            # Update tracked positions to fresh positions for matched balls
+            fresh_lookup = {}
+            for ti in matched_tracked:
+                for fi in matched_fresh:
+                    tb = self._tracked_balls[ti]
+                    fb = fresh[fi]
+                    dist = ((tb.cm_x - fb.cm_x) ** 2 + (tb.cm_y - fb.cm_y) ** 2) ** 0.5
+                    if dist <= MATCH_RADIUS_CM and ti not in fresh_lookup:
+                        fresh_lookup[ti] = fb
+            for ti, fb in fresh_lookup.items():
+                self._tracked_balls[ti] = fb
+            needs_replan = True
+
+        if needs_replan and self.robot_pose is not None:
+            targets = self._ball_targets(self._tracked_balls)
+            if targets:
+                if self._plan_and_load_route(targets):
+                    self.message = f"Reconciled — replanned ({self._brain.step_count} steps)"
+                else:
+                    self.message = "Reconcile: no route found"
+            elif not self._tracked_balls:
+                log_event("RECONCILE", "no balls remaining")
 
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         """Build planner ball targets from smoothed field coordinates."""
@@ -1122,75 +1143,9 @@ class MainGui:
         if not self._plan_and_load_route(self._ball_targets(result.smoothed_ball_coordinates)):
             self.message = "Rescan: no route found — stopping"
             return
-
         self._tracked_balls = list(result.smoothed_ball_coordinates)
-        self._crop_missing_counts = {}
-        self._crop_hsv_ranges = (
-            self.pipeline.calibrate_crop_hsv(result.frame_for_detection, result.smoothed_ball_coordinates, self.params)
-            if result.frame_for_detection is not None else {}
-        )
         self.message = f"Replanned — {self._brain.step_count} steps"
         log_event("BRAIN", "replanned after rescan", steps=self._brain.step_count)
-
-    def _tick_pickup_verifier(self) -> None:
-        """Trigger a YOLO snapshot when the robot has moved away from all pending pickups."""
-        if self.mode != AppMode.AUTO or self._brain is None:
-            return
-
-        # If a snapshot was just taken this frame, run verification now.
-        if self._verification_snapshot_done:
-            self._verification_snapshot_done = False
-            self._verify_pickups()
-            return
-
-        if not self._pending_verification or self.robot_pose is None:
-            return
-
-        robot_radius = float(self.params.get("robot_radius_cm", 30.0))
-        for ball in self._pending_verification:
-            dist = (
-                (ball.cm_x - self.robot_pose.x_cm) ** 2
-                + (ball.cm_y - self.robot_pose.y_cm) ** 2
-            ) ** 0.5
-            if dist < robot_radius:
-                return  # still near at least one pending ball — wait
-
-        # Robot is clear of all pending balls — schedule verification snapshot.
-        self._needs_verification_snapshot = True
-
-    def _verify_pickups(self) -> None:
-        """Compare fresh YOLO detections against pending pickups; replan if any failed."""
-        result = self._last_result
-        pending = list(self._pending_verification)
-        self._pending_verification = []
-        self._attempted_pickups = 0
-
-        if not pending or result is None:
-            return
-
-        match_radius_sq = 15.0 ** 2
-        fresh = result.smoothed_ball_coordinates
-        failed = [
-            p for p in pending
-            if any(
-                (b.cm_x - p.cm_x) ** 2 + (b.cm_y - p.cm_y) ** 2 < match_radius_sq
-                for b in fresh
-            )
-        ]
-
-        log_event("BRAIN", "pickup verification", attempted=len(pending), failed=len(failed))
-
-        if not failed:
-            return  # all pickups confirmed
-
-        self.message = f"Pickup failed for {len(failed)} ball(s) — replanning"
-        if (
-            result.smoothed_ball_coordinates
-            and result.occupancy_grid is not None
-            and self.robot_pose is not None
-            and self._brain is not None
-        ):
-            self._replan_after_displacement()
 
     # ------------------------------------------------------------------
     # Red-cross collision re-localization (fire-on-exit)
@@ -1643,11 +1598,10 @@ class MainGui:
         # and both panel overlays.
         skip = (
             self.mode == AppMode.GUIDANCE_TEST
-            or (self.mode == AppMode.AUTO and self._tracked_balls is not None and not self._needs_verification_snapshot)
+            or (self.mode == AppMode.AUTO and self._tracked_balls is not None and self._frames_elapsed % 60 != 0)
         )
-        if self._needs_verification_snapshot:
-            self._needs_verification_snapshot = False
-            self._verification_snapshot_done = True
+        if not skip and self.mode == AppMode.AUTO and self._tracked_balls is not None:
+            self._yolo_ran_this_frame = True
         cross = self.cross_red_zone()
         extra_red_zones = [cross] if cross is not None else []
         return self.pipeline.process(
@@ -1695,10 +1649,7 @@ class MainGui:
         return left
 
     def _draw_crop_overlay(self, image: np.ndarray) -> None:
-        """Draw crop monitor boxes on the topdown frame.
-
-        Green = ball present, Red = missing, Grey = skipped (robot over crop).
-        """
+        """Draw tracked ball markers on the topdown frame (green boxes)."""
         if not self._tracked_balls:
             return
         crop_size = int(self.params.get("crop_size", 60))
@@ -1714,7 +1665,7 @@ class MainGui:
             )
         robot_radius_px = robot_radius_cm * px_per_cm
 
-        # Draw robot exclusion circle so operator can see which crops are protected
+        # Draw robot exclusion circle so operator can see which balls are protected
         if robot_px is not None:
             cv2.circle(
                 image,
@@ -1726,8 +1677,6 @@ class MainGui:
             )
 
         for ball in self._tracked_balls:
-            if ball.label != "white":
-                continue  # orange balls not monitored via HSV
             cx, cy = self.pipeline.mapper.field_cm_to_topdown_pixel((ball.cm_x, ball.cm_y))
             cx, cy = int(round(cx)), int(round(cy))
 
@@ -1737,37 +1686,7 @@ class MainGui:
                     cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), (120, 120, 120), 1, cv2.LINE_AA)
                     continue
 
-            color = (60, 60, 200) if ball.track_id in self._last_crop_missing else (60, 200, 60)
-            cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), color, 2, cv2.LINE_AA)
-
-        # Draw pending verification cluster overlay
-        if self._pending_verification:
-            pv_px = [
-                self.pipeline.mapper.field_cm_to_topdown_pixel((b.cm_x, b.cm_y))
-                for b in self._pending_verification
-            ]
-            # Dashed yellow box per pending ball
-            for px, py in pv_px:
-                px, py = int(round(px)), int(round(py))
-                cv2.rectangle(image, (px - half, py - half), (px + half, py + half), (0, 220, 220), 1, cv2.LINE_AA)
-                cv2.drawMarker(image, (px, py), (0, 220, 220), cv2.MARKER_CROSS, 10, 1, cv2.LINE_AA)
-
-            # Cluster center crosshair
-            cx_mean = sum(p[0] for p in pv_px) / len(pv_px)
-            cy_mean = sum(p[1] for p in pv_px) / len(pv_px)
-            center_px = (int(round(cx_mean)), int(round(cy_mean)))
-
-            # Cluster radius = max distance from center to any pending ball
-            cluster_r = max(
-                int(round(((p[0] - cx_mean) ** 2 + (p[1] - cy_mean) ** 2) ** 0.5))
-                for p in pv_px
-            ) + half
-            cv2.circle(image, center_px, cluster_r, (0, 220, 220), 1, cv2.LINE_AA)
-            cv2.drawMarker(image, center_px, (0, 220, 220), cv2.MARKER_TILTED_CROSS, 14, 2, cv2.LINE_AA)
-
-            label = f"Pending {self._attempted_pickups}x"
-            cv2.putText(image, label, (center_px[0] + cluster_r + 4, center_px[1] + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 220), 1, cv2.LINE_AA)
+            cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), (60, 200, 60), 2, cv2.LINE_AA)
 
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.
@@ -1897,8 +1816,7 @@ class MainGui:
                 self._last_result = result
                 self._estimate_pose(result)
                 self._tick_guidance()
-                self._tick_crop_monitor()
-                self._tick_pickup_verifier()
+                self._tick_reconciliation()
                 self._tick_cross_tracker()
                 self._tick_brain()
                 self._tick_calibration()

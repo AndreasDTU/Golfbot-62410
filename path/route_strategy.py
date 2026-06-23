@@ -22,12 +22,12 @@ from typing import Protocol
 
 import numpy as np
 
-from path.models import HybridPose
+from path.models import HybridPose, SafePickupZone
 from path.pickup_geometry import (
     PickupCandidate,
     PickupCategory,
     PickupGeometryResult,
-    acceptance_tolerance_rad,
+    build_safe_pickup_zone,
 )
 
 
@@ -64,15 +64,15 @@ class RoutePlannerInput:
 class RouteStop:
     """One ball visit: chosen candidate plus optional intermediate node.
 
-    ``accept_heading_tol_rad`` is the final-heading acceptance window for this
-    pickup: wide for open (SAFE) balls so the robot grabs without a hard final
-    pivot, ``None`` for constrained pickups (keep the tight default).
+    ``pickup_zone`` is the SAFE acceptance region for an open ball (None for a
+    constrained pickup), letting the executor grab from any SAFE point on the
+    reach circle instead of homing to this exact pose.
     """
 
     candidate: PickupCandidate
     intermediate_node: HybridPose | None  # None if SAFE
     ball_index: int
-    accept_heading_tol_rad: float | None = None
+    pickup_zone: SafePickupZone | None = None
 
 
 @dataclass(frozen=True)
@@ -142,12 +142,12 @@ def _make_stop(
     intermediate_node: HybridPose | None,
     ball_idx: int,
 ) -> RouteStop:
-    """Build a RouteStop, attaching its computed acceptance window."""
+    """Build a RouteStop, attaching its SAFE acceptance zone."""
     return RouteStop(
         candidate=candidate,
         intermediate_node=intermediate_node,
         ball_index=ball_idx,
-        accept_heading_tol_rad=acceptance_tolerance_rad(geo, candidate),
+        pickup_zone=build_safe_pickup_zone(geo, candidate),
     )
 
 

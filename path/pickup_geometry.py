@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 
 from localization.models import RobotGeometry
-from path.models import PlannedBallTarget
+from path.models import PlannedBallTarget, SafePickupZone
 
 DEFAULT_N_SAMPLES = 72
 
@@ -85,7 +85,8 @@ class PickupGeometryResult:
     safe_radius_cm: float            # max(tank_turn, tube_sweep) — SAFE threshold
     constrained_radius_cm: float     # min(tank_turn, tube_sweep) — CONSTRAINED threshold
     ring_radius_cm: float
-    mouth_radius_cm: float           # tube-mouth capture radius (ball-grab tolerance)
+    mounting_offset_rad: float       # atan2(tube_right, tube_forward) — tube mount angle
+    n_samples: int                   # heading samples per ring (angular resolution)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +226,9 @@ def compute_pickup_geometry(
     # Classification thresholds: safe above the larger, constrained below the smaller.
     safe_radius = max(tank_turn_radius, tube_sweep_radius)
     constrained_radius = min(tank_turn_radius, tube_sweep_radius)
+    # Tube mounting angle: where the tube tip sits relative to the robot's
+    # forward axis.  Used to convert between robot heading and grab direction.
+    mounting_offset = math.atan2(geometry.tube_right_cm, geometry.tube_forward_cm)
 
     # --- Per-ball ring sampling -----------------------------------------------
     tube_fwd = geometry.tube_forward_cm
@@ -298,44 +302,79 @@ def compute_pickup_geometry(
         safe_radius_cm=safe_radius,
         constrained_radius_cm=constrained_radius,
         ring_radius_cm=R,
-        mouth_radius_cm=mouth_r,
+        mounting_offset_rad=mounting_offset,
+        n_samples=n_samples,
     )
 
 
 # ---------------------------------------------------------------------------
-# Approach acceptance window
+# SAFE pickup zone
 # ---------------------------------------------------------------------------
 
-def capture_tolerance_rad(mouth_radius_cm: float, ring_radius_cm: float) -> float:
-    """Heading slack at which the tube mouth still swallows the ball.
-
-    If the robot is at the planned pickup position but its heading is off by
-    ``delta``, the tube tip swings off the ball centre by roughly
-    ``ring_radius * delta``.  Capture still succeeds while that offset stays
-    within the mouth radius, so the tolerance is ``asin(mouth / ring)``.
-    """
-    if ring_radius_cm <= 1e-6 or mouth_radius_cm <= 0.0:
-        return 0.0
-    return math.asin(min(1.0, mouth_radius_cm / ring_radius_cm))
-
-
-def acceptance_tolerance_rad(
+def build_safe_pickup_zone(
     geo: PickupGeometryResult,
     candidate: PickupCandidate,
-) -> float | None:
-    """Per-pickup final-heading acceptance window for *candidate*.
+) -> SafePickupZone | None:
+    """Build the SAFE acceptance region for a chosen pickup candidate.
 
-    Returns ``None`` for non-SAFE candidates: the caller keeps its tight
-    default tolerance and the careful straight-line approach.
+    Returns ``None`` for non-SAFE candidates (the caller keeps the precise
+    single-point approach).  For a SAFE candidate it collects the contiguous
+    SAFE arcs of the ball's reach circle -- the set of origin positions from
+    which the robot can grab the ball with the body guaranteed clear during
+    the in-place turn -- so the executor may accept *any* point on those arcs
+    rather than homing to one exact spot.
 
-    For a SAFE candidate the window is the physical capture tolerance.  A
-    SAFE position has clearance above ``safe_radius`` (the larger of the
-    tank-turn and tube-sweep radii), so the body and tube stay clear through
-    *any* in-place rotation there -- the only thing that bounds how far the
-    arrival heading may deviate is whether the mouth still swallows the ball.
-    This stays strictly within the SAFE region while letting open balls be
-    grabbed without a hard final pivot.
+    Arcs are expressed in bearing-around-the-ball space and shrunk by half a
+    sample at each end, so a borderline-unsafe heading is never accepted.
     """
     if candidate.category is not PickupCategory.SAFE:
         return None
-    return capture_tolerance_rad(geo.mouth_radius_cm, geo.ring_radius_cm)
+    n = geo.n_samples
+    if n <= 0:
+        return None
+    ball_cands = geo.balls[candidate.ball_index]
+    cands = ball_cands.candidates
+    ball = ball_cands.ball
+    step = 2.0 * math.pi / n
+    alpha = geo.mounting_offset_rad
+
+    safe_idx = {
+        round(c.theta_rad / step) % n
+        for c in cands
+        if c.category is PickupCategory.SAFE
+    }
+    if not safe_idx:
+        return None
+
+    arcs: list[tuple[float, float]] = []
+    if len(safe_idx) >= n:
+        # Whole circle is SAFE: a single all-encompassing arc.
+        arcs.append((0.0, math.pi))
+    else:
+        # Each SAFE sample owns a ±half-sample cell, so a run's arc spans from
+        # its first to its last centre, expanded half a sample at each end to
+        # the SAFE/in-between boundary -- never reaching into a non-SAFE cell.
+        half_cell = step * 0.5
+        # A run starts at an index whose predecessor is not SAFE.
+        starts = [i for i in safe_idx if (i - 1) % n not in safe_idx]
+        for s in starts:
+            length = 1
+            while (s + length) % n in safe_idx:
+                length += 1
+            span = (length - 1) * step
+            half_width = span * 0.5 + half_cell
+            center_heading = s * step + span * 0.5
+            # bearing(ball -> origin) for heading h is (h - alpha + pi).
+            center_bearing = center_heading - alpha + math.pi
+            arcs.append((center_bearing, half_width))
+
+    if not arcs:
+        return None
+
+    return SafePickupZone(
+        ball_x_cm=ball.x_cm,
+        ball_y_cm=ball.y_cm,
+        reach_cm=geo.ring_radius_cm,
+        mounting_offset_rad=alpha,
+        safe_arcs=tuple(arcs),
+    )

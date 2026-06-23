@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from path.models import HybridPose
+from path.models import HybridPose, SafePickupZone
 
 
 class BrainState(str, Enum):
@@ -59,13 +59,13 @@ class Step:
     ball sits against the cross/wall, so the executor backs away before raising
     the tube.
 
-    *accept_heading_tol_rad* is only meaningful for DRIVE steps that end at a
-    pickup: the final-heading acceptance window handed to guidance so an open
-    ball is grabbed without a hard final pivot.  None means "use the tight
-    default".
+    *pickup_zone* is only meaningful for DRIVE steps that end at a SAFE pickup:
+    the SAFE acceptance region handed to guidance so the robot grabs from
+    wherever it lands on the ball's reach circle instead of homing to one exact
+    spot.  None for constrained pickups and pure navigation.
     """
 
     kind: StepKind
     waypoints: tuple[HybridPose, ...] = ()
     obstacle_constrained: bool = False
-    accept_heading_tol_rad: float | None = None
+    pickup_zone: SafePickupZone | None = None

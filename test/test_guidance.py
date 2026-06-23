@@ -10,7 +10,7 @@ from config import DriveConfig
 from control.commander import RobotCommander
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.models import RobotPose
-from path.models import HybridPose
+from path.models import HybridPose, SafePickupZone
 from config import DriveConfig
 
 from path.pathfinding.models import HybridPose
@@ -301,41 +301,48 @@ class TestFinalHeadingAlignment:
 
 
 # ---------------------------------------------------------------------------
-# Per-route acceptance window (open-ball pickups)
+# SAFE pickup zone: accept any periphery point, re-aim at the ball
 # ---------------------------------------------------------------------------
 
 
-class TestAcceptanceWindowOverride:
-    def test_wide_window_accepts_without_pivot(self):
+def _zone(ball_x=50.0, ball_y=50.0, reach=10.0):
+    # Whole-circle SAFE arc (half-width pi) for an open ball.
+    return SafePickupZone(
+        ball_x_cm=ball_x, ball_y_cm=ball_y, reach_cm=reach,
+        mounting_offset_rad=0.0, safe_arcs=((0.0, math.pi),),
+    )
+
+
+class TestSafePickupZoneArrival:
+    def test_accepts_off_planned_point_and_grabs(self):
         g, cmd = make_guidance()
-        # Open ball: wide acceptance window handed in with the route.
-        g.set_route([wp(50, 50, 90)], final_heading_tol=math.radians(20))
-        # Robot arrives 15° off heading -- inside the window -> ARRIVED, no turn.
-        status = g.tick(pose(50, 50, 75), DT)
+        # Planned pickup point is east of the ball; robot instead lands NORTH
+        # of the ball (a different SAFE periphery point) already facing it.
+        g.set_route([wp(60, 50, 180)], pickup_zone=_zone())
+        # Robot at (50,60): on the circle, north of ball, heading -90° (south,
+        # toward the ball). It never reached the planned point (60,50).
+        status = g.tick(pose(50, 60, -90), DT)
         assert status == GuidanceStatus.ARRIVED
 
-    def test_default_window_still_aligns(self):
+    def test_reaims_toward_ball_when_crooked(self):
         g, cmd = make_guidance()
-        # No override -> tight default; 15° off must still align (RUNNING).
-        g.set_route([wp(50, 50, 90)])
-        status = g.tick(pose(50, 50, 75), DT)
-        assert status == GuidanceStatus.RUNNING
-
-    def test_override_never_tightens_below_default(self):
-        g, cmd = make_guidance()
-        # A sub-default override must not make the robot fight for fractions
-        # of a degree: the default floor still applies.
-        g.set_route([wp(50, 50, 90)], final_heading_tol=math.radians(0.1))
-        status = g.tick(pose(50, 50, 89), DT)  # 1° off, within default 1.5°
+        g.set_route([wp(60, 50, 180)], pickup_zone=_zone())
+        # On the circle north of the ball but facing east (0°): must re-aim.
+        status = g.tick(pose(50, 60, 0), DT)
+        assert status == GuidanceStatus.RUNNING        # turning toward ball
+        left, right = last_lr(cmd)
+        assert left * right < 0                          # rotating in place
+        # Once facing the ball within the tight default tolerance → ARRIVED.
+        status = g.tick(pose(50, 60, -89), DT)           # grab heading ≈ -90°
         assert status == GuidanceStatus.ARRIVED
 
-    def test_window_resets_between_routes(self):
+    def test_off_band_keeps_driving(self):
         g, cmd = make_guidance()
-        g.set_route([wp(50, 50, 90)], final_heading_tol=math.radians(20))
-        # New route without override -> tight default again.
-        g.set_route([wp(50, 50, 90)])
-        status = g.tick(pose(50, 50, 75), DT)
+        g.set_route([wp(60, 50, 180)], pickup_zone=_zone())
+        # Far from the circle (radial 30) → not accepted → still pursuing.
+        status = g.tick(pose(50, 80, -90), DT)
         assert status == GuidanceStatus.RUNNING
+        assert g.cursor == 0
 
 
 # ---------------------------------------------------------------------------

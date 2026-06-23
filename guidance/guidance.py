@@ -20,7 +20,7 @@ from control.telemetry import log_event
 from guidance.route_tracking import compute_route_tracking_error
 from localization.localization import normalize_angle
 from localization.models import RobotPose
-from path.models import HybridPose
+from path.models import HybridPose, SafePickupZone
 from config import DriveConfig
 from path.pathfinding.models import HybridPose
 
@@ -65,9 +65,9 @@ class GuidanceController:
         self._cursor: int = 0
         self._route_complete: bool = False
         self._aligning: bool = False
-        # Per-route override for the final-heading acceptance window (radians).
-        # None falls back to the tight config default.
-        self._route_final_tol: float | None = None
+        # SAFE acceptance region for the final pickup, or None to home to the
+        # exact final waypoint (constrained pickup / navigation / unload).
+        self._pickup_zone: SafePickupZone | None = None
 
         self._driving: bool = False
 
@@ -78,20 +78,22 @@ class GuidanceController:
     def set_route(
         self,
         waypoints: list[HybridPose],
-        final_heading_tol: float | None = None,
+        pickup_zone: SafePickupZone | None = None,
     ) -> None:
         """Load a new route and reset the cursor to the first waypoint.
 
-        *final_heading_tol* optionally widens the final-waypoint heading
-        acceptance window (radians) for this route -- used so an open-ball
-        pickup is accepted without a hard final pivot.  None keeps the tight
-        config default.  The override never tightens below that default.
+        *pickup_zone*, when given, lets the route finish at *any* SAFE point on
+        the ball's reach circle: the robot accepts wherever it lands in the
+        zone (within the standoff tolerance) and turns to face the ball,
+        instead of homing to the exact final waypoint.  Arrival and heading
+        tolerances are the same as for an ordinary pickup -- only *which* point
+        on the circle is free.
         """
         self._waypoints = list(waypoints)
         self._cursor = 0
         self._route_complete = False
         self._aligning = False
-        self._route_final_tol = final_heading_tol
+        self._pickup_zone = pickup_zone
         log_event("GUIDANCE", "route set", waypoints=len(self._waypoints))
 
     def clear_route(self) -> None:
@@ -100,7 +102,7 @@ class GuidanceController:
         self._cursor = 0
         self._route_complete = False
         self._aligning = False
-        self._route_final_tol = None
+        self._pickup_zone = None
         self._driving = False
         self._commander.stop()
         log_event("GUIDANCE", "route cleared")
@@ -156,12 +158,14 @@ class GuidanceController:
 
         # 5. Check arrival at current waypoint (before driving init or turn check).
         is_last = self._cursor >= len(self._waypoints) - 1
-        if distance < (self._ball_arrival_cm if is_last else self._waypoint_arrival_cm):
-            if is_last:
-                # Position reached — enter heading alignment phase.
+        if is_last:
+            if self._pickup_arrived(pose, distance):
+                # In position (exact point, or anywhere on the SAFE arc) —
+                # enter heading alignment / re-aim phase.
                 self._aligning = True
                 self._log("ALIGNING", dist=distance)
                 return self._tick_align(pose)
+        elif distance < self._waypoint_arrival_cm:
             # Intermediate waypoint — advance cursor.
             self._cursor += 1
             target = self._waypoints[self._cursor]
@@ -221,19 +225,35 @@ class GuidanceController:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _tick_align(self, pose: RobotPose) -> GuidanceStatus:
-        """Rotate in place to match the final waypoint's heading.
+    def _pickup_arrived(self, pose: RobotPose, distance: float) -> bool:
+        """Whether the robot has reached the final pickup.
 
-        The acceptance window is the route's per-pickup override when present
-        (wider for open balls so we accept without a hard pivot), but never
-        tighter than the config default.
+        With a SAFE pickup zone, arrival is *anywhere* on the ball's SAFE arc
+        at reach distance -- the robot accepts where it landed instead of
+        homing to one exact spot.  Reaching the exact planned point still
+        counts (fallback), so behaviour is never worse than before.
         """
-        target = self._waypoints[self._cursor]
-        heading_error = normalize_angle(target.theta_rad - pose.heading_rad)
+        if self._pickup_zone is not None and self._pickup_zone.accepts(
+            pose.x_cm, pose.y_cm, self._ball_arrival_cm,
+        ):
+            return True
+        return distance < self._ball_arrival_cm
+
+    def _tick_align(self, pose: RobotPose) -> GuidanceStatus:
+        """Rotate in place to face the ball, then finish.
+
+        For a SAFE pickup zone the target heading is recomputed each tick as
+        "turn towards the ball from wherever I landed"; otherwise it is the
+        fixed final-waypoint heading.  The heading tolerance is the same tight
+        default in both cases -- only *which* point on the circle is free.
+        """
+        if self._pickup_zone is not None:
+            target_theta = self._pickup_zone.grab_heading(pose.x_cm, pose.y_cm)
+        else:
+            target_theta = self._waypoints[self._cursor].theta_rad
+        heading_error = normalize_angle(target_theta - pose.heading_rad)
 
         tolerance = self._final_heading_tolerance_rad
-        if self._route_final_tol is not None:
-            tolerance = max(tolerance, self._route_final_tol)
 
         if abs(heading_error) <= tolerance:
             self._commander.stop()

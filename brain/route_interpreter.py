@@ -49,7 +49,7 @@ def interpret_route(plan: RoutePlan) -> list[Step]:
             steps.append(Step(
                 kind=StepKind.DRIVE,
                 waypoints=tuple(current_waypoints),
-                accept_heading_tol_rad=wp.accept_heading_tol_rad,
+                pickup_zone=wp.pickup_zone,
             ))
             current_waypoints = []
             steps.append(Step(

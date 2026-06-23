@@ -1,13 +1,13 @@
 """Tests for the faster-approach optimization.
 
-Covers the three coordinated changes:
+Covers the coordinated changes:
 
 1. **Drive-straight-in selection** -- among SAFE candidates, the chosen pickup
    pose lines up with the robot's incoming travel so it does not pivot hard
    beside the ball.
-2. **Acceptance window** -- open (SAFE) balls carry a wide final-heading
-   tolerance (capped by the tube capture angle and the SAFE arc); constrained
-   pickups stay tight (``None``).
+2. **SAFE pickup zone** -- open balls accept any SAFE point on the reach circle
+   and re-aim at the ball; constrained pickups keep the precise approach.
+   Arrival and heading tolerances are unchanged -- only *which* point is free.
 3. **Commit lock** -- a committed pickup pose is reused verbatim and visited
    first, so a replan cannot flip the approach side near the ball.
 """
@@ -19,15 +19,10 @@ from dataclasses import replace
 
 import pytest
 
-from path.models import HybridPose
-from path.pickup_geometry import (
-    PickupCandidate,
-    PickupCategory,
-    acceptance_tolerance_rad,
-    capture_tolerance_rad,
-)
+from path.models import HybridPose, SafePickupZone, tube_center_for_pose
+from path.pickup_geometry import PickupCandidate, PickupCategory
 from path.route_strategy import IntersectionPriorityStrategy
-from test_route_strategy import _build_route_input, make_ball
+from test_route_strategy import _build_route_input, make_ball, make_geometry
 
 
 def _final_turn(stop, sx: float, sy: float) -> float:
@@ -56,41 +51,6 @@ class TestDriveStraightInSelection:
         assert _final_turn(stop_weighted, sx, sy) <= _final_turn(stop_unweighted, sx, sy) + 1e-9
         # With weighting the robot can essentially roll straight in.
         assert math.degrees(_final_turn(stop_weighted, sx, sy)) < 20.0
-
-
-# ---------------------------------------------------------------------------
-# 2. Acceptance window
-# ---------------------------------------------------------------------------
-
-class TestAcceptanceWindow:
-    def test_capture_tolerance_geometry(self):
-        # asin(mouth / ring); degenerate inputs give zero.
-        assert capture_tolerance_rad(2.0, 13.1) == pytest.approx(math.asin(2.0 / 13.1))
-        assert capture_tolerance_rad(0.0, 13.1) == 0.0
-        assert capture_tolerance_rad(2.0, 0.0) == 0.0
-        # Mouth wider than reach clamps to a quarter turn, never NaN.
-        assert capture_tolerance_rad(99.0, 1.0) == pytest.approx(math.pi / 2)
-
-    def test_open_ball_window_is_wide(self):
-        balls = [make_ball(50.0, 40.0, label="white", track_id=1)]
-        inp = replace(_build_route_input(seed=42, balls=balls), approach_turn_weight=20.0)
-        stop = IntersectionPriorityStrategy().plan(inp).stops[0]
-        geo = inp.geometry_result
-        assert stop.candidate.category is PickupCategory.SAFE
-        assert stop.accept_heading_tol_rad is not None
-        # Wider than the tight 1.5 deg default; the SAFE-position capture angle.
-        assert stop.accept_heading_tol_rad > math.radians(1.5)
-        assert stop.accept_heading_tol_rad == pytest.approx(
-            capture_tolerance_rad(geo.mouth_radius_cm, geo.ring_radius_cm)
-        )
-
-    def test_non_safe_candidate_has_no_window(self):
-        # acceptance_tolerance_rad returns None for non-SAFE candidates so the
-        # executor keeps its tight default and careful straight-line approach.
-        c = PickupCandidate(0.0, 0.0, 0.0, PickupCategory.CONSTRAINED, 1.0, 0)
-        balls = [make_ball(50.0, 40.0, label="white", track_id=1)]
-        geo = _build_route_input(seed=42, balls=balls).geometry_result
-        assert acceptance_tolerance_rad(geo, c) is None
 
 
 # ---------------------------------------------------------------------------
@@ -126,3 +86,74 @@ class TestCommitLock:
 
         result = IntersectionPriorityStrategy().plan(inp)
         assert result.stops[0].ball_index == 0
+
+
+# ---------------------------------------------------------------------------
+# 4. SafePickupZone — accept any SAFE periphery point, re-aim, grab
+# ---------------------------------------------------------------------------
+
+class TestSafePickupZone:
+    # Standoff (radial) tolerance the executor uses, = ball_arrival_cm.
+    TOL = 0.5
+
+    def _zone(self) -> SafePickupZone:
+        # Ball at (50,40), reach 13, tube on-axis, SAFE arc = bearings within
+        # ±90° of bearing 0 (the +x side of the ball).
+        return SafePickupZone(
+            ball_x_cm=50.0, ball_y_cm=40.0, reach_cm=13.0,
+            mounting_offset_rad=0.0, safe_arcs=((0.0, math.pi / 2),),
+        )
+
+    def test_accepts_on_circle_inside_arc(self):
+        z = self._zone()
+        assert z.accepts(63.0, 40.0, self.TOL)   # bearing 0, exactly on circle
+        # bearing 80° (inside the ±90° arc), on the circle
+        assert z.accepts(50.0 + 13.0 * math.cos(math.radians(80)),
+                         40.0 + 13.0 * math.sin(math.radians(80)), self.TOL)
+
+    def test_rejects_outside_arc(self):
+        z = self._zone()
+        # bearing 100° — outside the ±90° SAFE arc
+        assert not z.accepts(50.0 + 13.0 * math.cos(math.radians(100)),
+                             40.0 + 13.0 * math.sin(math.radians(100)), self.TOL)
+
+    def test_rejects_off_radial_band(self):
+        z = self._zone()
+        assert z.accepts(63.0, 40.0, self.TOL)        # on the circle
+        assert not z.accepts(64.0, 40.0, self.TOL)    # 1 cm beyond reach > 0.5
+
+    def test_grab_heading_points_at_ball(self):
+        z = self._zone()
+        # East of the ball -> face west; north of the ball -> face south.
+        # Compare via unit vector so the pi/-pi wrap doesn't matter.
+        h_east = z.grab_heading(63.0, 40.0)
+        assert math.cos(h_east) == pytest.approx(-1.0, abs=1e-6)
+        assert math.sin(h_east) == pytest.approx(0.0, abs=1e-6)
+        h_north = z.grab_heading(50.0, 53.0)
+        assert math.cos(h_north) == pytest.approx(0.0, abs=1e-6)
+        assert math.sin(h_north) == pytest.approx(-1.0, abs=1e-6)
+
+    @pytest.mark.parametrize("ball_xy", [(40.0, 40.0), (125.0, 40.0), (40.0, 90.0)])
+    def test_zone_grab_heading_lands_tube_on_ball(self, ball_xy):
+        # Inverse property: from any accepted periphery point, turning to
+        # grab_heading puts the tube tip on the ball center.
+        bx, by = ball_xy
+        balls = [make_ball(bx, by, label="white", track_id=1)]
+        inp = _build_route_input(seed=42, balls=balls)
+        stop = IntersectionPriorityStrategy().plan(inp).stops[0]
+        zone = stop.pickup_zone
+        assert zone is not None
+        c = stop.candidate
+        assert zone.accepts(c.x_cm, c.y_cm, self.TOL)
+        h = zone.grab_heading(c.x_cm, c.y_cm)
+        tip_x, tip_y = tube_center_for_pose(HybridPose(c.x_cm, c.y_cm, h), make_geometry())
+        assert math.hypot(tip_x - bx, tip_y - by) < 0.05
+
+    def test_constrained_pickup_has_no_zone(self):
+        # Ball hard against the cross -> non-SAFE -> no zone (precise approach).
+        balls = [make_ball(96.5, 60.75, label="white", track_id=1)]
+        stop = IntersectionPriorityStrategy().plan(
+            _build_route_input(seed=42, balls=balls)
+        ).stops
+        if stop and stop[0].candidate.category is not PickupCategory.SAFE:
+            assert stop[0].pickup_zone is None

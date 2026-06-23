@@ -43,6 +43,60 @@ class PlannedBallTarget:
 
 
 # ---------------------------------------------------------------------------
+# Pickup acceptance
+# ---------------------------------------------------------------------------
+
+def _normalize_angle(a: float) -> float:
+    """Wrap *a* to [-pi, pi)."""
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@dataclass(frozen=True)
+class SafePickupZone:
+    """The set of SAFE origin positions from which a ball can be grabbed.
+
+    The pickup origin may be any point on the ball's reach circle whose radius
+    is within the caller's ``radial_tol_cm`` of the reach and whose
+    bearing-around-the-ball falls in a SAFE arc (clearance guaranteed for the
+    in-place turn).  From any such point the robot turns to :meth:`grab_heading`
+    and grabs -- it never corrects its position to one exact spot.
+
+    The radial tolerance is supplied by the caller (an executor policy, e.g.
+    the standoff arrival tolerance), not baked in -- the zone is pure geometry.
+    Angles are radians; positions are bottom-left field-cm.  ``safe_arcs`` is a
+    tuple of ``(center_bearing, half_width)`` arcs in bearing-around-the-ball
+    space.  The executor depends on its two predicates, not on any grid.
+    """
+
+    ball_x_cm: float
+    ball_y_cm: float
+    reach_cm: float
+    mounting_offset_rad: float
+    safe_arcs: tuple[tuple[float, float], ...]
+
+    def accepts(self, x_cm: float, y_cm: float, radial_tol_cm: float) -> bool:
+        """True if origin ``(x, y)`` is a SAFE pickup spot on the reach circle.
+
+        ``radial_tol_cm`` is how far off the reach circle is still accepted --
+        the caller's standoff tolerance.
+        """
+        dx = x_cm - self.ball_x_cm
+        dy = y_cm - self.ball_y_cm
+        if abs(math.hypot(dx, dy) - self.reach_cm) > radial_tol_cm:
+            return False
+        bearing = math.atan2(dy, dx)
+        return any(
+            abs(_normalize_angle(bearing - center)) <= half_width
+            for center, half_width in self.safe_arcs
+        )
+
+    def grab_heading(self, x_cm: float, y_cm: float) -> float:
+        """Robot heading that lands the tube tip on the ball from ``(x, y)``."""
+        bearing_to_ball = math.atan2(self.ball_y_cm - y_cm, self.ball_x_cm - x_cm)
+        return _normalize_angle(bearing_to_ball + self.mounting_offset_rad)
+
+
+# ---------------------------------------------------------------------------
 # Route plan
 # ---------------------------------------------------------------------------
 
@@ -71,10 +125,10 @@ class RouteWaypoint:
     # True when this pickup sits against the cross/wall, so the executor must
     # back away before raising the tube. Always False for NAVIGATE/UNLOAD.
     obstacle_constrained: bool = False
-    # Final-heading acceptance window (radians) for a PICKUP: wide for open
-    # balls so the robot grabs without a hard final pivot. None means "use the
-    # executor's tight default". Always None for NAVIGATE/UNLOAD.
-    accept_heading_tol_rad: float | None = None
+    # SAFE acceptance region for a PICKUP: lets the executor grab from any SAFE
+    # point on the ball's reach circle instead of homing to this exact pose.
+    # None for constrained pickups (precise approach) and NAVIGATE/UNLOAD.
+    pickup_zone: SafePickupZone | None = None
 
 
 @dataclass(frozen=True)

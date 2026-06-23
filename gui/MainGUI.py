@@ -305,6 +305,7 @@ class MainGui:
     _timer_start_time: float | None = None
     _timer_elapsed: float = 0.0
     _timer_running: bool = False
+    _frames_elapsed: int = 0
 
     # Red-cross collision re-localization (fire-on-exit state machine)
     _cross_tracker: CrossCollisionTracker = field(default_factory=CrossCollisionTracker)
@@ -975,6 +976,13 @@ class MainGui:
         if prev_state == BrainState.PICKUP and self._brain_state == BrainState.IDLE:
             self._remove_collected_ball()
 
+        
+        if (self._frames_elapsed % 60 == 0): #Hvis ikke alle bolde er fundet til at starte med, så får de ikke et hsv crop.
+            self._needs_verification_snapshot = True
+            #Check for any missed pickups every 60 frames (2 seconds at 30fps) to catch any balls that were displaced before the crop monitor could detect them. Also gives a chance to catch any missed pickups after the brain is done, before stopping
+
+
+
         if (
             self._brain_state == BrainState.ERROR
             and self._brain.error_message == "ball_displaced"
@@ -991,7 +999,6 @@ class MainGui:
             and self.robot_pose is not None
         ): #If brain is done, verify pickups to check for any missed balls before stopping
             self._needs_verification_snapshot = True
-            self._verify_pickups()
             #Could add a return 0 here to end program or someshit. Maybe move dance to here?
 
 

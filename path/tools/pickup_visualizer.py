@@ -598,6 +598,7 @@ def _compute_and_render(
         field_height_cm=config.field.height_cm,
         strategy=compile_strategy,
         balls=targets,
+        obstacle_margin_cm=config.field.obstacle_margin_cm,
     )
 
     # Render

@@ -915,6 +915,7 @@ class MainGui:
                     geometry,
                     self.config.field,
                     unload_position=unload_pos,
+                    obstacle_margin_cm=self.config.field.obstacle_margin_cm,
                 )
 
                 if not plan.waypoints:
@@ -1101,6 +1102,7 @@ class MainGui:
             geometry,
             self.config.field,
             unload_position=unload_pos,
+            obstacle_margin_cm=self.config.field.obstacle_margin_cm,
         )
 
         if not plan.waypoints:

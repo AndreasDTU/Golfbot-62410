@@ -451,12 +451,13 @@ def compile_route(
     strategy: CompileStrategy = CompileStrategy.SINGLE_NODE,
     balls: list[PlannedBallTarget] | None = None,
     ball_radius_cm: float = 2.0,
+    obstacle_margin_cm: float = 0.0,
 ) -> RoutePlan:
     """Compile ordered route stops into a flat annotated waypoint sequence.
 
     Uses the distance field as the single source of truth for collision
     avoidance: a grid cell is traversable if
-    ``distance_field[row, col] >= half_width_cm``.
+    ``distance_field[row, col] >= half_width_cm + obstacle_margin_cm``.
 
     When *balls* is provided, uncollected balls are stamped into the
     blocked grid as obstacles (inflated by ``ball_radius_cm +
@@ -483,6 +484,9 @@ def compile_route(
         as collision objects.
     ball_radius_cm : float
         Physical ball radius for inflation (default 2.0 cm).
+    obstacle_margin_cm : float
+        Extra clearance added to all obstacles in the collision grid.
+        Pickup positions are not affected.  Default 0.0 cm.
 
     Returns
     -------
@@ -491,7 +495,8 @@ def compile_route(
         annotations.  No movement semantics.
     """
     # Blocked grid: nonzero where robot body does not fit.
-    blocked_base = (distance_field < half_width_cm).astype(np.uint8)
+    clearance = half_width_cm + max(0.0, obstacle_margin_cm)
+    blocked_base = (distance_field < clearance).astype(np.uint8)
     collected: set[int] = set()
 
     # ----- Build target sequence from stops -----
@@ -600,6 +605,7 @@ def plan_route(
     field_config: FieldConfig,
     unload_position: tuple[float, float] | None = None,
     compile_strategy: CompileStrategy = CompileStrategy.SINGLE_NODE,
+    obstacle_margin_cm: float = 0.0,
 ) -> RoutePlan:
     """Chain all three path layers to produce a ``RoutePlan``.
 
@@ -621,6 +627,9 @@ def plan_route(
         Staging position for unloading, or None to skip unload.
     compile_strategy : CompileStrategy
         Path simplification strategy passed to ``compile_route()``.
+    obstacle_margin_cm : float
+        Extra clearance (cm) added to all obstacles in the collision
+        grid.  Does not affect pickup positions.  Default 0.0.
 
     Returns
     -------
@@ -656,6 +665,7 @@ def plan_route(
         field_height_cm=field_config.height_cm,
         strategy=compile_strategy,
         balls=balls,
+        obstacle_margin_cm=obstacle_margin_cm,
     )
 
     return plan

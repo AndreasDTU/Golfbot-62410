@@ -27,6 +27,7 @@ class FieldConfig:
     height_cm: float = 121.5
     ball_height_cm: float = 2.0
     floor_height_cm: float = 0.0
+    obstacle_margin_cm: float = 3.0
 
     @property
     def grid_width_cm(self) -> int:

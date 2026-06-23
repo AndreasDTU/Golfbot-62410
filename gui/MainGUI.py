@@ -987,7 +987,7 @@ class MainGui:
         self._frames_elapsed += 1
         if self._verification_snapshot_done:
             self._verification_snapshot_done = False
-            self._verify_pickups()
+            self._plan_and_load_route(self._ball_targets(self._tracked_balls))  # Replan after verification snapshot
             return
 
         if (

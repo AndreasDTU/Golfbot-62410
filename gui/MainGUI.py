@@ -1036,6 +1036,14 @@ class MainGui:
         result = self._last_result
         if result is None:
             return
+        # Skip this YOLO cycle entirely while the robot is in a tight area
+        # (approach/pickup/reverse near a wall or cross).  Treated like an
+        # active arm: by returning before _tracked_balls is updated we leave
+        # the "new ball" signal intact, so once the robot drives clear the
+        # next YOLO cycle sees the balls as new and replans normally.
+        if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid):
+            log_event("RECONCILE", "skipped — robot in danger zone")
+            return
         fresh = list(result.smoothed_ball_coordinates)
 
         robot_xy = (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose else None
@@ -1111,12 +1119,6 @@ class MainGui:
         self._tracked_balls = deduped
 
         if needs_replan and self.robot_pose is not None:
-            # Defer replan if robot is in a tight area (approach/pickup/reverse
-            # segment near a wall or cross).  The next reconciliation cycle
-            # will pick it up once the robot has reversed to the approach node.
-            if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid):
-                log_event("RECONCILE", "replan deferred — robot in danger zone")
-                return
             targets = self._ball_targets(self._tracked_balls)
             if targets:
                 if self._plan_and_load_route(targets):

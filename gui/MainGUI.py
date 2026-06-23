@@ -31,6 +31,7 @@ from path.models import HybridPose, PlannedBallTarget
 from path.planner import plan_route
 from path.pickup_geometry import compute_pickup_geometry
 from path.tools.pickup_visualizer import (
+    OverlayMode,
     STRATEGY_OPTIONS,
     draw_pickup_geometry,
     draw_route_plan,
@@ -322,6 +323,9 @@ class MainGui:
     _cross_spec: RedCrossSpec | None = None
     _cross_window_open: bool = False
     _cross_state: CornerSelectionState = field(default_factory=CornerSelectionState)
+
+    # Overlay mode for right-panel heatmap/collision visualization
+    _overlay_mode: OverlayMode = OverlayMode.NONE
 
     # Route View window state
     _route_view_open: bool = False
@@ -1815,7 +1819,7 @@ class MainGui:
             manual_wp = [(wp.x_cm, wp.y_cm) for wp in self._brain_route_points]
             route_pts = self._brain_route_points
 
-        return self.renderer.draw_schematic(
+        image = self.renderer.draw_schematic(
             frame_shape=frame_shape,
             red_zones=result.red_zones,
             smoothed_ball_coordinates=result.smoothed_ball_coordinates,
@@ -1825,6 +1829,23 @@ class MainGui:
             route_points_cm=route_pts,
             manual_waypoints_cm=manual_wp,
         )
+
+        # Pickup geometry overlay (heatmap / collision map)
+        if self._overlay_mode != OverlayMode.NONE and result.occupancy_grid is not None:
+            geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+            targets = self._ball_targets(result.smoothed_ball_coordinates)
+            if targets:
+                geometry_result = compute_pickup_geometry(
+                    self.config.field.width_cm, self.config.field.height_cm,
+                    result.occupancy_grid, targets, geometry,
+                )
+                half_w = geometry.width_cm * 0.5
+                draw_pickup_geometry(
+                    image, geometry_result, self.renderer.mapper,
+                    self.config.field, self._overlay_mode, half_w,
+                )
+
+        return image
 
     def _read_frame(self) -> np.ndarray | None:
         if self.static_image is not None:
@@ -1975,7 +1996,7 @@ class MainGui:
 
         self._keys_label = tk.Label(
             status_frame, anchor=tk.W,
-            text="Keys: q/Esc quit | f corners | x cross | c calib | g guide | v route | a auto | s stop",
+            text="Keys: q/Esc quit | f corners | x cross | c calib | g guide | v overlay | a auto | s stop",
             font=("Courier", 9), fg="#A0A0A0", bg="#323232",
         )
         self._keys_label.pack(fill=tk.X)
@@ -2208,9 +2229,18 @@ class MainGui:
         elif ch == "x":
             self._handle_button("set_cross")
         elif ch == "v":
-            self._handle_button("route_view")
+            self._cycle_overlay_mode()
         elif ch == "s":
             self._handle_button("stop")
+
+    _OVERLAY_CYCLE = [OverlayMode.NONE, OverlayMode.HEATMAP, OverlayMode.COLLISION]
+
+    def _cycle_overlay_mode(self) -> None:
+        """Cycle the right-panel overlay: off → heatmap → collision → off."""
+        idx = self._OVERLAY_CYCLE.index(self._overlay_mode)
+        self._overlay_mode = self._OVERLAY_CYCLE[(idx + 1) % len(self._OVERLAY_CYCLE)]
+        labels = {OverlayMode.NONE: "off", OverlayMode.HEATMAP: "heatmap", OverlayMode.COLLISION: "collision"}
+        self.message = f"Overlay: {labels[self._overlay_mode]}"
 
     def _on_close(self) -> None:
         """Handle window close button (X)."""

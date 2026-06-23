@@ -83,7 +83,7 @@ PICKUP_ASSIST_SPEED = 60
 # Pipe travel for a corner ball's pre-lower: drop the tube just below the field
 # border so the walls guide it in on the final approach. Must be < the full
 # PICKUP_ASSIST_UNITS stroke; the capture lowers only the remainder.
-PICKUP_PRELOWER_UNITS = 8
+PICKUP_PRELOWER_UNITS = 4
 PICKUP_PRELOWER_SPEED = 40
 # Drive units to back the tube clear of the cross/wall before raising it on a
 # constrained pickup. Tune for the smallest reverse that frees the tube.

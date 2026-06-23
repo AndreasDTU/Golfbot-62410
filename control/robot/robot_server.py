@@ -19,7 +19,8 @@ Commands:
   drivecal get            - Read active drive calibration constants
   drivecal set <axle_track_mm> <mm_per_unit> - Persist/apply drive calibration
   collector_travel_position - Raise collector to safe driving position
-  pickup_assist           - Small pipe jiggle for collecting one ball
+  pickup_assist [retreat] - Small pipe jiggle for collecting one ball;
+                            'retreat' backs away before raising near obstacles
   unload_full_cycle       - Full pipe cycle for unloading balls at the goal
   pickup                  - Compatibility alias for pickup_assist
   dropoff                 - Compatibility alias for unload_full_cycle
@@ -74,9 +75,13 @@ PIPE_DEGREES_PER_UNIT = 45.0
 COLLECTOR_TRAVEL_UNITS = 5
 COLLECTOR_TRAVEL_SPEED = 50
 PICKUP_ASSIST_UNITS = 25
-PICKUP_ASSIST_SPEED = 40
-UNLOAD_FULL_CYCLE_UNITS = 25
-UNLOAD_FULL_CYCLE_SPEED = 75
+PICKUP_ASSIST_SPEED = 70
+# Drive units to back the tube clear of the cross/wall before raising it on a
+# constrained pickup. Tune for the smallest reverse that frees the tube.
+PICKUP_RETREAT_UNITS = 6
+PICKUP_RETREAT_SPEED = 20
+UNLOAD_FULL_CYCLE_UNITS = 23
+UNLOAD_FULL_CYCLE_SPEED = 90
 
 # --- Motor setup ---
 tank         = MoveTank(OUTPUT_B, OUTPUT_C)
@@ -224,12 +229,18 @@ def cmd_collector_travel_position():
     )
     return "ok: collector travel position"
 
-def cmd_pickup_assist():
-    """Small local pipe motion for collection; never a full unload stroke."""
+def cmd_pickup_assist(retreat=False):
+    """Small local pipe motion for collection; never a full unload stroke.
+
+    When *retreat* is set the ball sits against the cross/wall: back the robot
+    away after capturing but before raising, so the rising tube neither nudges
+    the (very light) cross nor jams against the wall and skips gears.
+    """
     units = PICKUP_ASSIST_UNITS
     speed = PICKUP_ASSIST_SPEED
     motor_deg = units * PIPE_DEGREES_PER_UNIT
 
+    # Lower the tube over the ball (capture).
     pipe_motor.on_for_degrees(
         speed=SpeedPercent(speed),
         degrees=motor_deg,
@@ -237,6 +248,13 @@ def cmd_pickup_assist():
         block=True
     )
 
+    if retreat:
+        retreat_deg = units_to_degrees(PICKUP_RETREAT_UNITS)
+        _apply_wheel_speeds_for_degrees(
+            -PICKUP_RETREAT_SPEED, -PICKUP_RETREAT_SPEED, retreat_deg
+        )
+
+    # Raise the tube back to travel position (now clear of the obstacle).
     pipe_motor.on_for_degrees(
         speed=SpeedPercent(-speed),
         degrees=motor_deg,
@@ -247,6 +265,21 @@ def cmd_pickup_assist():
     return "ok: pipe pickup assist completed"
 
 def cmd_unload_full_cycle():
+    # Lower the tube over the ball (capture).
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(PICKUP_ASSIST_SPEED),
+        degrees=(PICKUP_ASSIST_UNITS + 5) * PIPE_DEGREES_PER_UNIT,
+        brake=True,
+        block=True
+    )
+
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(-PICKUP_ASSIST_SPEED),
+        degrees=(PICKUP_ASSIST_UNITS + 5) * PIPE_DEGREES_PER_UNIT,
+        brake=True,
+        block=True
+    )
+
     """Full pipe motion for unloading at the goal only."""
     units = UNLOAD_FULL_CYCLE_UNITS
     speed = UNLOAD_FULL_CYCLE_SPEED
@@ -260,6 +293,9 @@ def cmd_unload_full_cycle():
     )
 
     time.sleep(3)
+
+    cmd_move(["-10"])
+    cmd_move(["10"])
 
     pipe_motor.on_for_degrees(
         speed=SpeedPercent(speed),
@@ -332,7 +368,8 @@ def handle_command(cmd):
         elif action == "collector_travel_position":
             return cmd_collector_travel_position()
         elif action in ("pickup_assist", "pickup"):
-            return cmd_pickup_assist()
+            retreat = len(parts) > 1 and parts[1].lower() == "retreat"
+            return cmd_pickup_assist(retreat=retreat)
         elif action in ("unload_full_cycle", "dropoff"):
             return cmd_unload_full_cycle()
         else:

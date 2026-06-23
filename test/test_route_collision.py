@@ -17,6 +17,7 @@ import pytest
 from config import FieldConfig
 from localization.models import RobotGeometry
 from path.models import HybridPose, PlannedBallTarget, WaypointKind
+from conftest import load_test_geometry
 from path.pickup_geometry import (
     PickupCandidate,
     PickupCategory,
@@ -39,7 +40,6 @@ from path.route_strategy import RouteStop, RouteStrategyResult
 
 CROSS_SIZE_CM = 20.0
 CROSS_ARM_WIDTH_CM = 3.0
-HALF_WIDTH_CM = 9.75  # robot half-body width (19.5 / 2)
 
 
 # ---------------------------------------------------------------------------
@@ -51,15 +51,10 @@ def make_field_config() -> FieldConfig:
 
 
 def make_geometry() -> RobotGeometry:
-    return RobotGeometry(
-        width_cm=19.5,
-        front_cm=3.8,
-        rear_cm=15.1,
-        tube_forward_cm=13.1,
-        tube_right_cm=0.0,
-        tube_width_cm=6.0,
-        mouth_radius_cm=2.0,
-    )
+    return load_test_geometry()
+
+
+HALF_WIDTH_CM = make_geometry().width_cm / 2  # robot half-body width
 
 
 def make_cross_obstacle_grid(

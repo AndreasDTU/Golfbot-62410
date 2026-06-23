@@ -352,6 +352,47 @@ class TestFullRoute:
 
 
 # ---------------------------------------------------------------------------
+# Reverse driving
+# ---------------------------------------------------------------------------
+
+
+class TestReverse:
+    def test_target_behind_and_close_triggers_reverse(self):
+        """Target directly behind within 25 cm → both wheels negative (reverse)."""
+        g, cmd = make_guidance()
+        # Robot at (50, 50) heading 0° (+X). Waypoint at (40, 50) → directly behind, 10 cm.
+        g.set_route([wp(40, 50), wp(80, 50)])
+        status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.RUNNING
+        left, right = last_lr(cmd)
+        assert left < 0 and right < 0, f"expected both wheels negative, got L={left}, R={right}"
+
+    def test_reverse_with_lateral_offset_produces_differential(self):
+        """Target slightly off the direct-behind line → differential wheel speeds."""
+        g, cmd = make_guidance()
+        # Robot at (50, 50) heading 0°. Waypoint at (40, 53): behind and slightly above.
+        # heading_to_target ≈ 163° → |error| > 150° and dist ≈ 10.4 < 25 → reverse.
+        # reverse_error is nonzero → heading correction active → left ≠ right.
+        g.set_route([wp(40, 53), wp(80, 50)])
+        status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.RUNNING
+        left, right = last_lr(cmd)
+        assert left < 0 and right < 0, f"expected both wheels negative, got L={left}, R={right}"
+        assert left != right, "expected differential wheel speeds for heading correction"
+
+    def test_target_behind_but_far_does_not_reverse(self):
+        """Target behind but > 25 cm → should turn instead of reversing."""
+        g, cmd = make_guidance()
+        # Robot at (50, 50) heading 0°. Waypoint at (20, 50): 30 cm behind.
+        g.set_route([wp(20, 50), wp(80, 50)])
+        status = g.tick(pose(50, 50, 0), DT)
+        assert status == GuidanceStatus.RUNNING
+        # Should turn (opposite-sign wheels), not reverse
+        left, right = last_lr(cmd)
+        assert left * right < 0, f"expected turn (opposite sign wheels), got L={left}, R={right}"
+
+
+# ---------------------------------------------------------------------------
 # Heading wrapping near ±180°
 # ---------------------------------------------------------------------------
 

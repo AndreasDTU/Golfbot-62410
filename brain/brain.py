@@ -20,8 +20,8 @@ from path.models import RoutePlan
 from brain.models import BrainIntent, BrainState, IntentAction, StepKind
 from brain.route_interpreter import interpret_route
 
-UNLOAD_SETTLE_DURATION_S = 2.0
-UNLOAD_HEADING_TOLERANCE_RAD = math.radians(3.0)
+UNLOAD_SETTLE_DURATION_S = 0.5
+UNLOAD_HEADING_TOLERANCE_RAD = math.radians(2.0)
 
 
 class BrainController:
@@ -241,6 +241,14 @@ class BrainController:
             log_event("BRAIN", "DRIVE complete", step=self._step_cursor - 1)
             return self._state
 
+        if status == GuidanceStatus.OFF_PATH:
+            self._error_message = "off_path"
+            self._state = BrainState.ERROR
+            self._intent = BrainIntent(action=IntentAction.STOP)
+            self._guidance.clear_route()
+            log_event("BRAIN", "ERROR", reason="off_path", step=self._step_cursor)
+            return self._state
+
         if status == GuidanceStatus.ERROR:
             self._error_message = "Guidance reported ERROR during DRIVE"
             self._state = BrainState.ERROR
@@ -257,8 +265,9 @@ class BrainController:
 
     def _tick_pickup(self) -> BrainState:
         """Execute blocking pickup and advance."""
+        step = self._steps[self._step_cursor]
         try:
-            result = self._commander.pickup()
+            result = self._commander.pickup(retreat=step.obstacle_constrained)
             log_event(
                 "BRAIN", "PICKUP complete",
                 result=result, step=self._step_cursor,

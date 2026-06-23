@@ -5,14 +5,17 @@
   "camera_height_cm": 184.0,
   "created_unix": 1781691257.8928242,
   "geometry": {
-    "front_cm": 3.8000000000000007,
-    "heading_tuning_deg": 80.00000000000009,
+    "front_cm": 3.0,
+    "heading_tuning_deg": 80.0,
     "heading_tuning_rad": 1.3962634015954651,
     "rear_cm": 16.0,
-    "tube_forward_cm": 13.100000000000001,
+    "tube_forward_cm": 13.1,
     "tube_right_cm": 0.0,
-    "unload_extension_cm": 25.0,
-    "width_cm": 21.0
+    "tube_width_cm": 6.0,
+    "mouth_radius_cm": 2.0,
+    "pipe_diameter_cm": 4.5,
+    "unload_extension_cm": 24.0,
+    "width_cm": 23.0
   },
   "marker_height_cm": 9.0,
   "marker_ids": [

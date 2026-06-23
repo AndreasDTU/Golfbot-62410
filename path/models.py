@@ -68,6 +68,9 @@ class RouteWaypoint:
     theta_rad: float
     kind: WaypointKind
     ball_index: int | None = None
+    # True when this pickup sits against the cross/wall, so the executor must
+    # back away before raising the tube. Always False for NAVIGATE/UNLOAD.
+    obstacle_constrained: bool = False
 
 
 @dataclass(frozen=True)

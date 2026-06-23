@@ -241,7 +241,6 @@ class RobotCommander:
         )
 
         speed = max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
-        print(f"DRIVING speed={speed} dist_left={distance_left} dist_driven={distance_driven}")
         return speed
 
     def _target_speed_for_angle(self, total_angle: float) -> float:
@@ -332,8 +331,9 @@ class RobotCommander:
             speed = -speed
         self._current_speed = speed
         correction = (
-            heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
+            heading_error_deg * self._config.adjust_gain * max((speed * speed) / 10000.0, 0.1)
         )
+        #print(f"Base speed={speed}, correction={correction}")
         return self._send_wheel_speeds(speed - correction, speed + correction)
 
     def stop(self, force: bool = True) -> bool:
@@ -362,9 +362,10 @@ class RobotCommander:
     def collector_travel_position(self) -> str:
         return self._send("collector_travel_position")
 
-    def pickup_assist(self) -> str:
+    def pickup_assist(self, retreat: bool = False) -> str:
         self._send("stop")
-        return self._send("pickup_assist")
+        cmd = "pickup_assist retreat" if retreat else "pickup_assist"
+        return self._send(cmd)
 
     def unload_full_cycle(self) -> str:
         self._send("stop")
@@ -382,8 +383,8 @@ class RobotCommander:
     def pipe_stop(self) -> str:
         return self._send("pipe stop")
 
-    def pickup(self) -> str:
-        return self.pickup_assist()
+    def pickup(self, retreat: bool = False) -> str:
+        return self.pickup_assist(retreat=retreat)
 
     def dropoff(self) -> str:
         return self.unload_full_cycle()

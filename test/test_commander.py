@@ -269,3 +269,19 @@ class TestSteer:
         left, right = last_lr(c)
         assert left == pytest.approx(15.0, abs=0.5)
         assert right == pytest.approx(25.0, abs=0.5)
+
+
+# ---------------------------------------------------------------------------
+# Pickup actuator wire commands
+# ---------------------------------------------------------------------------
+
+class TestPickup:
+    def test_default_pickup_sends_plain_assist(self):
+        c = make_commander()
+        c.pickup()
+        assert c.sent_commands[-1] == "pickup_assist"
+
+    def test_retreat_pickup_sends_retreat_variant(self):
+        c = make_commander()
+        c.pickup(retreat=True)
+        assert c.sent_commands[-1] == "pickup_assist retreat"

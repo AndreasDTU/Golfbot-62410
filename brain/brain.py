@@ -20,8 +20,8 @@ from path.models import RoutePlan
 from brain.models import BrainIntent, BrainState, IntentAction, StepKind
 from brain.route_interpreter import interpret_route
 
-UNLOAD_SETTLE_DURATION_S = 2.0
-UNLOAD_HEADING_TOLERANCE_RAD = math.radians(3.0)
+UNLOAD_SETTLE_DURATION_S = 0.5
+UNLOAD_HEADING_TOLERANCE_RAD = math.radians(2.0)
 
 
 class BrainController:

@@ -581,6 +581,7 @@ def compile_route(
         ),
     ]
     cx, cy = start_pose.x_cm, start_pose.y_cm
+    is_first_segment = True
 
     for tx, ty, theta, kind, ball_idx, constrained in targets:
         # Build blocked grid for this segment (with uncollected balls).
@@ -599,11 +600,14 @@ def compile_route(
         start_col, start_row = _field_to_grid(cx, cy, field_height_cm)
         goal_col, goal_row = _field_to_grid(tx, ty, field_height_cm)
 
-        # If the robot is inside a blocked cell (e.g. within the
-        # obstacle margin), find the nearest free cell and emit a
-        # waypoint to drive there first.
+        # If the robot's actual start position is inside a blocked cell
+        # (e.g. path recalculated while in a danger zone), find the
+        # nearest free cell and emit an escape waypoint.  Only applies
+        # to the very first segment — subsequent segments use planned
+        # positions (e.g. pickup → approach node) that don't need escape.
         h, w = blocked.shape
-        if (0 <= start_row < h and 0 <= start_col < w
+        if (is_first_segment
+                and 0 <= start_row < h and 0 <= start_col < w
                 and blocked[start_row, start_col]):
             escape = _nearest_free_cell(blocked, start_col, start_row)
             if escape is not None:
@@ -615,6 +619,7 @@ def compile_route(
                     kind=WaypointKind.NAVIGATE,
                 ))
                 start_col, start_row = ec, er
+        is_first_segment = False
 
         same_cell = (start_col == goal_col and start_row == goal_row)
 

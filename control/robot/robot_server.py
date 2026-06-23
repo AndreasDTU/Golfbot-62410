@@ -75,12 +75,12 @@ PIPE_DEGREES_PER_UNIT = 45.0
 COLLECTOR_TRAVEL_UNITS = 5
 COLLECTOR_TRAVEL_SPEED = 50
 PICKUP_ASSIST_UNITS = 25
-PICKUP_ASSIST_SPEED = 40
+PICKUP_ASSIST_SPEED = 60
 # Drive units to back the tube clear of the cross/wall before raising it on a
 # constrained pickup. Tune for the smallest reverse that frees the tube.
-PICKUP_RETREAT_UNITS = 3
-PICKUP_RETREAT_SPEED = 30
-UNLOAD_FULL_CYCLE_UNITS = 25
+PICKUP_RETREAT_UNITS = 6
+PICKUP_RETREAT_SPEED = 20
+UNLOAD_FULL_CYCLE_UNITS = 22
 UNLOAD_FULL_CYCLE_SPEED = 75
 
 # --- Motor setup ---

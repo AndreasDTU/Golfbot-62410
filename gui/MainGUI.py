@@ -1039,8 +1039,7 @@ class MainGui:
         # Skip this YOLO cycle entirely while the robot is in a tight area
         # (approach/pickup/reverse near a wall or cross).  Treated like an
         # active arm: by returning before _tracked_balls is updated we leave
-        # the "new ball" signal intact, so once the robot drives clear the
-        # next YOLO cycle sees the balls as new and replans normally.
+        # the current route intact.
         if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid):
             log_event("RECONCILE", "skipped — robot in danger zone")
             return

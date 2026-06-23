@@ -17,6 +17,7 @@ from enum import Enum
 from config import DriveConfig
 from control.commander import RobotCommander
 from control.telemetry import log_event
+from guidance.route_tracking import compute_route_tracking_error
 from localization.localization import normalize_angle
 from localization.models import RobotPose
 from path.models import HybridPose
@@ -32,6 +33,7 @@ class GuidanceStatus(str, Enum):
     NO_POSE = "NO_POSE"
     NO_ROUTE = "NO_ROUTE"
     ERROR = "ERROR"
+    OFF_PATH = "OFF_PATH"
 
 
 class GuidanceController:
@@ -153,7 +155,12 @@ class GuidanceController:
             self._log("DRIVING", dist=distance, ok=self._driving)
             return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
 
-        # 6. Target behind and close — reverse instead of turning.
+        # 6. Cross-track error guard — replan if too far off path.
+        off_path = self._check_xte(pose)
+        if off_path is not None:
+            return off_path
+
+        # 7. Target behind and close — reverse instead of turning.
         if abs(heading_error) > math.radians(150) and distance < 25.0:
             reverse_error = normalize_angle(heading_error - math.pi)
             ok = self._commander.drive_adjusted(
@@ -166,7 +173,7 @@ class GuidanceController:
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
         max_heading_error = self._config.max_heading_for_tank_rad if self._commander._current_speed == 0 else self._config.max_heading_for_forward_rad
-        # 7. Large heading error — rotate in place.
+        # 8. Large heading error — rotate in place.
         if abs(heading_error) > max_heading_error:
             ok = self._commander.turn(math.degrees(heading_error))
             self._log(
@@ -177,7 +184,7 @@ class GuidanceController:
             )
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
-        # 8. Initialize driving or continue with heading correction.
+        # 9. Initialize driving or continue with heading correction.
         if not self._driving:
             self._driving = self._commander.start_drive(
                 distance, math.degrees(heading_error)
@@ -185,7 +192,7 @@ class GuidanceController:
             self._log("DRIVING", dist=distance, ok=self._driving)
             return GuidanceStatus.RUNNING if self._driving else GuidanceStatus.ERROR
 
-        # 9. Drive forward with arc correction (single combined LR command).
+        # 10. Drive forward with arc correction (single combined LR command).
         ok = self._commander.drive_adjusted(distance, math.degrees(heading_error))
         self._log(
             "DRIVING ADJUSTED",
@@ -217,6 +224,34 @@ class GuidanceController:
             ok=ok,
         )
         return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
+
+    def _check_xte(self, pose: RobotPose) -> GuidanceStatus | None:
+        """Return OFF_PATH if the robot is too far from the current route.
+
+        Computes the Euclidean distance to the nearest point on the
+        current and future path segments.  If it exceeds
+        ``max_cross_track_error_cm`` the robot is stopped and OFF_PATH
+        is returned so the layer above can trigger a replan.
+
+        Returns None when the robot is within tolerance.
+        """
+        tracking = compute_route_tracking_error(
+            pose,
+            self._waypoints,
+            start_segment_index=max(0, self._cursor - 1),
+        )
+        if tracking is None:
+            return None
+        if tracking.xte_cm <= self._config.max_cross_track_error_cm:
+            return None
+        self._commander.stop()
+        self._driving = False
+        self._log(
+            "OFF_PATH",
+            xte_cm=f"{tracking.xte_cm:.1f}",
+            threshold=f"{self._config.max_cross_track_error_cm:.1f}",
+        )
+        return GuidanceStatus.OFF_PATH
 
     @staticmethod
     def _compute_geometry(

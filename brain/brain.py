@@ -241,6 +241,14 @@ class BrainController:
             log_event("BRAIN", "DRIVE complete", step=self._step_cursor - 1)
             return self._state
 
+        if status == GuidanceStatus.OFF_PATH:
+            self._error_message = "off_path"
+            self._state = BrainState.ERROR
+            self._intent = BrainIntent(action=IntentAction.STOP)
+            self._guidance.clear_route()
+            log_event("BRAIN", "ERROR", reason="off_path", step=self._step_cursor)
+            return self._state
+
         if status == GuidanceStatus.ERROR:
             self._error_message = "Guidance reported ERROR during DRIVE"
             self._state = BrainState.ERROR

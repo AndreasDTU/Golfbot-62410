@@ -990,7 +990,7 @@ class MainGui:
 
         if (
             self._brain_state == BrainState.ERROR
-            and self._brain.error_message == "ball_displaced"
+            and self._brain.error_message in ("ball_displaced", "off_path")
             and self._last_result is not None
             and self._last_result.smoothed_ball_coordinates
             and self._last_result.occupancy_grid is not None

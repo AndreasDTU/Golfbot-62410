@@ -985,7 +985,12 @@ class MainGui:
         ):
             self._replan_after_displacement()
 
-        if (self._brain_state == BrainState.DONE): #If brain is done, verify pickups to check for any missed balls before stopping
+        if (self._brain_state == BrainState.DONE
+            and self._last_result.smoothed_ball_coordinates
+            and self._last_result.occupancy_grid is not None
+            and self.robot_pose is not None
+        ): #If brain is done, verify pickups to check for any missed balls before stopping
+            self._needs_verification_snapshot = True
             self._verify_pickups()
             #Could add a return 0 here to end program or someshit. Maybe move dance to here?
 

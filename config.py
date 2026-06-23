@@ -332,13 +332,13 @@ class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
     # Drive speed profiling
-    drive_min_speed_pct: float = 10.0  # Minimum travel speed
-    drive_max_speed_pct: float = 90.0  # Maximum travel speed
+    drive_min_speed_pct: float = 7.0  # Minimum travel speed
+    drive_max_speed_pct: float = 95.0  # Maximum travel speed
     drive_acceleration_cm: float = 5.0  # Distance to go from min to max speed
     drive_deacceleration_cm: float = 25.0  # Distance to go from min to max speed
     # Turn speed profiling — flat speed proportional to total turn angle.
     # speed = clamp(total_angle / turn_reference_angle_deg * turn_max_speed_pct, min, max)
-    turn_min_speed_pct: float = 5.0
+    turn_min_speed_pct: float = 3.0
     turn_max_speed_pct: float = 120.0  # global tuning knob: speed at the reference angle
     turn_reference_angle_deg: float = 360.0  # angle that maps to turn_max_speed_pct
     # PID gains
@@ -365,7 +365,7 @@ class DriveConfig:
     # Waypoint arrival tolerance
     waypoint_arrival_cm: float = 3.0
     ball_arrival_cm: float = 0.5
-    final_heading_tolerance_rad: float = math.radians(2.0)
+    final_heading_tolerance_rad: float = math.radians(1.5)
     # Route tracking
     route_tracking_lookahead_segments: int = 12
 

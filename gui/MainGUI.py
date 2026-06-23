@@ -968,7 +968,6 @@ class MainGui:
             self._brain_state == BrainState.ERROR
             and self._brain.error_message in ("ball_displaced", "off_path")
             and self._last_result is not None
-            and self._last_result.smoothed_ball_coordinates
             and self._last_result.occupancy_grid is not None
             and self.robot_pose is not None
         ):
@@ -1062,7 +1061,7 @@ class MainGui:
         if missing:
             for b in missing:
                 log_event("RECONCILE", "ball missing — removed", track_id=b.track_id)
-            self._tracked_balls = [b for ti, b in enumerate(self._tracked_balls) if ti in matched_tracked]
+                self._tracked_balls.remove(b)
             needs_replan = True
 
         if new_balls:

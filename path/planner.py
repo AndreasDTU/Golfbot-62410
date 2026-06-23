@@ -213,6 +213,43 @@ def _douglas_peucker(
         return [(int(start[0]), int(start[1])), (int(end[0]), int(end[1]))]
 
 
+def _nearest_free_cell(
+    blocked: np.ndarray,
+    col: int,
+    row: int,
+) -> tuple[int, int] | None:
+    """Find the nearest unblocked cell to (col, row) by Euclidean distance.
+
+    Uses an expanding square search.  Returns None only if the entire
+    grid is blocked (should never happen in practice).
+    """
+    h, w = blocked.shape
+    if 0 <= row < h and 0 <= col < w and not blocked[row, col]:
+        return col, row
+    best: tuple[int, int] | None = None
+    best_dist = float("inf")
+    max_radius = max(h, w)
+    for radius in range(1, max_radius + 1):
+        if radius * radius > best_dist:
+            break
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if abs(dr) != radius and abs(dc) != radius:
+                    continue  # only check the ring, not the interior
+                nr, nc = row + dr, col + dc
+                if not (0 <= nr < h and 0 <= nc < w):
+                    continue
+                if blocked[nr, nc]:
+                    continue
+                dist = dr * dr + dc * dc
+                if dist < best_dist:
+                    best_dist = dist
+                    best = (nc, nr)
+        if best is not None:
+            break
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Coordinate conversion helpers
 # ---------------------------------------------------------------------------
@@ -555,6 +592,23 @@ def compile_route(
 
         start_col, start_row = _field_to_grid(cx, cy, field_height_cm)
         goal_col, goal_row = _field_to_grid(tx, ty, field_height_cm)
+
+        # If the robot is inside a blocked cell (e.g. within the
+        # obstacle margin), find the nearest free cell and emit a
+        # waypoint to drive there first.
+        h, w = blocked.shape
+        if (0 <= start_row < h and 0 <= start_col < w
+                and blocked[start_row, start_col]):
+            escape = _nearest_free_cell(blocked, start_col, start_row)
+            if escape is not None:
+                ec, er = escape
+                fx, fy = _grid_to_field(ec, er, field_height_cm)
+                escape_theta = math.atan2(fy - cy, fx - cx)
+                waypoints.append(RouteWaypoint(
+                    x_cm=fx, y_cm=fy, theta_rad=escape_theta,
+                    kind=WaypointKind.NAVIGATE,
+                ))
+                start_col, start_row = ec, er
 
         same_cell = (start_col == goal_col and start_row == goal_row)
 

@@ -66,6 +66,13 @@ CALIB_ALIGN = "align"
 GEOM_STEP_CM = 0.5
 HEADING_STEP_RAD = math.radians(1.0)
 
+# AUTO-mode ball detection cadence.  YOLO runs for a short burst of consecutive
+# frames once per cycle; the smoother accumulates the union of balls seen across
+# the burst and reconciliation fires once, on the final burst frame, against
+# that union.  A multi-frame burst recovers balls a single noisy frame misses.
+YOLO_CYCLE_FRAMES = 60   # ~2 s at 30 fps
+YOLO_BURST_FRAMES = 3
+
 
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
@@ -1043,7 +1050,10 @@ class MainGui:
         if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid):
             log_event("RECONCILE", "skipped — robot in danger zone")
             return
-        fresh = list(result.smoothed_ball_coordinates)
+        # Use the union of balls the smoother accumulated over the detection
+        # burst, not just the final frame's hits — a ball seen in any burst
+        # frame counts, which is the whole point of running a multi-frame burst.
+        fresh = self.pipeline.ball_smoother.live_coordinates()
 
         robot_xy = (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose else None
         robot_radius = float(self.params.get("robot_radius_cm", 30.0))
@@ -1644,12 +1654,16 @@ class MainGui:
         # HSV cross detection is disabled; the central cross is the manually
         # placed one, fed in as a red zone so it flows into the occupancy grid
         # and both panel overlays.
+        in_yolo_burst = self._frames_elapsed % YOLO_CYCLE_FRAMES < YOLO_BURST_FRAMES
         skip = (
             self.mode == AppMode.GUIDANCE_TEST
-            or (self.mode == AppMode.AUTO and self._tracked_balls is not None and self._frames_elapsed % 60 != 0)
+            or (self.mode == AppMode.AUTO and self._tracked_balls is not None and not in_yolo_burst)
         )
         if not skip and self.mode == AppMode.AUTO and self._tracked_balls is not None:
-            self._yolo_ran_this_frame = True
+            # Reconcile once per cycle, on the final burst frame, against the
+            # union the smoother accumulated over the whole burst.
+            if self._frames_elapsed % YOLO_CYCLE_FRAMES == YOLO_BURST_FRAMES - 1:
+                self._yolo_ran_this_frame = True
         cross = self.cross_red_zone()
         extra_red_zones = [cross] if cross is not None else []
         return self.pipeline.process(

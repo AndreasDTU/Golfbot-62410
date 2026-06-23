@@ -43,6 +43,30 @@ class BallCoordinateSmoother:
         self.next_track_id = 0
         self.tracks.clear()
 
+    def live_coordinates(self) -> list[SmoothedBallCoordinate]:
+        """Return every currently-live track, not just the latest frame's hits.
+
+        ``update`` returns only the balls matched in the frame it was called
+        with.  After a multi-frame detection burst the live tracks hold the
+        *union* of balls seen across the burst (each survives up to
+        ``max_missed_frames`` non-detections), so a caller that runs several
+        detection frames in a row can recover every ball that appeared in any
+        of them.  Pixel fields are not retained per track and are reported as
+        zero; callers needing them should use ``update``'s return value.
+        """
+        return [
+            SmoothedBallCoordinate(
+                track_id=track_id,
+                label=track.label,
+                center_px=(0, 0),
+                corrected_center_px=(0, 0),
+                radius_px=0,
+                cm_x=track.x_cm,
+                cm_y=track.y_cm,
+            )
+            for track_id, track in self.tracks.items()
+        ]
+
     def update(
         self,
         detections: list[BallDetection],

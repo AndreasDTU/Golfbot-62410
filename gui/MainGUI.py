@@ -306,6 +306,7 @@ class MainGui:
     _timer_start_time: float | None = None
     _timer_elapsed: float = 0.0
     _timer_running: bool = False
+    _frames_elapsed: int = 0
 
     # Red-cross collision re-localization (fire-on-exit state machine)
     _cross_tracker: CrossCollisionTracker = field(default_factory=CrossCollisionTracker)
@@ -979,6 +980,13 @@ class MainGui:
         if prev_state == BrainState.PICKUP and self._brain_state == BrainState.IDLE:
             self._remove_collected_ball()
 
+        
+        if (self._frames_elapsed % 60 == 0): #Hvis ikke alle bolde er fundet til at starte med, så får de ikke et hsv crop.
+            self._needs_verification_snapshot = True
+            #Check for any missed pickups every 60 frames (2 seconds at 30fps) to catch any balls that were displaced before the crop monitor could detect them. Also gives a chance to catch any missed pickups after the brain is done, before stopping
+        self._frames_elapsed += 1
+
+
         if (
             self._brain_state == BrainState.ERROR
             and self._brain.error_message == "ball_displaced"
@@ -995,7 +1003,6 @@ class MainGui:
             and self.robot_pose is not None
         ): #If brain is done, verify pickups to check for any missed balls before stopping
             self._needs_verification_snapshot = True
-            self._verify_pickups()
             #Could add a return 0 here to end program or someshit. Maybe move dance to here?
 
 
@@ -1609,7 +1616,7 @@ class MainGui:
         unload_reach = geometry.rear_cm + geometry.unload_extension_cm
         unload_pos = (unload_reach + 2.0, self.config.field.height_cm * 0.5)
 
-        from path.route_strategy import NearestNeighborStrategy, RoutePlannerInput
+        from path.route_strategy import NearestNeighborStrategy, IntersectionPriorityStrategy, RoutePlannerInput
         route_input = RoutePlannerInput(
             geometry_result=geometry_result,
             start_pose=start_pose,
@@ -1617,7 +1624,7 @@ class MainGui:
             field_height_cm=field_h,
             unload_position=unload_pos,
         )
-        strategy = NearestNeighborStrategy()
+        strategy = IntersectionPriorityStrategy()
         strategy_result = strategy.plan(route_input)
         draw_route_plan(image, strategy_result, geometry_result, mapper, self.config.field)
 

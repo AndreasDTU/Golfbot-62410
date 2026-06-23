@@ -241,7 +241,6 @@ class RobotCommander:
         )
 
         speed = max(min(raw_speed, cfg.drive_max_speed_pct), cfg.drive_min_speed_pct)
-        print(f"DRIVING speed={speed} dist_left={distance_left} dist_driven={distance_driven}")
         return speed
 
     def _target_speed_for_angle(self, total_angle: float) -> float:
@@ -332,8 +331,9 @@ class RobotCommander:
             speed = -speed
         self._current_speed = speed
         correction = (
-            heading_error_deg * self._config.adjust_gain * (speed * speed / 10000.0)
+            heading_error_deg * self._config.adjust_gain * max((speed * speed) / 10000.0, 0.1)
         )
+        #print(f"Base speed={speed}, correction={correction}")
         return self._send_wheel_speeds(speed - correction, speed + correction)
 
     def stop(self, force: bool = True) -> bool:

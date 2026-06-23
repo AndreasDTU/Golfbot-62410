@@ -426,6 +426,7 @@ def draw_legend(
     geometry_result: PickupGeometryResult,
     strategy_result: RouteStrategyResult,
     strategy_label: str = "",
+    compile_label: str = "",
 ) -> None:
     """Draw a compact legend at the bottom of the image."""
     h, w = image.shape[:2]
@@ -455,6 +456,13 @@ def draw_legend(
                     (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(image, strategy_label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (0, 220, 255), 1, cv2.LINE_AA)
+
+    # Compile strategy (below strategy name)
+    if compile_label:
+        cv2.putText(image, compile_label, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(image, compile_label, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (180, 180, 255), 1, cv2.LINE_AA)
 
 
 def draw_start_marker(
@@ -533,7 +541,7 @@ def _compute_and_render(
     geometry,
     seed: int,
     strategy_option: StrategyOption,
-    compile_strategy: CompileStrategy = CompileStrategy.MINIMAL,
+    compile_strategy: CompileStrategy = CompileStrategy.SINGLE_NODE,
     overlay_mode: OverlayMode = OverlayMode.HEATMAP,
     quiet: bool = False,
 ) -> tuple[np.ndarray, RoutePlan]:
@@ -602,7 +610,14 @@ def _compute_and_render(
     draw_route_plan(image, strategy_result, result, state.renderer.mapper, config.field, start,
                     route_plan=route_plan)
     draw_start_marker(image, start, state.renderer.mapper)
-    draw_legend(image, result, strategy_result, strategy_label=strategy_option.label)
+    _COMPILE_LABELS = {
+        CompileStrategy.SINGLE_NODE: "compile: single_node",
+        CompileStrategy.MINIMAL: "compile: minimal",
+        CompileStrategy.FULL: "compile: full",
+    }
+    draw_legend(image, result, strategy_result,
+                strategy_label=strategy_option.label,
+                compile_label=_COMPILE_LABELS.get(compile_strategy, compile_strategy.value))
 
     # Save output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -716,9 +731,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--compile",
-        choices=["full", "minimal"],
-        default="minimal",
-        help="Initial compile strategy: 'full' (Douglas-Peucker) or 'minimal' (greedy visibility)",
+        choices=["single_node", "full", "minimal"],
+        default="single_node",
+        help="Initial compile strategy: 'single_node' (one detour node), 'full' (Douglas-Peucker), or 'minimal' (greedy visibility)",
     )
     parser.add_argument(
         "--benchmark",
@@ -808,10 +823,9 @@ def main() -> int:
             render_current()
             print(f"\n{HELP_TEXT}")
         if key == ord("c"):
-            if compile_strategy == CompileStrategy.MINIMAL:
-                compile_strategy = CompileStrategy.FULL
-            else:
-                compile_strategy = CompileStrategy.MINIMAL
+            _compile_cycle = [CompileStrategy.SINGLE_NODE, CompileStrategy.MINIMAL, CompileStrategy.FULL]
+            _ci = _compile_cycle.index(compile_strategy) if compile_strategy in _compile_cycle else -1
+            compile_strategy = _compile_cycle[(_ci + 1) % len(_compile_cycle)]
             render_current()
             print(f"\n{HELP_TEXT}")
         if key == ord("v"):

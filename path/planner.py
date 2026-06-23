@@ -21,12 +21,16 @@ import numpy as np
 class CompileStrategy(str, Enum):
     """Path simplification strategy for the route compiler.
 
-    FULL    -- A* + Douglas-Peucker with collision-safe recursive splitting.
-               Preserves path shape; more intermediate waypoints.
-    MINIMAL -- A* + greedy farthest-visible-point simplification.
-               Fewest possible waypoints; better for stop-pivot-go guidance.
+    SINGLE_NODE -- A* + try to reduce the detour to one intermediate node.
+                   Falls back to greedy visibility if no single node works.
+                   Minimises turning; default for stop-pivot-go guidance.
+    FULL        -- A* + Douglas-Peucker with collision-safe recursive splitting.
+                   Preserves path shape; more intermediate waypoints.
+    MINIMAL     -- A* + greedy farthest-visible-point simplification.
+                   Fewest possible waypoints; better for stop-pivot-go guidance.
     """
 
+    SINGLE_NODE = "single_node"
     FULL = "full"
     MINIMAL = "minimal"
 
@@ -291,6 +295,86 @@ def _greedy_visibility_simplify(
     return result
 
 
+def _single_node_simplify(
+    blocked: np.ndarray,
+    path: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Try to reduce an A* path to a single intermediate node.
+
+    Phase 1: test every raw A* path point as the sole intermediate.
+    Phase 2: if no on-path point works, search a neighbourhood around the
+    path apex (the point farthest from the direct start→goal line).
+    A slightly wider berth often gives clear line-of-sight to both
+    endpoints even when the tight A* path does not.
+
+    Among valid candidates the one with shortest total distance is chosen.
+    Falls back to ``_greedy_visibility_simplify`` when no single node
+    can be found.
+    """
+    if len(path) <= 2:
+        return list(path)
+
+    start = path[0]
+    goal = path[-1]
+
+    # Direct line clear — no intermediate needed.
+    if _bresenham_clear(blocked, *start, *goal):
+        return [start, goal]
+
+    h, w = blocked.shape
+    best_point: tuple[int, int] | None = None
+    best_cost = float("inf")
+
+    def _try(c: int, r: int) -> None:
+        nonlocal best_point, best_cost
+        if not (0 <= r < h and 0 <= c < w):
+            return
+        if blocked[r, c]:
+            return
+        if not _bresenham_clear(blocked, *start, c, r):
+            return
+        if not _bresenham_clear(blocked, c, r, *goal):
+            return
+        cost = (math.hypot(c - start[0], r - start[1])
+                + math.hypot(goal[0] - c, goal[1] - r))
+        if cost < best_cost:
+            best_cost = cost
+            best_point = (c, r)
+
+    # Phase 1: raw A* path points.
+    for point in path[1:-1]:
+        _try(*point)
+
+    if best_point is not None:
+        return [start, best_point, goal]
+
+    # Phase 2: neighbourhood search around the path apex.
+    sx, sy = float(start[0]), float(start[1])
+    gx, gy = float(goal[0]), float(goal[1])
+    line_len = math.hypot(gx - sx, gy - sy)
+
+    if line_len > 1e-9:
+        line_dx = gx - sx
+        line_dy = gy - sy
+        apex_idx = max(
+            range(1, len(path) - 1),
+            key=lambda i: abs(
+                (path[i][0] - sx) * line_dy - (path[i][1] - sy) * line_dx
+            ),
+        )
+        ac, ar = path[apex_idx]
+        _SEARCH_R = 12
+        for dr in range(-_SEARCH_R, _SEARCH_R + 1):
+            for dc in range(-_SEARCH_R, _SEARCH_R + 1):
+                _try(ac + dc, ar + dr)
+
+    if best_point is not None:
+        return [start, best_point, goal]
+
+    # No single node found — fall back to greedy visibility.
+    return _greedy_visibility_simplify(blocked, path)
+
+
 def _emit_astar_waypoints(
     blocked: np.ndarray,
     start_col: int,
@@ -299,7 +383,7 @@ def _emit_astar_waypoints(
     goal_row: int,
     field_height_cm: float,
     target_theta: float,
-    strategy: CompileStrategy = CompileStrategy.MINIMAL,
+    strategy: CompileStrategy = CompileStrategy.SINGLE_NODE,
 ) -> list[RouteWaypoint]:
     """Run A*, simplify, and emit NAVIGATE waypoints between two grid cells.
 
@@ -310,7 +394,9 @@ def _emit_astar_waypoints(
     if grid_path is None or len(grid_path) <= 1:
         return []
 
-    if strategy == CompileStrategy.MINIMAL:
+    if strategy == CompileStrategy.SINGLE_NODE:
+        simplified = _single_node_simplify(blocked, grid_path)
+    elif strategy == CompileStrategy.MINIMAL:
         simplified = _greedy_visibility_simplify(blocked, grid_path)
     else:
         simplified = _safe_simplify(blocked, grid_path, epsilon=2.0)
@@ -362,7 +448,7 @@ def compile_route(
     start_pose: HybridPose,
     half_width_cm: float,
     field_height_cm: float,
-    strategy: CompileStrategy = CompileStrategy.MINIMAL,
+    strategy: CompileStrategy = CompileStrategy.SINGLE_NODE,
     balls: list[PlannedBallTarget] | None = None,
     ball_radius_cm: float = 2.0,
 ) -> RoutePlan:
@@ -513,7 +599,7 @@ def plan_route(
     geometry: RobotGeometry,
     field_config: FieldConfig,
     unload_position: tuple[float, float] | None = None,
-    compile_strategy: CompileStrategy = CompileStrategy.MINIMAL,
+    compile_strategy: CompileStrategy = CompileStrategy.SINGLE_NODE,
 ) -> RoutePlan:
     """Chain all three path layers to produce a ``RoutePlan``.
 

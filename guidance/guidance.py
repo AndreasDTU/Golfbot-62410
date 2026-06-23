@@ -165,11 +165,7 @@ class GuidanceController:
             )
             return GuidanceStatus.RUNNING if ok else GuidanceStatus.ERROR
 
-        max_heading_error = (
-            math.radians(4)
-            if (is_last and distance < self._waypoint_arrival_cm)
-            else self._config.max_heading_for_forward_rad
-        )
+        max_heading_error = self._config.max_heading_for_tank_rad if self._commander._current_speed == 0 else self._config.max_heading_for_forward_rad
         # 7. Large heading error — rotate in place.
         if abs(heading_error) > max_heading_error:
             ok = self._commander.turn(math.degrees(heading_error))

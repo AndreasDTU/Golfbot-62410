@@ -358,7 +358,8 @@ class DriveConfig:
     turn_coast_deg: float = 98.2
     turn_reset_noise_deg: float = 5.0
     # Heading correction
-    max_heading_for_forward_rad: float = math.radians(7.0)
+    max_heading_for_tank_rad: float = math.radians(5.0)
+    max_heading_for_forward_rad: float = math.radians(15.0)
     adjust_gain: float = 9.0
     # Waypoint arrival tolerance
     waypoint_arrival_cm: float = 3.0

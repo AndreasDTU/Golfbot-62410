@@ -75,13 +75,13 @@ PIPE_DEGREES_PER_UNIT = 45.0
 COLLECTOR_TRAVEL_UNITS = 5
 COLLECTOR_TRAVEL_SPEED = 50
 PICKUP_ASSIST_UNITS = 25
-PICKUP_ASSIST_SPEED = 60
+PICKUP_ASSIST_SPEED = 70
 # Drive units to back the tube clear of the cross/wall before raising it on a
 # constrained pickup. Tune for the smallest reverse that frees the tube.
 PICKUP_RETREAT_UNITS = 6
 PICKUP_RETREAT_SPEED = 20
-UNLOAD_FULL_CYCLE_UNITS = 22
-UNLOAD_FULL_CYCLE_SPEED = 75
+UNLOAD_FULL_CYCLE_UNITS = 23
+UNLOAD_FULL_CYCLE_SPEED = 90
 
 # --- Motor setup ---
 tank         = MoveTank(OUTPUT_B, OUTPUT_C)
@@ -265,6 +265,21 @@ def cmd_pickup_assist(retreat=False):
     return "ok: pipe pickup assist completed"
 
 def cmd_unload_full_cycle():
+    # Lower the tube over the ball (capture).
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(PICKUP_ASSIST_SPEED),
+        degrees=(PICKUP_ASSIST_UNITS + 5) * PIPE_DEGREES_PER_UNIT,
+        brake=True,
+        block=True
+    )
+
+    pipe_motor.on_for_degrees(
+        speed=SpeedPercent(-PICKUP_ASSIST_SPEED),
+        degrees=(PICKUP_ASSIST_UNITS + 5) * PIPE_DEGREES_PER_UNIT,
+        brake=True,
+        block=True
+    )
+
     """Full pipe motion for unloading at the goal only."""
     units = UNLOAD_FULL_CYCLE_UNITS
     speed = UNLOAD_FULL_CYCLE_SPEED
@@ -278,6 +293,9 @@ def cmd_unload_full_cycle():
     )
 
     time.sleep(3)
+
+    cmd_move(["-10"])
+    cmd_move(["10"])
 
     pipe_motor.on_for_degrees(
         speed=SpeedPercent(speed),

@@ -257,8 +257,9 @@ class BrainController:
 
     def _tick_pickup(self) -> BrainState:
         """Execute blocking pickup and advance."""
+        step = self._steps[self._step_cursor]
         try:
-            result = self._commander.pickup()
+            result = self._commander.pickup(retreat=step.obstacle_constrained)
             log_event(
                 "BRAIN", "PICKUP complete",
                 result=result, step=self._step_cursor,

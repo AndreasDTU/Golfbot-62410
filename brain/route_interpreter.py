@@ -49,7 +49,10 @@ def interpret_route(plan: RoutePlan) -> list[Step]:
                 waypoints=tuple(current_waypoints),
             ))
             current_waypoints = []
-            steps.append(Step(kind=StepKind.PICKUP))
+            steps.append(Step(
+                kind=StepKind.PICKUP,
+                obstacle_constrained=wp.obstacle_constrained,
+            ))
 
         elif wp.kind == WaypointKind.UNLOAD:
             current_waypoints.append(pose)

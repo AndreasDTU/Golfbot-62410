@@ -54,7 +54,12 @@ class Step:
 
     For DRIVE steps, *waypoints* is the list of HybridPose waypoints
     to feed to GuidanceController.  For PICKUP/UNLOAD, waypoints is empty.
+
+    *obstacle_constrained* is only meaningful for PICKUP steps: when True the
+    ball sits against the cross/wall, so the executor backs away before raising
+    the tube.
     """
 
     kind: StepKind
     waypoints: tuple[HybridPose, ...] = ()
+    obstacle_constrained: bool = False

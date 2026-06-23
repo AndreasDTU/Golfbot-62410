@@ -43,7 +43,7 @@ from path.models import (
     RouteWaypoint,
     WaypointKind,
 )
-from path.pickup_geometry import compute_pickup_geometry
+from path.pickup_geometry import PickupCategory, compute_pickup_geometry
 from path.route_strategy import (
     IntersectionPriorityStrategy,
     RoutePlannerInput,
@@ -500,30 +500,36 @@ def compile_route(
     collected: set[int] = set()
 
     # ----- Build target sequence from stops -----
-    # Each target: (x_cm, y_cm, theta_rad, WaypointKind, ball_index | None)
-    targets: list[tuple[float, float, float, WaypointKind, int | None]] = []
+    # Each target: (x_cm, y_cm, theta_rad, WaypointKind, ball_index | None,
+    #               obstacle_constrained)
+    targets: list[
+        tuple[float, float, float, WaypointKind, int | None, bool]
+    ] = []
 
     for stop in strategy_result.stops:
         cand = stop.candidate
+        # Non-SAFE pickups sit tight against the cross/wall, so the executor
+        # must back away before raising the tube.
+        constrained = cand.category != PickupCategory.SAFE
         if stop.intermediate_node is not None:
             inter = stop.intermediate_node
             # Constrained/in-between: intermediate → pickup → intermediate
             targets.append((inter.x_cm, inter.y_cm, inter.theta_rad,
-                            WaypointKind.NAVIGATE, None))
+                            WaypointKind.NAVIGATE, None, False))
             targets.append((cand.x_cm, cand.y_cm, cand.theta_rad,
-                            WaypointKind.PICKUP, stop.ball_index))
+                            WaypointKind.PICKUP, stop.ball_index, constrained))
             targets.append((inter.x_cm, inter.y_cm, inter.theta_rad,
-                            WaypointKind.NAVIGATE, None))
+                            WaypointKind.NAVIGATE, None, False))
         else:
             # Safe: direct pickup
             targets.append((cand.x_cm, cand.y_cm, cand.theta_rad,
-                            WaypointKind.PICKUP, stop.ball_index))
+                            WaypointKind.PICKUP, stop.ball_index, constrained))
 
     # Unload at end.
     unload_goal_cm: tuple[float, float] | None = None
     if strategy_result.unload_position is not None:
         ux, uy = strategy_result.unload_position
-        targets.append((ux, uy, 0.0, WaypointKind.UNLOAD, None))
+        targets.append((ux, uy, 0.0, WaypointKind.UNLOAD, None, False))
         unload_goal_cm = (0.0, uy)
 
     # ----- Connect targets with collision-free paths -----
@@ -539,7 +545,7 @@ def compile_route(
     ]
     cx, cy = start_pose.x_cm, start_pose.y_cm
 
-    for tx, ty, theta, kind, ball_idx in targets:
+    for tx, ty, theta, kind, ball_idx, constrained in targets:
         # Build blocked grid for this segment (with uncollected balls).
         # Exclude the ball we're about to pick up — we're driving to it.
         if balls:
@@ -579,6 +585,7 @@ def compile_route(
         waypoints.append(RouteWaypoint(
             x_cm=tx, y_cm=ty, theta_rad=theta,
             kind=kind, ball_index=ball_idx,
+            obstacle_constrained=constrained,
         ))
 
         # Mark ball as collected after pickup.

@@ -987,6 +987,41 @@ class MainGui:
         self._tracked_balls = [b for b in self._tracked_balls if b.track_id != nearest.track_id]
         log_event("BRAIN", "pickup removed from tracking", track_id=nearest.track_id)
 
+    def _robot_in_danger_zone(self, occupancy_grid: np.ndarray) -> bool:
+        """Return True if the robot is too close to an obstacle to safely replan.
+
+        Uses the distance field derived from the occupancy grid.  When the
+        clearance is below the safe manoeuvring radius the robot is still on
+        the approach→pickup→reverse segment and should finish that before any
+        route recalculation.
+        """
+        if self.robot_pose is None:
+            return False
+        field_h = self.config.field.height_cm
+        col = round(self.robot_pose.x_cm)
+        row = round(field_h - self.robot_pose.y_cm)
+        h, w = occupancy_grid.shape[:2]
+        if not (0 <= row < h and 0 <= col < w):
+            return False
+
+        # Build distance field (with wall borders, same as pickup_geometry)
+        combined = (occupancy_grid > 0).astype(np.uint8)
+        combined[0, :] = 1
+        combined[-1, :] = 1
+        combined[:, 0] = 1
+        combined[:, -1] = 1
+        free_mask = (combined == 0).astype(np.uint8)
+        distance_field = cv2.distanceTransform(free_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+
+        geometry = self.pose_estimator.robot_geometry_from_params(self.params)
+        half_width = geometry.width_cm * 0.5
+        safe_radius = max(
+            math.hypot(geometry.rear_cm, half_width),
+            math.hypot(geometry.tube_forward_cm, geometry.pipe_diameter_cm * 0.5),
+        )
+        clearance = float(distance_field[row, col])
+        return clearance < safe_radius
+
     def _tick_reconciliation(self) -> None:
         """Compare fresh YOLO detections against tracked balls; add/remove/replan as needed."""
         if self.mode != AppMode.AUTO or not self._yolo_ran_this_frame:
@@ -994,6 +1029,9 @@ class MainGui:
         self._yolo_ran_this_frame = False
 
         if self._tracked_balls is None or self._brain is None:
+            return
+        # Don't replan while the robot arm is active.
+        if self._brain_state in (BrainState.PICKUP, BrainState.UNLOAD):
             return
         result = self._last_result
         if result is None:
@@ -1005,9 +1043,8 @@ class MainGui:
 
         # Greedy nearest-neighbor matching (tracked → fresh)
         MATCH_RADIUS_CM = 15.0
-        matched_tracked: set[int] = set()   # indices into _tracked_balls
-        matched_fresh: set[int] = set()     # indices into fresh
-        moved_balls: list[tuple] = []       # (tracked_ball, fresh_ball) pairs where position shifted >1cm
+        match_map: dict[int, int] = {}      # tracked index → fresh index
+        matched_fresh: set[int] = set()      # indices into fresh
 
         for ti, tb in enumerate(self._tracked_balls):
             best_dist = MATCH_RADIUS_CM
@@ -1020,15 +1057,13 @@ class MainGui:
                     best_dist = dist
                     best_fi = fi
             if best_fi >= 0:
-                matched_tracked.add(ti)
+                match_map[ti] = best_fi
                 matched_fresh.add(best_fi)
-                if best_dist > 1.0:
-                    moved_balls.append((tb, fresh[best_fi]))
 
         # Missing balls: tracked but not matched (skip if under robot)
         missing = []
         for ti, tb in enumerate(self._tracked_balls):
-            if ti in matched_tracked:
+            if ti in match_map:
                 continue
             if robot_xy is not None:
                 dist_to_robot = ((tb.cm_x - robot_xy[0]) ** 2 + (tb.cm_y - robot_xy[1]) ** 2) ** 0.5
@@ -1041,36 +1076,47 @@ class MainGui:
 
         needs_replan = False
 
-        if moved_balls:
-            for old, new in moved_balls:
-                log_event("RECONCILE", "ball moved", track_id=old.track_id,
-                          dx=round(new.cm_x - old.cm_x, 1), dy=round(new.cm_y - old.cm_y, 1))
-            # Update tracked positions to fresh positions for matched balls
-            fresh_lookup = {}
-            for ti in matched_tracked:
-                for fi in matched_fresh:
-                    tb = self._tracked_balls[ti]
-                    fb = fresh[fi]
-                    dist = ((tb.cm_x - fb.cm_x) ** 2 + (tb.cm_y - fb.cm_y) ** 2) ** 0.5
-                    if dist <= MATCH_RADIUS_CM and ti not in fresh_lookup:
-                        fresh_lookup[ti] = fb
-            for ti, fb in fresh_lookup.items():
-                self._tracked_balls[ti] = fb
+        # Log changes
+        for b in missing:
+            log_event("RECONCILE", "ball missing — removed", track_id=b.track_id)
+        for b in new_balls:
+            log_event("RECONCILE", "new ball detected — added", x=round(b.cm_x, 1), y=round(b.cm_y, 1))
+
+        # Check for moved balls (matched but shifted >1cm)
+        for ti, fi in match_map.items():
+            tb = self._tracked_balls[ti]
+            fb = fresh[fi]
+            dist = ((tb.cm_x - fb.cm_x) ** 2 + (tb.cm_y - fb.cm_y) ** 2) ** 0.5
+            if dist > 1.0:
+                log_event("RECONCILE", "ball moved", track_id=tb.track_id,
+                          dx=round(fb.cm_x - tb.cm_x, 1), dy=round(fb.cm_y - tb.cm_y, 1))
+                needs_replan = True
+
+        if missing or new_balls:
             needs_replan = True
 
-        if missing:
-            for b in missing:
-                log_event("RECONCILE", "ball missing — removed", track_id=b.track_id)
-                self._tracked_balls.remove(b)
-            needs_replan = True
+        # Rebuild _tracked_balls: matched entries get fresh positions, plus new balls
+        updated = [fresh[match_map[ti]] for ti in sorted(match_map)]
+        updated.extend(new_balls)
 
-        if new_balls:
-            for b in new_balls:
-                log_event("RECONCILE", "new ball detected — added", x=round(b.cm_x, 1), y=round(b.cm_y, 1))
-            self._tracked_balls.extend(new_balls)
-            needs_replan = True
+        # Deduplicate by track_id (keep last/freshest entry)
+        seen: dict[int, int] = {}
+        deduped: list = []
+        for b in updated:
+            if b.track_id in seen:
+                deduped[seen[b.track_id]] = b
+            else:
+                seen[b.track_id] = len(deduped)
+                deduped.append(b)
+        self._tracked_balls = deduped
 
         if needs_replan and self.robot_pose is not None:
+            # Defer replan if robot is in a tight area (approach/pickup/reverse
+            # segment near a wall or cross).  The next reconciliation cycle
+            # will pick it up once the robot has reversed to the approach node.
+            if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid):
+                log_event("RECONCILE", "replan deferred — robot in danger zone")
+                return
             targets = self._ball_targets(self._tracked_balls)
             if targets:
                 if self._plan_and_load_route(targets):

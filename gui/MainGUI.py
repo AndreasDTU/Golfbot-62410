@@ -66,6 +66,13 @@ CALIB_ALIGN = "align"
 GEOM_STEP_CM = 0.5
 HEADING_STEP_RAD = math.radians(1.0)
 
+# Display fit: when the camera + schematic panels are wider/taller than the
+# screen (e.g. a laptop's built-in Retina panel), both are downscaled by a
+# single factor so the whole window stays on screen.  These leave room for
+# window chrome / the macOS menu bar and the status + button rows packed below.
+SCREEN_MARGIN_PX = 80
+CONTROLS_BUDGET_PX = 170
+
 # AUTO-mode ball detection cadence.  YOLO runs for a short burst of consecutive
 # frames once per cycle; the smoother accumulates the union of balls seen across
 # the burst and reconciliation fires once, on the final burst frame, against
@@ -82,6 +89,17 @@ ROUTE_VIEW_WINDOW_NAME = "Route View"
 # ---------------------------------------------------------------------------
 # Hardcoded test routes for Stage 2 guidance isolation testing
 # ---------------------------------------------------------------------------
+
+def _fit_scale(content_w: int, content_h: int, avail_w: int, avail_h: int) -> float:
+    """Largest factor <= 1.0 that fits content_w x content_h into the avail box.
+
+    Returns 1.0 (no scaling) when the content already fits or the inputs are
+    degenerate, so callers never enlarge a panel beyond its native size.
+    """
+    if content_w <= 0 or content_h <= 0 or avail_w <= 0 or avail_h <= 0:
+        return 1.0
+    return min(avail_w / content_w, avail_h / content_h, 1.0)
+
 
 def _route_waypoints(coords: list[tuple[float, float]]) -> list[HybridPose]:
     """Build a waypoint list with theta pointing toward the next waypoint."""
@@ -1947,6 +1965,17 @@ class MainGui:
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._root.bind("<Key>", self._on_key)
 
+        # Downscale the camera + schematic panels to fit the active display so
+        # the window never overflows the screen (the panels alone are
+        # left_w + right_w wide at native size).  Pack auto-sizes the window
+        # around the scaled panels, so no explicit geometry() is needed.
+        self._display_scale = _fit_scale(
+            self._left_w + self._right_w,
+            max(self._left_h, self._right_h),
+            self._root.winfo_screenwidth() - SCREEN_MARGIN_PX,
+            self._root.winfo_screenheight() - SCREEN_MARGIN_PX - CONTROLS_BUDGET_PX,
+        )
+
         # PhotoImage references (prevent GC)
         self._left_photo: ImageTk.PhotoImage | None = None
         self._right_photo: ImageTk.PhotoImage | None = None
@@ -2045,10 +2074,19 @@ class MainGui:
         self._calib_frame_visible = False
         self._last_gui_seq = -1
 
-    def _bgr_to_photo(self, bgr: np.ndarray) -> ImageTk.PhotoImage:
-        """Convert a BGR numpy array to a tkinter PhotoImage."""
+    def _bgr_to_photo(self, bgr: np.ndarray, scale: float = 1.0) -> ImageTk.PhotoImage:
+        """Convert a BGR numpy array to a tkinter PhotoImage, optionally downscaled.
+
+        ``scale`` is applied only to the main camera/schematic panels.  The
+        corner/cross/route windows convert at native size (scale=1.0) because
+        their click handlers map event pixels straight to image coordinates.
+        """
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        return ImageTk.PhotoImage(image=Image.fromarray(rgb))
+        image = Image.fromarray(rgb)
+        if scale != 1.0:
+            size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+            image = image.resize(size, Image.BILINEAR)
+        return ImageTk.PhotoImage(image=image)
 
     # ------------------------------------------------------------------
     # GUI tick (main thread, called via root.after)
@@ -2090,10 +2128,10 @@ class MainGui:
         if left is not None and right is not None and seq != self._last_gui_seq:
             self._last_gui_seq = seq
 
-            self._left_photo = self._bgr_to_photo(left)
+            self._left_photo = self._bgr_to_photo(left, self._display_scale)
             self._left_label.configure(image=self._left_photo)
 
-            self._right_photo = self._bgr_to_photo(right)
+            self._right_photo = self._bgr_to_photo(right, self._display_scale)
             self._right_label.configure(image=self._right_photo)
 
         # Update secondary window images

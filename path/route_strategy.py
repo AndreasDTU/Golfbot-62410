@@ -471,15 +471,24 @@ def _intersection_priority_plan(
             cx, cy = best_orange.candidate.x_cm, best_orange.candidate.y_cm
 
     # Greedy nearest with deferred candidate selection.
+    # When few balls remain, factor in distance to the unload point so the
+    # route ends near the delivery zone instead of across the field.
+    _UNLOAD_TAIL = 2  # consider unload cost for the last N balls
+    unload_pos = inp.unload_position
+
     while remaining:
         best_stop: RouteStop | None = None
         best_dist = math.inf
+        use_unload = unload_pos is not None and len(remaining) <= _UNLOAD_TAIL
 
         for i in remaining:
             stop = _best_stop_for_ball_from(i, geo, inp.field_height_cm, cx, cy)
             if stop is None:
                 continue
             d = _approach_distance(stop, cx, cy)
+            if use_unload:
+                d += math.hypot(stop.candidate.x_cm - unload_pos[0],
+                                stop.candidate.y_cm - unload_pos[1])
             if d < best_dist:
                 best_dist = d
                 best_stop = stop

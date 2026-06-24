@@ -1040,7 +1040,7 @@ class MainGui:
         # (approach/pickup/reverse near a wall or cross).  Treated like an
         # active arm: by returning before _tracked_balls is updated we leave
         # the current route intact.
-        if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid):
+        if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid) and self._brain.state != BrainState.ERROR:
             log_event("RECONCILE", "skipped — robot in danger zone")
             return
         fresh = list(result.smoothed_ball_coordinates)
@@ -1081,7 +1081,7 @@ class MainGui:
         # New balls: fresh but not matched to any tracked ball
         new_balls = [fresh[fi] for fi in range(len(fresh)) if fi not in matched_fresh]
 
-        needs_replan = False
+        needs_replan = self._brain.state == BrainState.ERROR
 
         # Log changes
         for b in missing:
@@ -1119,13 +1119,11 @@ class MainGui:
 
         if needs_replan and self.robot_pose is not None:
             targets = self._ball_targets(self._tracked_balls)
-            if targets:
-                if self._plan_and_load_route(targets):
-                    self.message = f"Reconciled — replanned ({self._brain.step_count} steps)"
-                else:
-                    self.message = "Reconcile: no route found"
-            elif not self._tracked_balls:
-                log_event("RECONCILE", "no balls remaining")
+
+            if self._plan_and_load_route(targets):
+                self.message = f"Reconciled — replanned ({self._brain.step_count} steps)"
+            else:
+                self.message = "Reconcile: no route found"
 
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         """Build planner ball targets from smoothed field coordinates."""

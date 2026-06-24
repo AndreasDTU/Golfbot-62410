@@ -402,12 +402,21 @@ def _best_stop_for_ball_from(
         best_safe = min(safe, key=lambda c: math.hypot(c.x_cm - cx, c.y_cm - cy))
         return RouteStop(candidate=best_safe, intermediate_node=None, ball_index=ball_idx)
 
-    # Non-safe: try in preference order (IN_BETWEEN before CONSTRAINED).
-    non_safe.sort(key=lambda c: (
-        _CATEGORY_PREFERENCE[c.category],
-        math.hypot(c.x_cm - cx, c.y_cm - cy),
-    ))
-    for cand in non_safe:
+    # Non-safe: pick the angular median of the best category so the
+    # approach bisects the valid arc (e.g. 45° into a corner).
+    non_safe.sort(key=lambda c: _CATEGORY_PREFERENCE[c.category])
+    best_cat = non_safe[0].category
+    best_group = [c for c in non_safe if c.category == best_cat]
+    # Sort by heading and take the median candidate.
+    best_group.sort(key=lambda c: c.theta_rad)
+    median_cand = best_group[len(best_group) // 2]
+    intermediate = _find_intermediate_node(median_cand, distance_field, safe_radius, field_height_cm)
+    if intermediate is not None:
+        return RouteStop(candidate=median_cand, intermediate_node=intermediate, ball_index=ball_idx)
+    # Median had no intermediate — fall through to try others.
+    for cand in best_group:
+        if cand is median_cand:
+            continue
         intermediate = _find_intermediate_node(cand, distance_field, safe_radius, field_height_cm)
         if intermediate is not None:
             return RouteStop(candidate=cand, intermediate_node=intermediate, ball_index=ball_idx)

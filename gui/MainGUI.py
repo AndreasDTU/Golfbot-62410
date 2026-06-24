@@ -954,6 +954,8 @@ class MainGui:
             self._timer_elapsed = now - self._timer_start_time
 
             if self._brain_state and self._brain_state.name == "DONE":
+                if self._tracked_balls is not None:
+                    self._tracked_balls.clear()
                 self._timer_running = False
 
         prev_state = self._brain_state

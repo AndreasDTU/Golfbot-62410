@@ -96,7 +96,7 @@ class RobotGeometry:
     tube_forward_cm: float  # origin to pickup tube tip (along heading)
     tube_right_cm: float  # lateral offset of tube tip (0 = centered)
     tube_width_cm: float = 6.0  # pickup tube opening diameter
-    mouth_radius_cm: float = 2.0  # tolerance radius around tube tip
+    mouth_radius_cm: float = 0.0  # tolerance radius around tube tip
     unload_extension_cm: float = 30.0  # reverse distance when unloading
     pipe_diameter_cm: float = 4.5  # physical pickup pipe outer diameter
 

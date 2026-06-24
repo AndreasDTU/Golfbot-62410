@@ -265,21 +265,6 @@ def cmd_pickup_assist(retreat=False):
     return "ok: pipe pickup assist completed"
 
 def cmd_unload_full_cycle():
-    # Lower the tube over the ball (capture).
-    pipe_motor.on_for_degrees(
-        speed=SpeedPercent(PICKUP_ASSIST_SPEED),
-        degrees=(PICKUP_ASSIST_UNITS + 5) * PIPE_DEGREES_PER_UNIT,
-        brake=True,
-        block=True
-    )
-
-    pipe_motor.on_for_degrees(
-        speed=SpeedPercent(-PICKUP_ASSIST_SPEED),
-        degrees=(PICKUP_ASSIST_UNITS + 5) * PIPE_DEGREES_PER_UNIT,
-        brake=True,
-        block=True
-    )
-
     """Full pipe motion for unloading at the goal only."""
     units = UNLOAD_FULL_CYCLE_UNITS
     speed = UNLOAD_FULL_CYCLE_SPEED
@@ -294,8 +279,8 @@ def cmd_unload_full_cycle():
 
     time.sleep(3)
 
-    cmd_move(["-10"])
-    cmd_move(["10"])
+    cmd_move(["", "-10"])
+    cmd_move(["", "10"])
 
     pipe_motor.on_for_degrees(
         speed=SpeedPercent(speed),

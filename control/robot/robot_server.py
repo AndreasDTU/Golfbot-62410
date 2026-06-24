@@ -279,8 +279,8 @@ def cmd_unload_full_cycle():
 
     time.sleep(3)
 
-    cmd_move(["", "-10"])
-    cmd_move(["", "10"])
+    cmd_move(["", "-3", "25"])
+    cmd_move(["", "3", "25"])
 
     pipe_motor.on_for_degrees(
         speed=SpeedPercent(speed),

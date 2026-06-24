@@ -383,6 +383,8 @@ def main() -> None:
                         help=f"Trials per angle (default: {DEFAULT_TRIALS})")
     parser.add_argument("--dummy", action="store_true",
                         help="Simulate robot commands (no real connection)")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Calibrate turn coasting from main.")
     args = parser.parse_args()
 
     try:

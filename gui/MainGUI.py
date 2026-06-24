@@ -320,6 +320,9 @@ class MainGui:
     # Overlay mode for right-panel heatmap/collision visualization
     _overlay_mode: OverlayMode = OverlayMode.NONE
 
+    # ArUco marker debug overlay on left panel
+    _show_aruco_overlay: bool = False
+
     # Route View window state
     _route_view_open: bool = False
     _route_view_strategy_index: int = 0
@@ -1690,6 +1693,8 @@ class MainGui:
 
         if self._tracked_balls is not None:
             self._draw_crop_overlay(left)
+        if self._show_aruco_overlay:
+            self._draw_aruco_overlay(left)
         if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
             left = cv2.resize(left, (self._left_w, self._left_h), interpolation=cv2.INTER_LINEAR)
         if self.mode == AppMode.CALIBRATE:
@@ -1735,6 +1740,34 @@ class MainGui:
                     continue
 
             cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), (60, 200, 60), 2, cv2.LINE_AA)
+
+    def _draw_aruco_overlay(self, image: np.ndarray) -> None:
+        """Draw detected ArUco marker outlines and headings on the topdown frame."""
+        detected_ids = set(self._latest_observations.keys())
+        expected_ids = set(self.config.robot.marker_ids)
+        heading_len = 40  # pixels for the heading line
+
+        for obs in self._latest_observations.values():
+            # Draw marker outline as green polygon
+            pts = obs.corners.astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(image, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # Label with marker ID at center
+            cx, cy = int(round(obs.center[0])), int(round(obs.center[1]))
+            cv2.putText(image, f"ID {obs.marker_id}", (cx + 8, cy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # Draw heading line from center along yaw_rad
+            ex = int(round(cx + heading_len * math.cos(obs.yaw_rad)))
+            ey = int(round(cy + heading_len * math.sin(obs.yaw_rad)))
+            cv2.arrowedLine(image, (cx, cy), (ex, ey), (0, 255, 0), 2, cv2.LINE_AA, tipLength=0.3)
+
+        # Show LOST text for missing markers
+        missing = expected_ids - detected_ids
+        for i, mid in enumerate(sorted(missing)):
+            y = 30 + i * 25
+            cv2.putText(image, f"ID {mid}: LOST", (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
 
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.
@@ -2207,6 +2240,9 @@ class MainGui:
             self._cycle_overlay_mode()
         elif ch == "s":
             self._handle_button("stop")
+        elif ch == "d":
+            self._show_aruco_overlay = not self._show_aruco_overlay
+            self.message = f"ArUco overlay: {'on' if self._show_aruco_overlay else 'off'}"
 
     _OVERLAY_CYCLE = [OverlayMode.NONE, OverlayMode.HEATMAP, OverlayMode.COLLISION]
 

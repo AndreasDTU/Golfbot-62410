@@ -474,3 +474,33 @@ class HomographyCalibrator:
         if self.transform_matrix is None:
             return None
         return cv2.warpPerspective(undistorted_frame, self.transform_matrix, self.camera.topdown_warp_size)
+
+    def marker_warp_offset_px(self) -> tuple[int, int]:
+        """Pixel border added on each side of the field in the marker-detection warp."""
+        width, height = self.camera.topdown_warp_size
+        margin_cm = self.camera.marker_warp_margin_cm
+        offset_x = int(round(margin_cm * width / self.field.width_cm))
+        offset_y = int(round(margin_cm * height / self.field.height_cm))
+        return offset_x, offset_y
+
+    def marker_warp(self, undistorted_frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int]] | None:
+        """Warp into a top-down frame padded by the marker margin on all sides.
+
+        This is a background-only view used solely for robot ArUco detection: the
+        playable field still occupies the same pixels as :meth:`warp`, but a border
+        is added so markers near a wall/corner are not cropped. Returns the padded
+        frame together with the ``(offset_x, offset_y)`` border so callers can map
+        detected pixels back into the unpadded field pixel space.
+        """
+        if self.transform_matrix is None:
+            return None
+        width, height = self.camera.topdown_warp_size
+        offset_x, offset_y = self.marker_warp_offset_px()
+        translation = np.array(
+            [[1.0, 0.0, offset_x], [0.0, 1.0, offset_y], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        padded_transform = translation @ self.transform_matrix
+        padded_size = (width + 2 * offset_x, height + 2 * offset_y)
+        frame = cv2.warpPerspective(undistorted_frame, padded_transform, padded_size)
+        return frame, (offset_x, offset_y)

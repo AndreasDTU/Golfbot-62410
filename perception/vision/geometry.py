@@ -40,27 +40,15 @@ class CoordinateMapper:
         bottom_left = corners[np.argmax(diffs)]
         return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
 
-    @property
-    def _topdown_world_span_cm(self) -> tuple[float, float]:
-        """World extent (cm) covered by the top-down warp, including the margin border."""
-        margin = self.camera.topdown_margin_cm
-        return (self.field.width_cm + 2.0 * margin, self.field.height_cm + 2.0 * margin)
-
     def destination_corners(self, size: tuple[int, int] | None = None) -> np.ndarray:
-        """Build the playable-field rectangle (inset by the margin) for a perspective warp."""
+        """Build the destination rectangle for a perspective warp."""
         width, height = size or self.camera.topdown_warp_size
-        span_w, span_h = self._topdown_world_span_cm
-        margin = self.camera.topdown_margin_cm
-        x0 = margin * (width - 1) / span_w
-        x1 = (margin + self.field.width_cm) * (width - 1) / span_w
-        y0 = margin * (height - 1) / span_h
-        y1 = (margin + self.field.height_cm) * (height - 1) / span_h
         return np.array(
             [
-                [x0, y0],
-                [x1, y0],
-                [x1, y1],
-                [x0, y1],
+                [0, 0],
+                [width - 1, 0],
+                [width - 1, height - 1],
+                [0, height - 1],
             ],
             dtype=np.float32,
         )
@@ -79,19 +67,15 @@ class CoordinateMapper:
     def topdown_px_to_field_cm(self, point_px: np.ndarray | tuple[float, float]) -> tuple[float, float]:
         """Convert fixed top-down pixels to bottom-left-origin field centimeters."""
         width, height = self.camera.topdown_warp_size
-        span_w, span_h = self._topdown_world_span_cm
-        margin = self.camera.topdown_margin_cm
-        x_cm = float(point_px[0]) * span_w / max(1, width - 1) - margin
-        y_cm = self.field.height_cm - (float(point_px[1]) * span_h / max(1, height - 1) - margin)
+        x_cm = float(point_px[0]) * self.field.width_cm / max(1, width - 1)
+        y_cm = self.field.height_cm - (float(point_px[1]) * self.field.height_cm / max(1, height - 1))
         return float(x_cm), float(y_cm)
 
     def field_cm_to_topdown_pixel(self, point_cm: tuple[float, float]) -> tuple[float, float]:
         """Convert bottom-left-origin field centimeters to fixed top-down pixels."""
         width, height = self.camera.topdown_warp_size
-        span_w, span_h = self._topdown_world_span_cm
-        margin = self.camera.topdown_margin_cm
-        x_px = (float(point_cm[0]) + margin) * (width - 1) / span_w
-        y_px = (self.field.height_cm - float(point_cm[1]) + margin) * (height - 1) / span_h
+        x_px = float(point_cm[0]) * (width - 1) / self.field.width_cm
+        y_px = (self.field.height_cm - float(point_cm[1])) * (height - 1) / self.field.height_cm
         return float(x_px), float(y_px)
 
     def field_cm_to_topdown_px_unflipped(self, x_cm: float, y_cm: float) -> tuple[float, float]:
@@ -101,11 +85,9 @@ class CoordinateMapper:
         world coordinates are expressed in the image-oriented top-down plane.
         """
         width, height = self.camera.topdown_warp_size
-        span_w, span_h = self._topdown_world_span_cm
-        margin = self.camera.topdown_margin_cm
-        scale_x = (width - 1) / span_w
-        scale_y = (height - 1) / span_h
-        return (x_cm + margin) * scale_x, (y_cm + margin) * scale_y
+        scale_x = (width - 1) / self.field.width_cm
+        scale_y = (height - 1) / self.field.height_cm
+        return x_cm * scale_x, y_cm * scale_y
 
     def map_point_between_frames(
         self,
@@ -127,10 +109,8 @@ class CoordinateMapper:
     ) -> tuple[float, float]:
         """Convert top-down source pixels to bottom-left-origin field centimeters."""
         src_width, src_height = source_size
-        span_w, span_h = self._topdown_world_span_cm
-        margin = self.camera.topdown_margin_cm
-        x_cm = float(point[0]) * span_w / max(1, src_width - 1) - margin
-        y_cm = self.field.height_cm - (float(point[1]) * span_h / max(1, src_height - 1) - margin)
+        x_cm = float(point[0]) * self.field.width_cm / max(1, src_width - 1)
+        y_cm = self.field.height_cm - (float(point[1]) * self.field.height_cm / max(1, src_height - 1))
         return (
             float(np.clip(x_cm, 0.0, self.field.width_cm)),
             float(np.clip(y_cm, 0.0, self.field.height_cm)),

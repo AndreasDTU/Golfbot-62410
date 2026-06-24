@@ -1679,14 +1679,18 @@ class MainGui:
         )
 
     def _estimate_pose(self, result: VisionFrameResult) -> None:
-        topdown = result.preprocessed.topdown
-        if topdown is None or self.params is None:
+        # Robot ArUco detection runs on the padded marker warp so markers near a
+        # wall/corner are not cropped; observations are mapped back into the normal
+        # field space, so pose, overlays, and balls remain on the unpadded view.
+        marker_topdown = result.preprocessed.marker_topdown
+        marker_offset_px = result.preprocessed.marker_offset_px
+        if marker_topdown is None or self.params is None:
             self.robot_pose = None
             self._latest_observations = {}
             self._latest_parallax = None
             return
         pose, _origin_px, observations, parallax = self.pose_estimator.estimate(
-            topdown, self.params, self.calibration,
+            marker_topdown, self.params, self.calibration, marker_offset_px,
         )
         self.robot_pose = pose
         self._latest_observations = observations

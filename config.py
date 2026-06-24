@@ -82,6 +82,11 @@ class CameraConfig:
 
     camera_index: int = 1
     topdown_warp_size: tuple[int, int] = (800, 600)
+    # Extra world margin (cm) kept around the playable field in the top-down warp.
+    # The field maps to an inset rectangle so robot markers near a wall/corner are
+    # not cropped out of the warped frame and stay detectable. Field pose is
+    # preserved because every px<->cm conversion accounts for this margin.
+    topdown_margin_cm: float = 10.0
     required_aruco_ids: tuple[int, ...] = (0, 1, 2, 3)
     wall_thickness_cm: float = 1.6
     marker_outer_offset_cm: float = 8.0

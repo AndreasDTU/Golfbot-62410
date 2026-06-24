@@ -1147,13 +1147,14 @@ class MainGui:
 
         if needs_replan and self.robot_pose is not None:
             targets = self._ball_targets(self._tracked_balls)
-            if targets:
-                if self._plan_and_load_route(targets):
+            if self._plan_and_load_route(targets):
+                if targets:
                     self.message = f"Reconciled — replanned ({self._brain.step_count} steps)"
                 else:
-                    self.message = "Reconcile: no route found"
-            elif not self._tracked_balls:
-                log_event("RECONCILE", "no balls remaining")
+                    self.message = f"All balls collected — returning to goal ({self._brain.step_count} steps)"
+                    log_event("RECONCILE", "no balls remaining — returning to goal")
+            else:
+                self.message = "Reconcile: no route found"
 
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         """Build planner ball targets from smoothed field coordinates."""
@@ -1212,16 +1213,22 @@ class MainGui:
         return True
 
     def _replan_after_displacement(self) -> None:
-        """Replan route from current tracked balls after a ball-displaced error."""
-        balls = self._tracked_balls if self._tracked_balls else []
-        if not balls:
-            self.message = "Rescan: no tracked balls — stopping"
-            return
-        if not self._plan_and_load_route(self._ball_targets(balls)):
+        """Recover from an error: replan to remaining balls, or home to goal.
+
+        When no balls remain, an empty target list still yields a goal-only
+        route (drive to the unload position + UNLOAD), so the robot always
+        returns to goal instead of stalling in ERROR.
+        """
+        targets = self._ball_targets(self._tracked_balls) if self._tracked_balls else []
+        if not self._plan_and_load_route(targets):
             self.message = "Rescan: no route found — stopping"
             return
-        self.message = f"Replanned — {self._brain.step_count} steps"
-        log_event("BRAIN", "replanned after rescan", steps=self._brain.step_count)
+        if targets:
+            self.message = f"Replanned — {self._brain.step_count} steps"
+            log_event("BRAIN", "replanned after rescan", steps=self._brain.step_count)
+        else:
+            self.message = f"All balls collected — returning to goal ({self._brain.step_count} steps)"
+            log_event("BRAIN", "no balls left — returning to goal", steps=self._brain.step_count)
 
     # ------------------------------------------------------------------
     # Red-cross collision re-localization (fire-on-exit)

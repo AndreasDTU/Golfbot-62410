@@ -80,20 +80,27 @@ class RobotMarkerDetector:
         self,
         frame: np.ndarray,
         parallax_config: ParallaxConfig,
+        origin_offset_px: tuple[int, int] = (0, 0),
     ) -> dict[int, RobotMarkerObservation]:
-        """Detect robot markers and immediately project their geometry to ground."""
+        """Detect robot markers and immediately project their geometry to ground.
+
+        ``origin_offset_px`` is the per-side border of a padded marker-detection
+        warp; detected pixels are shifted back into the unpadded field pixel space
+        so all downstream parallax, projection, and pose math is unchanged.
+        """
         observations: dict[int, RobotMarkerObservation] = {}
         corners, ids = self.detect_markers(frame)
         if ids is None:
             return observations
 
+        offset = np.array(origin_offset_px, dtype=np.float32)
         wanted = set(self.marker_ids)
         for marker_corners, raw_id in zip(corners, ids.flatten().tolist()):
             marker_id = int(raw_id)
             if marker_id not in wanted:
                 continue
 
-            pts = marker_corners.reshape(4, 2).astype(np.float32)
+            pts = marker_corners.reshape(4, 2).astype(np.float32) - offset
             ground_pts = np.array(
                 [self.parallax_corrector.correct_point_float(point, parallax_config) for point in pts],
                 dtype=np.float32,
@@ -227,15 +234,23 @@ class RobotPoseEstimator:
         frame_bgr: np.ndarray,
         params: dict[str, object],
         calibration: dict[str, Any] | None,
+        marker_offset_px: tuple[int, int] = (0, 0),
     ) -> tuple[
         RobotPose | None,
         tuple[float, float] | None,
         dict[int, RobotMarkerObservation],
         ParallaxConfig,
     ]:
-        """Estimate the robot pose from the current warped frame and live state."""
+        """Estimate the robot pose from the current warped frame and live state.
+
+        ``frame_bgr`` may be a marker-detection warp padded by ``marker_offset_px``
+        on each side; observations are mapped back into the unpadded field pixel
+        space so the resulting pose is identical to the unpadded view.
+        """
         parallax_config = self.parallax_config_from_live_params(params, calibration)
-        observations = self.marker_detector.extract_observations(frame_bgr, parallax_config)
+        observations = self.marker_detector.extract_observations(
+            frame_bgr, parallax_config, marker_offset_px,
+        )
 
         if calibration is None:
             self._reset_smoothing()
@@ -256,8 +271,12 @@ class RobotPoseEstimator:
             return None, None, observations, parallax_config
 
         origin = np.mean(np.array(origins, dtype=np.float32), axis=0)
+        # Observations were shifted back into the unpadded field pixel space, so the
+        # conversion uses the field size (padded frame minus the per-side border).
+        offset_x, offset_y = marker_offset_px
         source_height, source_width = frame_bgr.shape[:2]
-        x_cm, y_cm = self.mapper.pixel_float_to_field_cm(origin, (source_width, source_height))
+        field_size = (source_width - 2 * offset_x, source_height - 2 * offset_y)
+        x_cm, y_cm = self.mapper.pixel_float_to_field_cm(origin, field_size)
         heading_rad = math.atan2(
             sum(math.sin(angle) for angle in field_headings),
             sum(math.cos(angle) for angle in field_headings),

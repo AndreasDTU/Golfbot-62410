@@ -402,12 +402,21 @@ def _best_stop_for_ball_from(
         best_safe = min(safe, key=lambda c: math.hypot(c.x_cm - cx, c.y_cm - cy))
         return RouteStop(candidate=best_safe, intermediate_node=None, ball_index=ball_idx)
 
-    # Non-safe: try in preference order (IN_BETWEEN before CONSTRAINED).
-    non_safe.sort(key=lambda c: (
-        _CATEGORY_PREFERENCE[c.category],
-        math.hypot(c.x_cm - cx, c.y_cm - cy),
-    ))
-    for cand in non_safe:
+    # Non-safe: pick the angular median of the best category so the
+    # approach bisects the valid arc (e.g. 45° into a corner).
+    non_safe.sort(key=lambda c: _CATEGORY_PREFERENCE[c.category])
+    best_cat = non_safe[0].category
+    best_group = [c for c in non_safe if c.category == best_cat]
+    # Sort by heading and take the median candidate.
+    best_group.sort(key=lambda c: c.theta_rad)
+    median_cand = best_group[len(best_group) // 2]
+    intermediate = _find_intermediate_node(median_cand, distance_field, safe_radius, field_height_cm)
+    if intermediate is not None:
+        return RouteStop(candidate=median_cand, intermediate_node=intermediate, ball_index=ball_idx)
+    # Median had no intermediate — fall through to try others.
+    for cand in best_group:
+        if cand is median_cand:
+            continue
         intermediate = _find_intermediate_node(cand, distance_field, safe_radius, field_height_cm)
         if intermediate is not None:
             return RouteStop(candidate=cand, intermediate_node=intermediate, ball_index=ball_idx)
@@ -462,15 +471,24 @@ def _intersection_priority_plan(
             cx, cy = best_orange.candidate.x_cm, best_orange.candidate.y_cm
 
     # Greedy nearest with deferred candidate selection.
+    # When few balls remain, factor in distance to the unload point so the
+    # route ends near the delivery zone instead of across the field.
+    _UNLOAD_TAIL = 2  # consider unload cost for the last N balls
+    unload_pos = inp.unload_position
+
     while remaining:
         best_stop: RouteStop | None = None
         best_dist = math.inf
+        use_unload = unload_pos is not None and len(remaining) <= _UNLOAD_TAIL
 
         for i in remaining:
             stop = _best_stop_for_ball_from(i, geo, inp.field_height_cm, cx, cy)
             if stop is None:
                 continue
             d = _approach_distance(stop, cx, cy)
+            if use_unload:
+                d += math.hypot(stop.candidate.x_cm - unload_pos[0],
+                                stop.candidate.y_cm - unload_pos[1])
             if d < best_dist:
                 best_dist = d
                 best_stop = stop

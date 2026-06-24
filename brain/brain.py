@@ -15,7 +15,7 @@ from control.telemetry import log_event
 from guidance.guidance import GuidanceController, GuidanceStatus
 from localization.localization import normalize_angle
 from localization.models import RobotPose
-from path.models import RoutePlan
+from path.models import HybridPose, RoutePlan
 
 from brain.models import BrainIntent, BrainState, IntentAction, StepKind
 from brain.route_interpreter import interpret_route
@@ -171,7 +171,7 @@ class BrainController:
             return self._state
 
         if self._state == BrainState.IDLE:
-            return self._tick_idle()
+            return self._tick_idle(pose)
 
         if self._state == BrainState.DRIVE:
             return self._tick_drive(pose, dt_s)
@@ -188,7 +188,7 @@ class BrainController:
     # State handlers
     # ------------------------------------------------------------------
 
-    def _tick_idle(self) -> BrainState:
+    def _tick_idle(self, pose: RobotPose | None) -> BrainState:
         """Dispatch the next step or transition to DONE."""
         if self._step_cursor >= len(self._steps):
             self._state = BrainState.DONE
@@ -199,7 +199,14 @@ class BrainController:
         step = self._steps[self._step_cursor]
 
         if step.kind == StepKind.DRIVE:
-            self._guidance.set_route(list(step.waypoints))
+            waypoints = list(step.waypoints)
+            # After a constrained pickup retreat the robot is displaced from
+            # the planned route start — prepend actual position so XTE is valid.
+            if self._step_cursor > 0 and pose is not None:
+                prev = self._steps[self._step_cursor - 1]
+                if prev.kind == StepKind.PICKUP and prev.obstacle_constrained:
+                    waypoints.insert(0, HybridPose(pose.x_cm, pose.y_cm, pose.heading_rad))
+            self._guidance.set_route(waypoints)
             target = step.waypoints[-1] if step.waypoints else None
             self._intent = BrainIntent(
                 action=IntentAction.DRIVE,

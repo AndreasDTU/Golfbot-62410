@@ -82,6 +82,11 @@ class CameraConfig:
 
     camera_index: int = 1
     topdown_warp_size: tuple[int, int] = (800, 600)
+    # Extra margin (cm) added only around the *robot ArUco detection* warp. This
+    # padded warp is a background-only view that keeps markers near a wall/corner
+    # from being cropped out of the frame. The normal top-down view, ball, and
+    # cross detection all stay on the unpadded ``topdown_warp_size`` field.
+    marker_warp_margin_cm: float = 10.0
     required_aruco_ids: tuple[int, ...] = (0, 1, 2, 3)
     wall_thickness_cm: float = 1.6
     marker_outer_offset_cm: float = 8.0
@@ -356,7 +361,7 @@ class DriveConfig:
     near_zone_move_speed_pct: float = 7.0
     # Predictive stop: coast distance AT FULL SPEED (turn_max_speed_pct).
     # The effective coast scales linearly with the actual turn speed.
-    turn_coast_deg: float = 98.2
+    turn_coast_deg: float = 131.1
     turn_reset_noise_deg: float = 5.0
     # Heading correction
     max_heading_for_tank_rad: float = math.radians(5.0)

@@ -34,6 +34,10 @@ class PreprocessedFrame:
     transform_matrix: np.ndarray | None
     camera_ground_projection: CameraGroundProjection | None
     homography_result: HomographyCalibrationResult | None = None
+    # Background-only padded warp for robot ArUco detection, plus the per-side
+    # pixel border so detected pixels map back into the unpadded field space.
+    marker_topdown: np.ndarray | None = None
+    marker_offset_px: tuple[int, int] = (0, 0)
 
 
 class FramePreprocessor:
@@ -78,6 +82,13 @@ class FramePreprocessor:
         """Apply the active perspective transform, if available."""
         return self.homography_calibrator.warp(undistorted_frame)
 
+    def warp_marker_topdown(
+        self,
+        undistorted_frame: np.ndarray,
+    ) -> tuple[np.ndarray, tuple[int, int]] | None:
+        """Apply the padded marker-detection transform, if available."""
+        return self.homography_calibrator.marker_warp(undistorted_frame)
+
     def normalize_illumination(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Normalize illumination with CLAHE on the Lab L channel.
 
@@ -110,6 +121,8 @@ class FramePreprocessor:
             self.homography_calibrator.update_manual_anchor_tracking(live_gray)
         homography_result = self.update_homography(undistorted, use_aruco=use_aruco)
         topdown = self.warp_topdown(undistorted)
+        marker_warp = self.warp_marker_topdown(undistorted)
+        marker_topdown, marker_offset_px = marker_warp if marker_warp is not None else (None, (0, 0))
         should_normalize = self.normalize_illumination_enabled if normalize_illumination is None else normalize_illumination
         normalized = self.normalize_illumination(topdown) if should_normalize and topdown is not None else topdown
         camera_ground_projection = self.homography_calibrator.project_principal_point_to_topdown(
@@ -123,4 +136,6 @@ class FramePreprocessor:
             transform_matrix=self.homography_calibrator.transform_matrix,
             camera_ground_projection=camera_ground_projection,
             homography_result=homography_result,
+            marker_topdown=marker_topdown,
+            marker_offset_px=marker_offset_px,
         )

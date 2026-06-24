@@ -66,6 +66,13 @@ CALIB_ALIGN = "align"
 GEOM_STEP_CM = 0.5
 HEADING_STEP_RAD = math.radians(1.0)
 
+# AUTO-mode ball detection cadence.  YOLO runs for a short burst of consecutive
+# frames once per cycle; the smoother accumulates the union of balls seen across
+# the burst and reconciliation fires once, on the final burst frame, against
+# that union.  A multi-frame burst recovers balls a single noisy frame misses.
+YOLO_CYCLE_FRAMES = 60   # ~2 s at 30 fps
+YOLO_BURST_FRAMES = 3
+
 
 WINDOW_NAME = "GolfBot Main"
 CORNER_WINDOW_NAME = "Set Field Corners"
@@ -319,6 +326,9 @@ class MainGui:
 
     # Overlay mode for right-panel heatmap/collision visualization
     _overlay_mode: OverlayMode = OverlayMode.NONE
+
+    # ArUco marker debug overlay on left panel
+    _show_aruco_overlay: bool = False
 
     # Route View window state
     _route_view_open: bool = False
@@ -954,6 +964,8 @@ class MainGui:
             self._timer_elapsed = now - self._timer_start_time
 
             if self._brain_state and self._brain_state.name == "DONE":
+                if self._tracked_balls is not None:
+                    self._tracked_balls.clear()
                 self._timer_running = False
 
         prev_state = self._brain_state
@@ -1040,10 +1052,13 @@ class MainGui:
         # (approach/pickup/reverse near a wall or cross).  Treated like an
         # active arm: by returning before _tracked_balls is updated we leave
         # the current route intact.
-        if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid):
+        if result.occupancy_grid is not None and self._robot_in_danger_zone(result.occupancy_grid) and self._brain.state != BrainState.ERROR:
             log_event("RECONCILE", "skipped — robot in danger zone")
             return
-        fresh = list(result.smoothed_ball_coordinates)
+        # Use the union of balls the smoother accumulated over the detection
+        # burst, not just the final frame's hits — a ball seen in any burst
+        # frame counts, which is the whole point of running a multi-frame burst.
+        fresh = self.pipeline.ball_smoother.live_coordinates()
 
         robot_xy = (self.robot_pose.x_cm, self.robot_pose.y_cm) if self.robot_pose else None
         robot_radius = float(self.params.get("robot_radius_cm", 30.0))
@@ -1081,7 +1096,7 @@ class MainGui:
         # New balls: fresh but not matched to any tracked ball
         new_balls = [fresh[fi] for fi in range(len(fresh)) if fi not in matched_fresh]
 
-        needs_replan = False
+        needs_replan = self._brain.state == BrainState.ERROR
 
         # Log changes
         for b in missing:
@@ -1119,13 +1134,11 @@ class MainGui:
 
         if needs_replan and self.robot_pose is not None:
             targets = self._ball_targets(self._tracked_balls)
-            if targets:
-                if self._plan_and_load_route(targets):
-                    self.message = f"Reconciled — replanned ({self._brain.step_count} steps)"
-                else:
-                    self.message = "Reconcile: no route found"
-            elif not self._tracked_balls:
-                log_event("RECONCILE", "no balls remaining")
+
+            if self._plan_and_load_route(targets):
+                self.message = f"Reconciled — replanned ({self._brain.step_count} steps)"
+            else:
+                self.message = "Reconcile: no route found"
 
     def _ball_targets(self, balls: list[SmoothedBallCoordinate]) -> list[PlannedBallTarget]:
         """Build planner ball targets from smoothed field coordinates."""
@@ -1644,12 +1657,16 @@ class MainGui:
         # HSV cross detection is disabled; the central cross is the manually
         # placed one, fed in as a red zone so it flows into the occupancy grid
         # and both panel overlays.
+        in_yolo_burst = self._frames_elapsed % YOLO_CYCLE_FRAMES < YOLO_BURST_FRAMES
         skip = (
             self.mode == AppMode.GUIDANCE_TEST
-            or (self.mode == AppMode.AUTO and self._tracked_balls is not None and self._frames_elapsed % 60 != 0)
+            or (self.mode == AppMode.AUTO and self._tracked_balls is not None and not in_yolo_burst)
         )
         if not skip and self.mode == AppMode.AUTO and self._tracked_balls is not None:
-            self._yolo_ran_this_frame = True
+            # Reconcile once per cycle, on the final burst frame, against the
+            # union the smoother accumulated over the whole burst.
+            if self._frames_elapsed % YOLO_CYCLE_FRAMES == YOLO_BURST_FRAMES - 1:
+                self._yolo_ran_this_frame = True
         cross = self.cross_red_zone()
         extra_red_zones = [cross] if cross is not None else []
         return self.pipeline.process(
@@ -1662,14 +1679,18 @@ class MainGui:
         )
 
     def _estimate_pose(self, result: VisionFrameResult) -> None:
-        topdown = result.preprocessed.topdown
-        if topdown is None or self.params is None:
+        # Robot ArUco detection runs on the padded marker warp so markers near a
+        # wall/corner are not cropped; observations are mapped back into the normal
+        # field space, so pose, overlays, and balls remain on the unpadded view.
+        marker_topdown = result.preprocessed.marker_topdown
+        marker_offset_px = result.preprocessed.marker_offset_px
+        if marker_topdown is None or self.params is None:
             self.robot_pose = None
             self._latest_observations = {}
             self._latest_parallax = None
             return
         pose, _origin_px, observations, parallax = self.pose_estimator.estimate(
-            topdown, self.params, self.calibration,
+            marker_topdown, self.params, self.calibration, marker_offset_px,
         )
         self.robot_pose = pose
         self._latest_observations = observations
@@ -1690,6 +1711,8 @@ class MainGui:
 
         if self._tracked_balls is not None:
             self._draw_crop_overlay(left)
+        if self._show_aruco_overlay:
+            self._draw_aruco_overlay(left)
         if left.shape[1] != self._left_w or left.shape[0] != self._left_h:
             left = cv2.resize(left, (self._left_w, self._left_h), interpolation=cv2.INTER_LINEAR)
         if self.mode == AppMode.CALIBRATE:
@@ -1735,6 +1758,34 @@ class MainGui:
                     continue
 
             cv2.rectangle(image, (cx - half, cy - half), (cx + half, cy + half), (60, 200, 60), 2, cv2.LINE_AA)
+
+    def _draw_aruco_overlay(self, image: np.ndarray) -> None:
+        """Draw detected ArUco marker outlines and headings on the topdown frame."""
+        detected_ids = set(self._latest_observations.keys())
+        expected_ids = set(self.config.robot.marker_ids)
+        heading_len = 40  # pixels for the heading line
+
+        for obs in self._latest_observations.values():
+            # Draw marker outline as green polygon
+            pts = obs.corners.astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(image, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # Label with marker ID at center
+            cx, cy = int(round(obs.center[0])), int(round(obs.center[1]))
+            cv2.putText(image, f"ID {obs.marker_id}", (cx + 8, cy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # Draw heading line from center along yaw_rad
+            ex = int(round(cx + heading_len * math.cos(obs.yaw_rad)))
+            ey = int(round(cy + heading_len * math.sin(obs.yaw_rad)))
+            cv2.arrowedLine(image, (cx, cy), (ex, ey), (0, 255, 0), 2, cv2.LINE_AA, tipLength=0.3)
+
+        # Show LOST text for missing markers
+        missing = expected_ids - detected_ids
+        for i, mid in enumerate(sorted(missing)):
+            y = 30 + i * 25
+            cv2.putText(image, f"ID {mid}: LOST", (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
 
     def _draw_calibration_overlay(self, image: np.ndarray) -> None:
         """Overlay the spin turning-centers and the live virtual body on the feed.
@@ -2207,6 +2258,9 @@ class MainGui:
             self._cycle_overlay_mode()
         elif ch == "s":
             self._handle_button("stop")
+        elif ch == "d":
+            self._show_aruco_overlay = not self._show_aruco_overlay
+            self.message = f"ArUco overlay: {'on' if self._show_aruco_overlay else 'off'}"
 
     _OVERLAY_CYCLE = [OverlayMode.NONE, OverlayMode.HEATMAP, OverlayMode.COLLISION]
 

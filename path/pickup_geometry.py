@@ -27,7 +27,7 @@ import numpy as np
 from localization.models import RobotGeometry
 from path.models import PlannedBallTarget
 
-DEFAULT_N_SAMPLES = 72
+DEFAULT_N_SAMPLES = 150
 
 
 # ---------------------------------------------------------------------------

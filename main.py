@@ -15,6 +15,8 @@ from perception.vision.debug import DebugRenderer
 from perception.vision.pipeline import VisionPipeline
 from perception.vision.detection import BallDetector
 
+import localization.tools.turn_coast_calibration as turn_coast_calibration
+
 class _NullBallDetector(BallDetector):
     """Fallback detector when YOLO model is unavailable."""
 
@@ -34,12 +36,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Run without camera (schematic-only testing).")
     parser.add_argument("--image", type=str, default=None,
                         help="Use a static image instead of live camera.")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Calibrate turn coasting.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     config = AppConfig.from_repo_root(REPO_ROOT)
+
+    if args.calibrate:
+        turn_coast_calibration.main()
+        return 0
 
     try:
         pipeline = VisionPipeline(app_config=config, normalize_illumination=True)

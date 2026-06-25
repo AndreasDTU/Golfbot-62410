@@ -27,7 +27,7 @@ class FieldConfig:
     height_cm: float = 121.5
     ball_height_cm: float = 2.0
     floor_height_cm: float = 0.0
-    obstacle_margin_cm: float = 3.0
+    obstacle_margin_cm: float = 6.0
 
     @property
     def grid_width_cm(self) -> int:
@@ -337,22 +337,22 @@ class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
     # Drive speed profiling
-    drive_min_speed_pct: float = 7.0  # Minimum travel speed
+    drive_min_speed_pct: float = 20.0  # Minimum travel speed
     drive_max_speed_pct: float = 95.0  # Maximum travel speed
-    drive_acceleration_cm: float = 5.0  # Distance to go from min to max speed
-    drive_deacceleration_cm: float = 25.0  # Distance to go from min to max speed
+    drive_acceleration_cm: float = 0.1  # Distance to go from min to max speed
+    drive_deacceleration_cm: float = 10.0  # Distance to go from min to max speed
     # Turn speed profiling — flat speed proportional to total turn angle.
     # speed = clamp(total_angle / turn_reference_angle_deg * turn_max_speed_pct, min, max)
-    turn_min_speed_pct: float = 3.0
-    turn_max_speed_pct: float = 120.0  # global tuning knob: speed at the reference angle
-    turn_reference_angle_deg: float = 360.0  # angle that maps to turn_max_speed_pct
+    turn_min_speed_pct: float = 10.0
+    turn_max_speed_pct: float = 100.0  # global tuning knob: speed at the reference angle
+    turn_reference_angle_deg: float = 180.0  # angle that maps to turn_max_speed_pct
     # PID gains
     heading_kp: float = 38.0
     heading_kd: float = 6.0
     xte_kp: float = 2.2
     xte_kd: float = 0.25
     # Distance-based speed profiling
-    max_cross_track_error_cm: float = 8.0
+    max_cross_track_error_cm: float = 15.0
     # Edge/wall proximity
     edge_slowdown_cm: float = 15.0
     edge_min_speed_scale: float = 0.35
@@ -365,10 +365,10 @@ class DriveConfig:
     turn_reset_noise_deg: float = 5.0
     # Heading correction
     max_heading_for_tank_rad: float = math.radians(5.0)
-    max_heading_for_forward_rad: float = math.radians(15.0)
+    max_heading_for_forward_rad: float = math.radians(20.0)
     adjust_gain: float = 9.0
     # Waypoint arrival tolerance
-    waypoint_arrival_cm: float = 3.0
+    waypoint_arrival_cm: float = 5.0
     ball_arrival_cm: float = 0.5
     final_heading_tolerance_rad: float = math.radians(1.5)
     # Route tracking

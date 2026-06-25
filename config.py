@@ -337,13 +337,13 @@ class DriveConfig:
     """Movement kinematics, PID gains, and speed profiling."""
 
     # Drive speed profiling
-    drive_min_speed_pct: float = 20.0  # Minimum travel speed
+    drive_min_speed_pct: float = 10.0  # Minimum travel speed
     drive_max_speed_pct: float = 95.0  # Maximum travel speed
-    drive_acceleration_cm: float = 0.1  # Distance to go from min to max speed
-    drive_deacceleration_cm: float = 10.0  # Distance to go from min to max speed
+    drive_acceleration_cm: float = 5.0  # Distance to go from min to max speed
+    drive_deacceleration_cm: float = 15.0  # Distance to go from min to max speed
     # Turn speed profiling — flat speed proportional to total turn angle.
     # speed = clamp(total_angle / turn_reference_angle_deg * turn_max_speed_pct, min, max)
-    turn_min_speed_pct: float = 10.0
+    turn_min_speed_pct: float = 5.0
     turn_max_speed_pct: float = 100.0  # global tuning knob: speed at the reference angle
     turn_reference_angle_deg: float = 180.0  # angle that maps to turn_max_speed_pct
     # PID gains
@@ -361,7 +361,7 @@ class DriveConfig:
     near_zone_move_speed_pct: float = 7.0
     # Predictive stop: coast distance AT FULL SPEED (turn_max_speed_pct).
     # The effective coast scales linearly with the actual turn speed.
-    turn_coast_deg: float = 131.1
+    turn_coast_deg: float = 77.2
     turn_reset_noise_deg: float = 5.0
     # Heading correction
     max_heading_for_tank_rad: float = math.radians(5.0)

@@ -348,6 +348,10 @@ class MainGui:
     _shared: SharedDisplayState = field(default_factory=SharedDisplayState)
     _frame_seq: int = 0
 
+    # Threaded camera capture state
+    _capture_lock: threading.Lock = field(default_factory=threading.Lock)
+    _latest_frame: np.ndarray | None = None
+
     def __post_init__(self) -> None:
         self._left_w, self._left_h = self.config.camera.topdown_warp_size
         self._right_w = self.config.windows.schematic_width_px
@@ -1874,13 +1878,20 @@ class MainGui:
 
         return image
 
+    def _capture_loop(self) -> None:
+        """Daemon thread: continuously grab the latest camera frame."""
+        while not self.closed:
+            ret, frame = self.camera.read()
+            if ret:
+                with self._capture_lock:
+                    self._latest_frame = frame
+
     def _read_frame(self) -> np.ndarray | None:
         if self.static_image is not None:
             return self.static_image.copy()
         if self.camera is not None:
-            ret, frame = self.camera.read()
-            if ret:
-                return frame
+            with self._capture_lock:
+                return self._latest_frame
         return None
 
     # ------------------------------------------------------------------
@@ -2281,6 +2292,11 @@ class MainGui:
 
     def run(self) -> None:
         self._build_tk_ui()
+
+        # Start camera capture thread (grabs frames independently of processing)
+        if self.camera is not None:
+            capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+            capture_thread.start()
 
         # Start vision thread
         vision_thread = threading.Thread(target=self._vision_loop, daemon=True)

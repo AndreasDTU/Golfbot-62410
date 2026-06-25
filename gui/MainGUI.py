@@ -71,7 +71,7 @@ HEADING_STEP_RAD = math.radians(1.0)
 # the burst and reconciliation fires once, on the final burst frame, against
 # that union.  A multi-frame burst recovers balls a single noisy frame misses.
 YOLO_CYCLE_FRAMES = 60   # ~2 s at 30 fps
-YOLO_BURST_FRAMES = 3
+YOLO_BURST_FRAMES = 2
 
 
 WINDOW_NAME = "GolfBot Main"

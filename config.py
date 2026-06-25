@@ -338,9 +338,9 @@ class DriveConfig:
 
     # Drive speed profiling
     drive_min_speed_pct: float = 10.0  # Minimum travel speed
-    drive_max_speed_pct: float = 95.0  # Maximum travel speed
+    drive_max_speed_pct: float = 100.0  # Maximum travel speed
     drive_acceleration_cm: float = 5.0  # Distance to go from min to max speed
-    drive_deacceleration_cm: float = 15.0  # Distance to go from min to max speed
+    drive_deacceleration_cm: float = 20.0  # Distance to go from min to max speed
     # Turn speed profiling — flat speed proportional to total turn angle.
     # speed = clamp(total_angle / turn_reference_angle_deg * turn_max_speed_pct, min, max)
     turn_min_speed_pct: float = 5.0
@@ -365,10 +365,10 @@ class DriveConfig:
     turn_reset_noise_deg: float = 5.0
     # Heading correction
     max_heading_for_tank_rad: float = math.radians(5.0)
-    max_heading_for_forward_rad: float = math.radians(20.0)
+    max_heading_for_forward_rad: float = math.radians(15.0)
     adjust_gain: float = 9.0
     # Waypoint arrival tolerance
-    waypoint_arrival_cm: float = 5.0
+    waypoint_arrival_cm: float = 4.0
     ball_arrival_cm: float = 0.5
     final_heading_tolerance_rad: float = math.radians(1.5)
     # Route tracking

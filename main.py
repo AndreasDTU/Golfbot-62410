@@ -88,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Could not open camera {cam_index}", file=sys.stderr)
             return 1
 
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        camera.set(cv2.CAP_PROP_FPS, 60)
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
     gui = MainGui(
         config=config,
         pipeline=pipeline,

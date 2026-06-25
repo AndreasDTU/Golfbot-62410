@@ -265,6 +265,8 @@ def cmd_pickup_assist(retreat=False):
     return "ok: pipe pickup assist completed"
 
 def cmd_unload_full_cycle():
+    cmd_pickup_assist()
+
     """Full pipe motion for unloading at the goal only."""
     units = UNLOAD_FULL_CYCLE_UNITS
     speed = UNLOAD_FULL_CYCLE_SPEED

@@ -361,7 +361,7 @@ class DriveConfig:
     near_zone_move_speed_pct: float = 7.0
     # Predictive stop: coast distance AT FULL SPEED (turn_max_speed_pct).
     # The effective coast scales linearly with the actual turn speed.
-    turn_coast_deg: float = 131.1
+    turn_coast_deg: float = 119.4
     turn_reset_noise_deg: float = 5.0
     # Heading correction
     max_heading_for_tank_rad: float = math.radians(5.0)
